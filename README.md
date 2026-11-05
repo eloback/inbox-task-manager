@@ -102,6 +102,8 @@ itm jump                     # the task whose agent has waited longest
 itm last                     # back to the previous task
 itm project add git git@github.com:acme/api.git
 itm project add dir ~/src/scratch --name scratch
+itm project add name "Client X"   # only a name; give it a folder later
+itm project set "Client X" --dir ~/code/client-x   # or --no-dir
 itm project add-workspace    # the Herdr workspace you are in, for the current task
 itm project list | rename | remove
 itm list --json              # for scripts; itm status for a bar or title
@@ -180,6 +182,12 @@ names the workspace after the project, and adds it to the task (as found in
 that workspace while projects follow workspaces). Your home folder and the
 folders above it are refused there; `itm project add dir ~` saves it if you
 really want it.
+
+A project can also be just a name (`itm project add name`, the add dialog's
+"Name only" tab, or "+ New project" in the project finder): it gets no
+workspace and counts only for workspaces named after it. To give it a folder,
+press `prefix+shift+a` in a workspace named like it (itm asks first), or run
+`itm project set <name> --dir <folder>`.
 
 ### Settings
 

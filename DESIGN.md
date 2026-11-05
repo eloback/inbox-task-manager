@@ -232,11 +232,47 @@ Verified against Herdr 0.9.3. Re-check them after a Herdr upgrade.
   `found_projects`, making it the user's. `itm project add-workspace` adds
   its project as found while sync is on (closing that workspace removes it),
   else by hand (`edit_task(found=True)`).
-- Projects without a folder (a name only) are not supported yet. The
-  workspace code skips projects without `path` (`project_roots`,
-  `task_folders`, `project_change_messages`, `project_where`); most other
-  code (adding, listing, removing projects, the TUI's folder checks) still
-  reads `path`, so supporting them means a pass over those.
+- A project is `{name, url?, path?, added_at, last_used_at}`. Its kind is
+  not stored: `project_kind` reads `git` (a URL; its `path` is always itm's
+  clone), `dir` (a folder) or `name` (neither). A repository project without
+  its clone does not exist, so duplicate repositories are still found by
+  clone path, and nothing in the daemon calls `repo_key`. `Store._read`
+  drops a stored `kind`; older itm binaries read `project["kind"]` and fail
+  on a file this version wrote, so itm is upgraded everywhere at once (the
+  daemon restarted), as for the `project` → `projects` change.
+- Code never indexes `project["path"]` without knowing there is one: it
+  asks `project_folder` (None for a name), `project_where` (URL, else
+  folder, else "no folder"), or skips projects without `path`
+  (`project_roots`, `task_folders`, `project_change_messages`,
+  `deletable_clone`). The TUI keeps `Snapshot.missing`, the ids whose folder
+  is set and absent; a name-only project is never "missing" (a map from id
+  to "folder exists" read with a default of true once made the preview index
+  a name-only project's `path`).
+- A folder belongs to at most one project, nesting allowed
+  (`check_project_free` on add and on `set`). `set_project_folder` (`itm
+  project set`) is for projects without a repository only: a repository's
+  folder is its clone, and moving it would orphan the clone. It changes
+  nothing on disk.
+- A project without a folder gets no workspace (first start, edits: a
+  note, not an error) and is found in a workspace only by the workspace's
+  name. Renaming it unbinds workspaces still named the old way, so
+  `rename_project` says which tasks will lose it.
+- The workspace hotkey uses a project without a folder that the workspace
+  is named after, or named like (label or folder name: an unnamed
+  workspace's label is not a name, so "client-x" would not bind "Client-X"
+  otherwise), instead of saving a new one, and offers it the folder. Giving
+  a folder changes which workspaces count as the project in every task, so
+  it needs a yes in a terminal (`confirm_folder`), never happens without
+  one (no terminal, or `--name` given), and is not asked about when it could
+  not be given (`folder_problem`: the home folder or above, in another
+  project). `give_folder` checks again under the projects lock, also that
+  the project still has none. When it cannot be given, the project is still
+  named on the workspace and added to the task; in a popup, why is printed
+  to stderr and kept on screen 2.5 s, like an error. A project removed while
+  the question is open ends the command with an error, not a traceback.
+- The project finder's "+ New project" row is the last row and opens the
+  add dialog on its Name tab: one Enter on a typo saves nothing. Searching
+  never matches "no folder" (display text).
 - Workspace sync (`poll_once`, when `projects_from_workspaces` is on): for
   each running task session the daemon reads the workspaces' folders from
   `herdr api snapshot` (`session_workspaces`) and maps each workspace to a
@@ -596,6 +632,35 @@ The switcher and its dialogs follow these principles.
 - **Not changed:** the form adds projects in order (removing and adding
   changes which is first, and the order is kept); renaming a project leaves
   workspace names alone (such a workspace then goes by its folder again).
+
+### 2026-11-05: a project's folder is optional
+- **Why.** A project is what a task is about ("Client X"); a folder is only
+  where its workspace opens. Projects that are only a name come first and
+  get a folder later.
+- **Choices.** A project is a name with an optional folder and, for a
+  repository, the URL of its clone; the stored `kind` went (read off the
+  fields). One folder per project: several folders were considered and left
+  out, since a folder belongs to one project and worktrees and other
+  checkouts are matched at runtime (by main work tree and by `origin`). No
+  project source is stored: nothing would read it (deleting a clone checks
+  the folder; the hotkey is the user creating a project). `itm project add
+  name`, `itm project set --dir/--no-dir`, a Name tab in the add dialog, a
+  "+ New project" row, and the hotkey giving a name its workspace's folder
+  after a yes.
+- **Reviewed** (a design review before building). Changed after it: no
+  repository project without its clone (orphaned clones, no way to clone
+  again, `repo_key` in the daemon); `set` only for projects without a
+  repository; the hotkey's folder offer needs a yes and refuses the home
+  folder and folders of other projects; the TUI's folder map became a
+  "missing" set (a name-only project crashed the preview); "+ New project"
+  never saves on one Enter. A code review after building changed: a blank
+  `add name` is refused (it saved "project"); no question for a folder that
+  cannot be given or with `--name`; a project removed during the question;
+  plain ←/→ in the add dialog stop at the ends (← in an empty git source
+  jumped to "Name only") and no kind change during a clone; the rename note
+  names only tasks sync can drop it from.
+- **Not done:** a Projects-screen action for `set` (the screen says how);
+  `set --git` (a name cannot become a repository); several folders.
 
 ## 5. Known gaps
 

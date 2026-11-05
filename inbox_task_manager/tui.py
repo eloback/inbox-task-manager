@@ -19,6 +19,7 @@ import atexit
 import contextlib
 import os
 import re
+import shlex
 import signal
 import subprocess
 import threading
@@ -137,7 +138,7 @@ class Snapshot:
     current: str | None = None
     can_switch: bool = True
     switch_problem: str | None = None
-    folders: dict = field(default_factory=dict)  # project id -> folder exists
+    missing: set = field(default_factory=set)  # ids of projects whose folder is set and absent (not: no folder)
     loaded: bool = False
     listed: bool = True  # False when Herdr did not answer: sessions are unknown, not absent
 
@@ -166,7 +167,7 @@ def load_snapshot() -> Snapshot:
             core.switchable_session()
         except core.ItmError as exc:
             snap.can_switch, snap.switch_problem = False, str(exc)
-    snap.folders = {pid: Path(p["path"]).is_dir() for pid, p in data["projects"].items()}
+    snap.missing = missing_folders(data["projects"])
     return snap
 
 
@@ -177,6 +178,11 @@ def project_name(snap: Snapshot, project_id: str | None) -> str | None:
 
 def project_names(snap: Snapshot, task: dict) -> list[str]:
     return [name for pid in core.task_projects(task) if (name := project_name(snap, pid))]
+
+
+def missing_folders(projects: dict) -> set[str]:
+    """Ids of the projects whose folder is set but not there. A name-only project has none to miss."""
+    return {pid for pid, p in projects.items() if (folder := core.project_folder(p)) and not folder.is_dir()}
 
 
 def blocked_agents(snap: Snapshot, name: str) -> list[dict]:
@@ -449,7 +455,8 @@ def name_badge(name: str, width: int, matched: Sequence[int] = ()) -> Content:
 
 def project_line(project: dict, matched: Sequence[int] = (), missing: bool = False) -> Content:
     where = core.project_where(project) + (" (folder missing)" if missing else "")
-    return name_badge(project["name"], 14, matched) + markup("[$text-muted]$k $w[/]", k=f"{project['kind']:<4}", w=where)
+    kind = core.project_kind(project)
+    return name_badge(project["name"], 14, matched) + markup("[$text-muted]$k $w[/]", k=f"{kind:<4}", w=where)
 
 
 def looks_like_git_url(text: str) -> bool:
@@ -465,7 +472,7 @@ def saved_repository(projects: dict, url: str) -> str | None:
     except core.ItmError:
         return None
     for pid, project in projects.items():
-        if project["kind"] == "git":
+        if core.project_kind(project) == "git":
             with contextlib.suppress(core.ItmError):
                 if core.normalize_git_url(project["url"]) == key:
                     return pid
@@ -604,8 +611,8 @@ class ProjectPicker(Dialog):
         self.chosen = tuple(chosen)
         self.query_text = query
         self.data = core.Store().load()
-        self.folders = {pid: Path(p["path"]).is_dir() for pid, p in self.data["projects"].items()}
-        self.saved = {os.path.realpath(p["path"]): pid for pid, p in self.data["projects"].items()}
+        self.missing = missing_folders(self.data["projects"])
+        self.saved = {os.path.realpath(p["path"]): pid for pid, p in self.data["projects"].items() if p.get("path")}
         self.rows: list[tuple] = []
         self.lister: FolderLister | None = None
 
@@ -673,7 +680,7 @@ class ProjectPicker(Dialog):
     def project_row(self, pid: str, matched: Sequence[int] = ()) -> tuple:
         """A saved project's row, marked ✓ when chosen (picking it then removes it)."""
         mark = markup("[$success]✓[/] ") if pid in self.chosen else Content("  ")
-        return mark + project_line(self.data["projects"][pid], matched, not self.folders.get(pid, True)), ("project", pid)
+        return mark + project_line(self.data["projects"][pid], matched, pid in self.missing), ("project", pid)
 
     def project_rows(self, text: str) -> list[tuple]:
         projects = core.projects_by_recent(self.data["projects"])
@@ -686,7 +693,8 @@ class ProjectPicker(Dialog):
             for rank, (pid, p) in enumerate(projects):
                 name = core.fuzzy_match(text, p["name"])
                 # Git projects by URL, folders by where they are: a clone's path is mostly itm's own folder.
-                where = core.fuzzy_match(text, core.project_where(p))
+                # A name-only project's "no folder" is display text, never searched.
+                where = core.fuzzy_match(text, core.project_where(p)) if p.get("url") or p.get("path") else None
                 score = max(name[0] if name else 0, int(where[0] * 0.8) if where else 0)
                 if score:
                     matched = name[1] if name and name[0] >= score else ()
@@ -701,6 +709,9 @@ class ProjectPicker(Dialog):
                     rows.insert(0, (markup("[$accent]+ Clone[/] $u", u=text), ("add", "git", text)))
         rows += [(markup("[$accent]+ Add git repository…[/]"), ("add", "git", "")),
                  (markup("[$accent]+ Add local folder…[/]  [$text-muted]or type ~/ or /[/]"), ("add", "dir", ""))]
+        if text and not looks_like_git_url(text):
+            # Last, and through the add dialog: Enter on a typo never saves a project.
+            rows.append((markup("[$accent]+ New project[/] “$t”…  [$text-muted]no folder[/]", t=text), ("add", "name", text)))
         return rows
 
     def folder_rows(self, text: str) -> list[tuple] | None:
@@ -754,9 +765,9 @@ class ProjectPicker(Dialog):
         if core.looks_like_path(text):
             status.update(markup("[$text-muted]No folder there matches.[/]") if not rows else
                           markup("[$text-muted]Enter adds the folder (or picks it when saved); tab goes into it.[/]"))
-        elif text and not any(a[0] == "project" or (a[0] == "add" and a[2]) for _, a in rows):
-            status.update(markup("[$text-muted]No project matches “$q”. Type a path (~/…, /…) to add a folder.[/]",
-                                 q=text))
+        elif text and not any(a[0] == "project" or (a[0] == "add" and a[1] == "git" and a[2]) for _, a in rows):
+            status.update(markup("[$text-muted]No project matches “$q”. Type a path (~/…, /…) to add a folder, "
+                                 "or pick “New project” for a name without a folder.[/]", q=text))
         else:
             status.update("")
         if not rows:
@@ -808,7 +819,10 @@ class ProjectPicker(Dialog):
             self.dismiss(self.toggled(action[2]))  # already saved: that project
         else:
             add_kind, source = ("dir", action[1]) if kind == "folder" else action[1:]
-            screen = AddProjectScreen(add_kind, source=source, focus="name" if source else "source")
+            if add_kind == "name":  # the text is the name; the dialog shows it before anything is saved
+                screen = AddProjectScreen("name", focus="name", name=source)
+            else:
+                screen = AddProjectScreen(add_kind, source=source, focus="name" if source else "source")
 
             def added(pid: str | None) -> None:  # returns nothing: Textual awaits what a callback returns
                 if pid:
@@ -972,8 +986,12 @@ class TaskForm(Dialog):
             lines = [markup("[$text-muted]Session[/]   $s", s=self.task_name or "")]
             added = [self.data["projects"][pid] for pid in self.projects
                      if pid not in self.initial_projects and pid in self.data["projects"]]
+            folderless = [p["name"] for p in added if not p.get("path")]
+            added = [p for p in added if p.get("path")]
             missing = [core.display_path(p["path"]) for p in added if not Path(p["path"]).is_dir()]
             present = [core.display_path(p["path"]) for p in added if Path(p["path"]).is_dir()]
+            if folderless:
+                lines.append(markup("[$text-muted]$n: no folder, so no workspace[/]", n=", ".join(folderless)))
             if missing:
                 lines.append(markup("[$error]$f missing, so no workspace opens there[/]", f=", ".join(missing)))
             if present:
@@ -993,7 +1011,8 @@ class TaskForm(Dialog):
             return
         # As the session will: the first project whose folder exists, a workspace for each.
         present = [p for p in projects if p.get("path") and Path(p["path"]).is_dir()]
-        missing = [p["name"] for p in projects if p not in present]
+        folderless = [p["name"] for p in projects if not p.get("path")]
+        missing = [p["name"] for p in projects if p.get("path") and p not in present]
         folder = core.display_path(present[0]["path"] if present else core.task_dir())
         title = self.query_one("#title", Input).value
         try:
@@ -1011,6 +1030,8 @@ class TaskForm(Dialog):
             lines.append(markup("[$text-muted]Workspaces[/] $n", n=" · ".join(p["name"] for p in present)))
         if missing:
             lines.append(markup("[$error]Missing, so no workspace: $n[/]", n=", ".join(missing)))
+        if folderless:
+            lines.append(markup("[$text-muted]No folder, so no workspace: $n[/]", n=", ".join(folderless)))
         lines += [markup("[$text-muted]Session[/]   task-$s", s=core.slugify(title) if title.strip() else "…"),
                   markup("[$text-muted]$t[/]", t=then)]
         where.update(join_lines(lines))
@@ -1045,11 +1066,13 @@ class TaskForm(Dialog):
 
 
 class AddProjectScreen(Dialog):
-    """Save a folder, or clone a repository in a child process; returns the project id."""
+    """Save a folder or a name, or clone a repository in a child process; returns the project id."""
 
+    KINDS = ("git", "dir", "name")
     BINDINGS = [
-        Binding("ctrl+left", "kind('git')", show=False),
-        Binding("ctrl+right", "kind('dir')", show=False),
+        # Priority: the fields would take Ctrl+←/→ as word jumps, and the kind could not change from them.
+        Binding("ctrl+left", "kind_step(-1)", show=False, priority=True),
+        Binding("ctrl+right", "kind_step(1)", show=False, priority=True),
         # Priority: Tab would otherwise just move to the next field.
         Binding("tab", "complete_or_next", show=False, priority=True),
     ]
@@ -1069,8 +1092,9 @@ class AddProjectScreen(Dialog):
     def compose(self) -> ComposeResult:
         with Vertical(id="dialog", classes="wide"):
             yield Static("Add project", classes="dtitle")
-            yield Tabs(Tab("Git repository", id="git"), Tab("Local folder", id="dir"), active=self.kind, id="kind")
-            with Horizontal(classes="field"):
+            yield Tabs(Tab("Git repository", id="git"), Tab("Local folder", id="dir"), Tab("Name only", id="name"),
+                       active=self.kind, id="kind")
+            with Horizontal(classes="field", id="source-row"):
                 yield Static("Source", classes="label")
                 self.suggester = FolderSuggester(FolderLister(self.app, lambda: None), enabled=lambda: self.kind == "dir")
                 yield Input(self.source, id="source", compact=True, suggester=self.suggester)
@@ -1079,16 +1103,25 @@ class AddProjectScreen(Dialog):
                 yield Input(self.name_text, id="pname", compact=True)
             yield Static("", id="status")
             yield Static(markup("[$accent b]enter[/] add   [$accent b]tab[/] complete   "
-                                "[$accent b]←→[/] git / folder (empty source)   [$accent b]esc[/] back"), classes="dhint")
+                                "[$accent b]←→[/] kind (empty source)   [$accent b]esc[/] back"), classes="dhint")
 
     def on_mount(self) -> None:
         source = self.query_one("#source", Input)
         source.cursor_position = len(source.value)
-        self.query_one("#pname" if self.start_focus == "name" else "#source", Input).focus()
+        self.query_one("#source-row").display = self.kind != "name"
+        self.query_one("#pname" if self.start_focus == "name" or self.kind == "name" else "#source", Input).focus()
         self.update()
 
     def action_kind(self, kind: str) -> None:
         self.query_one("#kind", Tabs).active = kind
+
+    def action_kind_step(self, step: int, wrap: bool = True) -> None:
+        """Ctrl+←/→ cycle the kinds; plain ←/→ (``wrap`` false) stop at the ends. Never during a clone."""
+        if self.proc is not None or self.busy:
+            return
+        at = self.KINDS.index(self.kind) + step
+        if wrap or 0 <= at < len(self.KINDS):
+            self.action_kind(self.KINDS[at % len(self.KINDS)])
 
     @on(Tabs.TabActivated, "#kind")
     def kind_changed(self, event: Tabs.TabActivated) -> None:
@@ -1096,6 +1129,9 @@ class AddProjectScreen(Dialog):
         source = self.query_one("#source", Input)
         source.post_message(SuggestionReady(source.value, ""))  # no folder ghost text for a repository
         self.suggester.last = None
+        self.query_one("#source-row").display = self.kind != "name"  # a name only has no source
+        if self.kind == "name" and self.focused is source:
+            self.query_one("#pname", Input).focus()
         self.update()
 
     def action_complete_or_next(self) -> None:
@@ -1109,14 +1145,26 @@ class AddProjectScreen(Dialog):
         self.focus_next()
 
     def on_key(self, event) -> None:
-        if event.key in ("left", "right") and not self.query_one("#source", Input).value and self.proc is None:
-            self.action_kind("git" if event.key == "left" else "dir")
+        # ←/→ change the kind only in an empty source field: in the name they move the cursor.
+        source = self.query_one("#source", Input)
+        if event.key in ("left", "right") and self.focused is source and not source.value and self.proc is None:
+            self.action_kind_step(-1 if event.key == "left" else 1, wrap=False)
             event.stop()
 
     def check(self) -> tuple[dict | None, str | None, str | None]:
         """(spec, name, problem); problem is "same", "name" or "source" with a message in self.message."""
         source = self.query_one("#source", Input).value.strip()
         self.message = ""
+        if self.kind == "name":
+            name = self.query_one("#pname", Input).value.strip()
+            if not name:
+                return None, None, "empty"
+            try:
+                core.check_name_free(core.Store().load(), core.check_project_name(name))
+            except core.ItmError as exc:
+                self.message = str(exc)
+                return {}, name, "name"
+            return {}, name, None
         if not source:
             return None, None, "empty"
         try:
@@ -1161,12 +1209,16 @@ class AddProjectScreen(Dialog):
             "git@host:group/repo.git or https://host/group/repo" if self.kind == "git" else "~/code/project")
         spec, name, problem = self.check()
         default = core.default_project_name(spec) if spec else ""
-        self.query_one("#pname", Input).placeholder = default or "defaults to the repository or folder name"
+        self.query_one("#pname", Input).placeholder = (
+            "the project's name" if self.kind == "name" else default or "defaults to the repository or folder name")
         status = self.query_one("#status", Static)
         if problem == "empty":
             status.update("")
         elif problem in ("source", "same", "name"):
             status.update(markup("[$error]$m[/]", m=self.message))
+        elif self.kind == "name":
+            status.update(markup("[$text-muted]Saves the name; the project has no folder, so it gets no workspace. "
+                                 "Give it one later with prefix+shift+a in its workspace, or `itm project set`.[/]"))
         elif self.kind == "git":
             status.update(markup("[$text-muted]Clones to[/] $p\n[$text-muted]Esc stops the clone and removes what it "
                                  "copied.[/]", p=core.display_path(spec["path"])))
@@ -1189,14 +1241,17 @@ class AddProjectScreen(Dialog):
             return
         source = self.query_one("#source", Input).value.strip()
         self.busy = True
-        if self.kind == "dir":
-            self.run_worker(lambda: self.add_folder(source, name), thread=True, exit_on_error=False)
+        if self.kind == "name":
+            self.run_worker(lambda: self.add_folder("name", name, None), thread=True, exit_on_error=False)
+        elif self.kind == "dir":
+            self.run_worker(lambda: self.add_folder("dir", source, name), thread=True, exit_on_error=False)
         else:
             self.run_worker(self.clone(source, name), exclusive=True, exit_on_error=False)
 
-    def add_folder(self, source: str, name: str) -> None:
+    def add_folder(self, kind: str, source: str, name: str | None) -> None:
+        """Save a folder or a name (nothing to clone), in a worker."""
         try:
-            project_id = core.add_project("dir", source, name)
+            project_id = core.add_project(kind, source, name)
         except core.ItmError as exc:
             self.outcome_shown = True
             self.app.call_from_thread(self.query_one("#status", Static).update, markup("[$error]$m[/]", m=exc))
@@ -1292,6 +1347,27 @@ class ConfirmDeleteScreen(Dialog):
         self.dismiss(False)
 
 
+class ConfirmFolderScreen(Dialog):
+    """The workspace hotkey asks before giving a project without a folder the workspace's folder.
+
+    Returns True (give it), False (keep it without a folder) or None (Esc: nothing happens).
+    """
+
+    BINDINGS = [Binding("y", "dismiss(True)", "Give"), Binding("n", "dismiss(False)", "Keep")]
+
+    def __init__(self, project: str, folder: str) -> None:
+        super().__init__()
+        self.project, self.folder = project, folder
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="dialog"):
+            yield Static(markup("Give [b]$f[/b] to [b]$p[/b]?", f=self.folder, p=self.project), classes="dtitle")
+            yield Static(markup("[$text-muted]$p has no folder. With this one, workspaces in it count as $p in "
+                                "every task, and new tasks with $p start there.[/]", p=self.project))
+            yield Static(markup("[$accent b]y[/] give it   [$accent b]n[/] keep it without a folder   "
+                                "[$accent b]esc[/] cancel"), classes="dhint")
+
+
 class ConfirmArchiveScreen(Dialog):
     """Archiving stops a running session; Ctrl+A is also a common Herdr prefix, so ask first."""
 
@@ -1335,7 +1411,10 @@ class RemoveProjectScreen(Dialog):
                 yield Static(markup("[$accent b]esc[/] back"), classes="dhint")
                 return
             forget = Option(Content("Forget the project"), id="keep")
-            if info["kind"] == "dir":
+            if info["kind"] == "name":
+                yield Static(markup("[$text-muted]It has no folder; nothing is deleted.[/]"))
+                options = [forget]
+            elif info["kind"] == "dir":
                 yield Static(markup("[$text-muted]Forgets the folder $p. Nothing is deleted.[/]",
                                     p=core.display_path(info["path"])))
                 options = [forget]
@@ -1526,9 +1605,10 @@ HELP = [
                         ("enter", "add it; on a ✓ project, remove it"),
                         ("~/… or /…", "list folders; enter adds one as a project"),
                         ("tab", "go into the highlighted folder"), ("a git URL", "clone it, or pick it when saved"),
+                        ("+ New project", "a project that is only a name (last row; opens the add dialog)"),
                         ("↑ ↓ / ctrl+k ctrl+j", "move"), ("esc", "back, projects unchanged")]),
-    ("Add project", [("tab", "complete a folder path"), ("←→", "git / folder (empty source)"),
-                     ("enter", "add (clone)"), ("esc", "back; stops a clone")]),
+    ("Add project", [("tab", "complete a folder path"), ("ctrl+← ctrl+→", "git / folder / name only"),
+                     ("← →", "the same, in an empty source"), ("enter", "add (clone)"), ("esc", "back; stops a clone")]),
     ("Projects", [("enter", "show its tasks"), ("ctrl+k ctrl+j", "move"), ("ctrl+n", "add"), ("ctrl+r", "rename"),
                   ("ctrl+d", "remove"), ("esc", "back")]),
 ]
@@ -1580,6 +1660,7 @@ class ProjectsScreen(Screen):
     def compose(self) -> ComposeResult:
         yield Static(markup("[b]Projects[/]  [$text-muted]repositories and folders tasks start in[/]"), id="ptitle")
         yield OptionList(id="plist")
+        yield Static("", id="phint")
         yield Static("", id="pmsg")
         yield Static(markup("[$accent b]enter[/] show its tasks  [$accent b]^n[/] add  [$accent b]^r[/] rename  "
                             "[$accent b]^d[/] remove  [$accent b]esc[/] back"), id="keys")
@@ -1599,17 +1680,30 @@ class ProjectsScreen(Screen):
             count = f"{len(tasks)} task{'s' if len(tasks) != 1 else ''}" + (f" · {open_} open" if tasks else "")
             where = core.project_where(p)
             where = where if len(where) <= 44 else "…" + where[-43:]
-            missing = "" if snap.folders.get(pid, True) else " · folder missing"
+            missing = " · folder missing" if pid in snap.missing else ""
             used = rel(p.get("last_used_at") or now, now)
             plist.add_option(Option(badge(p["name"], 14) + markup(
                 "[$text-muted]$k[/] $w [$text-muted]$c used $u$m[/]",
-                k=f"{p['kind']:<4}", w=f"{where:<45}", c=f"{count:<16}", u=used, m=missing), id=pid))
+                k=f"{core.project_kind(p):<4}", w=f"{where:<45}", c=f"{count:<16}", u=used, m=missing), id=pid))
         if plist.option_count == 0:
-            plist.add_option(Option(markup("[$text-muted]No projects yet. Ctrl+N adds a repository or folder.[/]"),
-                                    disabled=True))
+            plist.add_option(Option(markup("[$text-muted]No projects yet. Ctrl+N adds a repository, a folder or a "
+                                           "name.[/]"), disabled=True))
+            self.query_one("#phint", Static).update("")
             return
         ids = [plist.get_option_at_index(i).id for i in range(plist.option_count)]
         plist.highlighted = ids.index(keep) if keep in ids else 0
+        self.show_hint()
+
+    @on(OptionList.OptionHighlighted, "#plist")
+    def show_hint(self) -> None:
+        """How to give a name-only project a folder (the Projects screen has no action for it yet)."""
+        picked = self.selected()
+        hint = self.query_one("#phint", Static)
+        if picked and core.project_kind(picked[1]) == "name":
+            hint.update(markup("[$text-muted]$n has no folder: press prefix+shift+a in its workspace, or run "
+                               "itm project set $q --dir <folder>[/]", n=picked[1]["name"], q=shlex.quote(picked[1]["name"])))
+        else:
+            hint.update("")
 
     def selected(self) -> tuple[str, dict] | None:
         plist = self.query_one("#plist", OptionList)
@@ -1637,7 +1731,8 @@ class ProjectsScreen(Screen):
 
         def renamed(new: str | None) -> None:
             if new:
-                self.app.run_core(core.rename_project, pid, new, done=lambda r: self.message(f"Renamed {r[0]} to {r[1]}."),
+                self.app.run_core(core.rename_project, pid, new,
+                                  done=lambda r: self.message(f"Renamed {r[0]} to {r[1]}." + (f" {r[2]}." if r[2] else "")),
                                   on_error=lambda e: self.message(e, True))
 
         self.app.push_screen(RenameProjectScreen(pid, project["name"]), renamed)
@@ -1679,7 +1774,7 @@ class ItmApp(App):
     #search { margin: 1 1 1 1; border: none; height: 1; padding: 0 1; background: $surface; }
     #search:focus { border: none; background: $surface-lighten-1; }
     #keys { height: 1; margin: 0 1; color: $text-muted; }
-    #msg, #pmsg { height: auto; margin: 0 1; }
+    #msg, #pmsg, #phint { height: auto; margin: 0 1; }
     #body { height: 1fr; margin: 0 1; }
     #list { width: 63%; border: none; background: $background; padding: 0; }
     #list > .option-list--option-highlighted { background: $surface-lighten-1; text-style: bold; }
@@ -2003,11 +2098,13 @@ class Switcher(ItmApp):
         for pid in core.task_projects(task):
             if (project := snap.data["projects"].get(pid)) is None:
                 continue
-            parts.append(markup("[$secondary]◆ $n[/]  [$text-muted]$k[/]", n=project["name"], k=project["kind"])
+            parts.append(markup("[$secondary]◆ $n[/]  [$text-muted]$k[/]", n=project["name"], k=core.project_kind(project))
                          + (markup("  [$success]workspace open[/]") if pid in open_ else Content("")))
             parts.append(markup("[$text-muted]  $w[/]", w=core.project_where(project)))
-            if not snap.folders.get(pid, True):
+            if pid in snap.missing:
                 parts.append(markup("[$error]  Its folder is missing, so it gets no workspace.[/]"))
+            elif core.project_kind(project) == "name":
+                parts.append(markup("[$text-muted]  give it one: prefix+shift+a in its workspace, or itm project set[/]"))
         if task.get("description"):
             parts.append(Content(""))
             lines = task["description"].splitlines()
@@ -2040,7 +2137,7 @@ class Switcher(ItmApp):
                 parts.append(markup("[$warning]Session unknown: Herdr is not answering[/]"))
             elif name not in snap.sessions:
                 folders = [p["path"] for pid in core.task_projects(task)
-                           if (p := snap.data["projects"].get(pid)) and snap.folders.get(pid, True)]
+                           if (p := snap.data["projects"].get(pid)) and p.get("path") and pid not in snap.missing]
                 folder = core.display_path(folders[0] if folders else core.task_dir())
                 more = f", with {len(folders)} workspaces" if len(folders) > 1 else ""
                 parts.append(markup("[$text-muted]Not started yet · starts in $f$m[/]", f=folder, m=more))
@@ -2278,6 +2375,11 @@ def confirm_delete(title: str) -> bool:
 
 def remove_project_dialog(info: dict) -> str | None:
     return run(DialogApp(RemoveProjectScreen(info)))
+
+
+def confirm_folder(project: str, folder: str) -> bool | None:
+    """Whether a project without a folder gets ``folder`` (None: cancelled)."""
+    return run(DialogApp(ConfirmFolderScreen(project, folder)))
 
 
 def add_project_dialog(kind: str, source: str = "", name: str = "") -> str | None:

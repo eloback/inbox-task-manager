@@ -491,7 +491,8 @@ class ProjectTest(ProjectEnvTest):
         project_id = itm.add_project("dir", str(path))
         project = self.project("notes")
         self.assertEqual(project["id"], project_id)
-        self.assertEqual((project["kind"], project["path"]), ("dir", str(path.resolve())))
+        self.assertEqual((itm.project_kind(project), project["path"]), ("dir", str(path.resolve())))
+        self.assertNotIn("kind", project)  # read off the fields
         self.assertEqual(project["last_used_at"], project["added_at"])
 
     def test_same_folder_again_is_an_error(self):
@@ -540,7 +541,7 @@ class ProjectTest(ProjectEnvTest):
                 itm.cmd_project_rename("API", " ")
             with self.assertRaisesRegex(itm.ItmError, "no project named"):
                 itm.cmd_project_rename("missing", "x")
-        self.assertEqual(self.project("API")["kind"], "git")
+        self.assertEqual(itm.project_kind(self.project("API")), "git")
 
     def test_resolve_by_name_or_id(self):
         api_id = self.add_api()
@@ -560,7 +561,8 @@ class ProjectTest(ProjectEnvTest):
             itm.add_project("git", "git@github.com:acme/api.git")
         clone.assert_called_once_with("git@github.com:acme/api.git", self.api_clone)
         project = self.project("api")
-        self.assertEqual(project, {**project, "kind": "git", "url": "git@github.com:acme/api.git", "path": str(self.api_clone)})
+        self.assertEqual(project, {**project, "url": "git@github.com:acme/api.git", "path": str(self.api_clone)})
+        self.assertEqual(itm.project_kind(project), "git")
 
     def test_same_repo_again_is_an_error_without_cloning(self):
         self.add_api()
@@ -1529,8 +1531,8 @@ class RepositoryMatchTest(TaskEnvTest):
         herdr.assert_called_once_with(["workspace", "rename", "w1", "api"], "/sock/run")
 
 
-class AddWorkspaceTest(TaskEnvTest):
-    """`itm project add-workspace` (prefix+shift+a)."""
+class WorkspaceEnvTest(TaskEnvTest):
+    """A task session with two workspaces, the second focused (fixtures only, no tests)."""
 
     def setUp(self):
         super().setUp()
@@ -1555,6 +1557,10 @@ class AddWorkspaceTest(TaskEnvTest):
         for patch in reversed(self.extra):
             patch.stop()
         super().tearDown()
+
+
+class AddWorkspaceTest(WorkspaceEnvTest):
+    """`itm project add-workspace` (prefix+shift+a)."""
 
     def test_saves_the_focused_workspace_named_like_it_and_gives_it_to_the_task(self):
         with mock.patch("sys.stdin") as stdin:
@@ -1623,6 +1629,241 @@ class AddWorkspaceTest(TaskEnvTest):
         self.sessions["work"]["socket_path"] = "/sock/here"
         itm.cmd_project_add_workspace("x")  # saved, and no task to give it to
         self.assertEqual(self.project("x")["path"], str(self.code))
+
+
+class NameOnlyProjectTest(TaskEnvTest):
+    """Projects whose folder is optional: a name only, given a folder later."""
+
+    def test_a_name_only_project(self):
+        pid = itm.add_project("name", "Client X")
+        project = self.store.load()["projects"][pid]
+        self.assertEqual((project["name"], itm.project_kind(project)), ("Client X", "name"))
+        self.assertNotIn("path", project)
+        self.assertIsNone(itm.project_folder(project))
+        self.assertEqual(itm.project_where(project), "no folder")
+        with self.assertRaisesRegex(itm.ItmError, "named by its source"):
+            itm.add_project("name", "Other", "Another name")
+        for blank in ("", "   "):
+            with self.subTest(name=blank), self.assertRaisesRegex(itm.ItmError, "a project name has 1 to 60"):
+                itm.add_project("name", blank)  # never a project called "project"
+        with self.assertRaisesRegex(itm.ItmError, "project already exists: Client X"):
+            itm.add_project("name", "client x")
+        row = itm.project_rows(self.store.load())[0]
+        self.assertEqual((row["kind"], row["path"], row["url"]), ("name", None, None))
+        with mock.patch("builtins.print") as out:
+            itm.cmd_project_list(as_json=False)
+        self.assertEqual(out.call_args.args[0], "Client X\tname\tno folder\t0 tasks")
+        self.assertEqual(itm.main(["project", "add", "name", "Client Y"]), 0)
+        self.assertEqual(itm.project_kind(self.project("Client Y")), "name")
+
+    def test_kind_is_no_longer_stored(self):
+        api = self.folder("code/api")
+        with self.store.edit() as data:
+            data["projects"]["p1"] = {"name": "api", "kind": "dir", "path": str(api)}
+        self.assertNotIn("kind", self.store.load()["projects"]["p1"])
+        with self.store.edit():
+            pass
+        self.assertNotIn('"kind"', self.store.path.read_text())
+
+    def test_a_folder_for_a_name_already_taken_by_a_name_only_project(self):
+        itm.add_project("name", "client-x")
+        folder = self.folder("code/client-x")
+        with self.assertRaisesRegex(itm.ItmError, r"has no folder yet; give it this one with `itm project set client-x --dir"):
+            itm.add_project("dir", str(folder))
+
+    def test_set_gives_moves_and_takes_the_folder(self):
+        pid = itm.add_project("name", "Client X")
+        first, second = self.folder("code/x"), self.folder("code/x2")
+        itm.cmd_new("Work", projects=["Client X"], switch=False)
+        self.assertEqual(itm.set_project_folder("client x", str(first)),
+                         [f"Client X is now in {first}", "workspaces of Work count as it by the new folder from now on"])
+        self.assertEqual(self.store.load()["projects"][pid]["path"], str(first))
+        self.assertEqual(itm.set_project_folder("Client X", str(first)), ["Client X already has that folder"])
+        itm.set_project_folder("Client X", str(second))
+        self.assertEqual(itm.set_project_folder("Client X", None)[0], "Client X has no folder now")
+        self.assertNotIn("path", self.store.load()["projects"][pid])
+        self.assertTrue(second.is_dir())  # nothing on disk changes
+        other = itm.add_project("dir", str(self.folder("code/other")), "other")
+        with self.assertRaisesRegex(itm.ItmError, "project already exists: other"):
+            itm.set_project_folder("Client X", str(self.folder("code/other")))
+        with self.assertRaisesRegex(itm.ItmError, "inside itm's projects folder"):
+            itm.set_project_folder("Client X", str(self.folder("data/inbox-task-manager/projects/github.com/a/b")))
+        api = self.add_api()
+        with self.assertRaisesRegex(itm.ItmError, "itm's clone of"):
+            itm.set_project_folder("api", None)
+        self.assertIn(other, self.store.load()["projects"])
+        self.assertIn(api, self.store.load()["projects"])
+        with mock.patch("builtins.print") as out:
+            itm.main(["project", "set", "Client X", "--dir", str(first)])
+        self.assertIn("Client X is now in", out.call_args.args[0])
+
+    def test_tasks_and_sessions_skip_a_project_without_a_folder(self):
+        itm.add_project("name", "Client X")
+        api = self.folder("code/api")
+        itm.add_project("dir", str(api), "api")
+        itm.cmd_new("Both", projects=["Client X", "api"], switch=False)
+        data = self.store.load()
+        self.assertEqual(itm.task_folders(data, "task-both"), [("api", api)])
+        self.assertEqual(itm.task_cwd(data, "task-both"), api)
+        itm.cmd_new("Only", projects=["Client X"], switch=False)
+        self.assertEqual(itm.task_cwd(self.store.load(), "task-only"), itm.task_dir())
+        running = {"task-only": {"running": True, "socket_path": "/sock/only"}}
+        itm.cmd_new("Run", switch=False)
+        with mock.patch.object(itm, "list_sessions", return_value=running), \
+                mock.patch.object(itm, "herdr_json") as herdr:
+            notes = itm.edit_task("task-run", add=["Client X"])
+        herdr.assert_not_called()
+        self.assertEqual(notes, ["Client X has no folder, so it gets no workspace"])
+        self.assertIn("Project added\n\nClient X (no folder)", itm.notes_path("task-run").read_text())
+
+    def test_sync_finds_it_by_workspace_name_only(self):
+        pid = itm.add_project("name", "Client X")
+        projects = self.store.load()["projects"]
+        home = itm.task_dir()
+        home.mkdir(parents=True, exist_ok=True)
+        named = {"id": "w1", "label": "Client X", "focused": True, "folder": str(home)}
+        self.assertEqual(itm.workspace_project(projects, named, repositories=True), pid)
+        self.assertIsNone(itm.workspace_project(projects, {**named, "label": "home"}, repositories=True))
+
+    def test_renaming_says_named_workspaces_no_longer_count(self):
+        pid = itm.add_project("name", "Client X")
+        itm.cmd_new("Run", switch=False)
+        itm.cmd_new("Stopped", switch=False)
+        with self.store.edit() as data:
+            itm.sync_task_projects(data["tasks"]["task-run"], [pid], remove=True)
+            itm.set_task_projects(data["tasks"]["task-stopped"], [pid], [pid])  # found, but no workspace open now
+        old, new, note = itm.rename_project("Client X", "Client Y")
+        self.assertEqual((old, new), ("Client X", "Client Y"))
+        self.assertIn("workspaces named Client X no longer count as it (it has no folder), so it may leave Run", note)
+        self.assertNotIn("Stopped", note)
+        self.assertIsNone(itm.rename_project("Client Y", "client y")[2])  # the same name, other case
+        itm.set_config("herdr", "remove_projects_without_workspace", False)
+        self.assertIsNone(itm.rename_project("client y", "Client Z")[2])  # nothing is removed then
+
+    def test_removing_it_forgets_it(self):
+        itm.add_project("name", "Client X")
+        info = itm.removal_info("Client X")
+        self.assertEqual((info["kind"], info["path"], info["clone"]), ("name", None, None))
+        with mock.patch("builtins.print") as out:
+            itm.cmd_project_remove("Client X", None)
+        self.assertEqual(out.call_args.args[0], "project Client X removed")
+        self.assertEqual(self.store.load()["projects"], {})
+
+
+class GiveFolderTest(WorkspaceEnvTest):
+    """The workspace hotkey gives a project without a folder the workspace's folder, when asked."""
+
+    def run_hotkey(self, answer=True, tty=True):
+        screens = mock.Mock()
+        screens.confirm_folder.return_value = answer
+        with mock.patch.object(itm, "screens", return_value=screens), mock.patch("sys.stdin") as stdin, \
+                mock.patch("sys.stdout") as stdout:
+            stdin.isatty.return_value = stdout.isatty.return_value = tty
+            itm.cmd_project_add_workspace(None)
+        return screens.confirm_folder
+
+    def test_a_workspace_named_after_it(self):
+        pid = itm.add_project("name", "My Thing")  # the focused workspace's label
+        asked = self.run_hotkey()
+        asked.assert_called_once_with("My Thing", str(self.code))
+        self.assertEqual(self.store.load()["projects"][pid]["path"], str(self.code))
+        self.assertEqual(self.task("task-here")["projects"], [pid])
+        self.assertEqual(self.calls, [["workspace", "rename", "w2", "My Thing"]])
+
+    def test_an_unnamed_workspace_named_like_it(self):
+        pid = itm.add_project("name", "New-Thing")  # like the folder; the label is Herdr's own
+        self.found[1]["label"] = "new-thing"
+        self.run_hotkey()
+        self.assertEqual(self.store.load()["projects"][pid]["path"], str(self.code))
+        self.assertEqual(len(self.store.load()["projects"]), 1)  # not a second project
+
+    def test_declined_kept_without_a_folder_but_still_given_to_the_task(self):
+        pid = itm.add_project("name", "My Thing")
+        self.run_hotkey(answer=False)
+        self.assertNotIn("path", self.store.load()["projects"][pid])
+        self.assertEqual(self.task("task-here")["projects"], [pid])
+        self.assertEqual(self.calls, [["workspace", "rename", "w2", "My Thing"]])
+
+    def test_esc_changes_nothing(self):
+        pid = itm.add_project("name", "My Thing")
+        before = self.store.path.read_text()
+        with self.assertRaises(itm.Cancelled):
+            self.run_hotkey(answer=None)
+        self.assertEqual(self.store.path.read_text(), before)
+        self.assertNotIn("path", self.store.load()["projects"][pid])
+        self.assertEqual(self.calls, [])  # the workspace is not renamed either
+
+    def test_a_name_given_means_no_question(self):
+        pid = itm.add_project("name", "My Thing")  # bound by the workspace's label
+        with mock.patch("builtins.print") as out:
+            asked = self.run_hotkey_named("Other")
+        asked.assert_not_called()
+        self.assertNotIn("path", self.store.load()["projects"][pid])
+        self.assertIn("kept without a folder; `itm project set", out.call_args_list[0].args[0])
+
+    def run_hotkey_named(self, name):
+        screens = mock.Mock()
+        with mock.patch.object(itm, "screens", return_value=screens), mock.patch("sys.stdin") as stdin, \
+                mock.patch("sys.stdout") as stdout:
+            stdin.isatty.return_value = stdout.isatty.return_value = True
+            itm.cmd_project_add_workspace(name)
+        return screens.confirm_folder
+
+    def test_removed_while_asking(self):
+        pid = itm.add_project("name", "My Thing")
+
+        def removed_meanwhile(project, folder):
+            itm.remove_project(pid)
+            return True
+
+        screens = mock.Mock()
+        screens.confirm_folder.side_effect = removed_meanwhile
+        with mock.patch.object(itm, "screens", return_value=screens), mock.patch("sys.stdin") as stdin, \
+                mock.patch("sys.stdout") as stdout, self.assertRaisesRegex(itm.ItmError, "no longer exists"):
+            stdin.isatty.return_value = stdout.isatty.return_value = True
+            itm.cmd_project_add_workspace(None)
+
+    def test_a_popup_keeps_what_went_wrong_on_screen(self):
+        itm.add_project("name", "My Thing")
+        home = itm.task_dir()
+        home.mkdir(parents=True, exist_ok=True)
+        self.found[1]["folder"] = str(home)
+        with mock.patch.dict(os.environ, {"ITM_POPUP": "1"}), mock.patch.object(itm.time, "sleep") as sleep, \
+                mock.patch("builtins.print") as out:
+            self.run_hotkey()
+        sleep.assert_called_once_with(2.5)
+        warned = [c for c in out.call_args_list if c.kwargs.get("file") is sys.stderr]
+        self.assertIn("kept without a folder:", warned[0].args[0])
+
+    def test_without_a_terminal_it_says_how(self):
+        pid = itm.add_project("name", "My Thing")
+        with mock.patch("builtins.print") as out:
+            asked = self.run_hotkey(tty=False)
+        asked.assert_not_called()
+        self.assertNotIn("path", self.store.load()["projects"][pid])
+        self.assertIn("kept without a folder; `itm project set 'My Thing' --dir", out.call_args.args[0])
+
+    def test_folders_it_must_not_get(self):
+        pid = itm.add_project("name", "My Thing")
+        home = itm.task_dir()
+        home.mkdir(parents=True, exist_ok=True)
+        self.found[1]["folder"] = str(home)  # a task without projects starts at home
+        with mock.patch("builtins.print") as out:
+            asked = self.run_hotkey()
+        asked.assert_not_called()  # a folder it cannot get is not asked about
+        self.assertNotIn("path", self.store.load()["projects"][pid])
+        self.assertIn("kept without a folder", out.call_args.args[0])
+        self.assertIn("holds every workspace under it", out.call_args.args[0])
+        self.assertEqual(self.task("task-here")["projects"], [pid])  # still given to the task
+        # Inside another project: that one holds it.
+        api = itm.add_project("dir", str(self.folder("code/api")), "api")
+        with self.assertRaisesRegex(itm.ItmError, "is in project api"):
+            itm.give_folder(pid, str(self.folder("code/api/src")))
+        # Given one meanwhile: not replaced.
+        itm.set_project_folder("My Thing", str(self.folder("elsewhere")))
+        with self.assertRaisesRegex(itm.ItmError, "has a folder already"):
+            itm.give_folder(pid, str(self.code))
+        self.assertIn(api, self.store.load()["projects"])
 
 
 class SettingsTest(TaskEnvTest):

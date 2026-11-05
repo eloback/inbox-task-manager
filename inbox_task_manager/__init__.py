@@ -430,6 +430,8 @@ class Store:
         data.setdefault("tasks", {})
         data.setdefault("deleted", {})
         data.setdefault("projects", {})
+        for project in data["projects"].values():
+            project.pop("kind", None)  # read off the fields now (project_kind)
         for task in data["tasks"].values():
             legacy = task.pop("project", None)  # one project per task before projects became a list
             if "projects" not in task and isinstance(legacy, str) and legacy:
@@ -743,10 +745,20 @@ def repo_key(url: str) -> str:
 
 
 def project_spec(kind: str, source: str) -> dict:
-    """The saved form of a git repository or folder, without its name."""
+    """The saved form of a git repository ("git"), a folder ("dir") or a name only ("name"), without its name.
+
+    A project's kind is not stored; ``project_kind`` reads it off the fields.
+    """
     source = source.strip()
     if kind == "git":
-        return {"kind": "git", "url": source, "path": str(projects_dir() / repo_key(source))}
+        return {"url": source, "path": str(projects_dir() / repo_key(source))}
+    if kind == "name":
+        return {}
+    return {"path": folder_spec(source)}
+
+
+def folder_spec(source: str) -> str:
+    """A folder as a project's folder is saved: resolved; never inside itm's projects folder."""
     if not source:
         raise ItmError("empty folder path")
     try:
@@ -759,11 +771,21 @@ def project_spec(kind: str, source: str) -> dict:
     root = projects_dir().resolve()
     if path == root or root in path.parents:
         raise ItmError(f"{display_path(path)} is inside itm's projects folder; add its repository with `itm project add git`")
-    return {"kind": "dir", "path": str(path)}
+    return str(path)
 
 
 def default_project_name(spec: dict) -> str:
-    return Path(spec["path"]).name or "project"
+    return (Path(spec["path"]).name if spec.get("path") else "") or "project"
+
+
+def project_folder(project: dict) -> Path | None:
+    """A project's folder, None for a project that has none (a name only)."""
+    return Path(project["path"]) if project.get("path") else None
+
+
+def project_kind(project: dict) -> str:
+    """"git" (a repository and itm's clone), "dir" (a folder) or "name" (a name only)."""
+    return "git" if project.get("url") else "dir" if project.get("path") else "name"
 
 
 def check_project_name(name: str) -> str:
@@ -777,18 +799,27 @@ def project_where(project: dict) -> str:
     return project.get("url") or (display_path(project["path"]) if project.get("path") else "no folder")
 
 
-def check_project_free(data: dict, spec: dict, name: str | None = None) -> None:
+def check_project_free(data: dict, spec: dict, name: str | None = None, exclude: str | None = None) -> None:
     """Refuse a repository or folder that is already saved, or a name another project has.
 
     A repository's clone path is derived from its normalized URL, so comparing
-    paths also finds the same repository given by another URL.
+    paths also finds the same repository given by another URL. A name-only
+    project has no folder to compare. ``exclude`` is a project being changed.
     """
-    target = os.path.realpath(spec["path"])
-    for project in data["projects"].values():
-        if os.path.realpath(project["path"]) == target:
-            raise ItmError(f"project already exists: {project['name']}")
+    if spec.get("path"):
+        target = os.path.realpath(spec["path"])
+        for project_id, project in data["projects"].items():
+            if project_id != exclude and project.get("path") and os.path.realpath(project["path"]) == target:
+                raise ItmError(f"project already exists: {project['name']}")
     if name is not None:
-        check_name_free(data, name)
+        try:
+            check_name_free(data, name)
+        except ItmError as exc:
+            taken = next(p for p in data["projects"].values() if p["name"].lower() == name.lower())
+            if project_kind(taken) == "name" and project_kind(spec) == "dir":
+                raise ItmError(f"project {taken['name']} has no folder yet; give it this one with "
+                               f"`itm project set {shlex.quote(taken['name'])} --dir {shlex.quote(spec['path'])}`") from exc
+            raise
 
 
 def check_name_free(data: dict, name: str, exclude: str | None = None) -> None:
@@ -921,10 +952,18 @@ def clone_repo(url: str, target: Path) -> None:
 
 
 def add_project(kind: str, source: str, name: str | None = None) -> str:
-    """Save a folder, or clone and save a git repository; returns its id."""
+    """Save a folder, a name, or clone and save a git repository; returns its id.
+
+    For "name" the source is the name.
+    """
     store = Store()
     spec = project_spec(kind, source)
-    name = check_project_name((name or "").strip() or default_project_name(spec))
+    if kind == "name":
+        if name:
+            raise ItmError("a name-only project is named by its source: `itm project add name <name>`")
+        name = check_project_name(source)  # no default to fall back on: the name is all it has
+    else:
+        name = check_project_name((name or "").strip() or default_project_name(spec))
     # Every writer of projects holds this lock, so checking once before the
     # clone is enough; cmd_new only updates last_used_at.
     with store.projects_lock():
@@ -941,14 +980,16 @@ def add_project(kind: str, source: str, name: str | None = None) -> str:
 def deletable_clone(data: dict, project: dict) -> Path | None:
     """A removed git project's clone, if itm may delete it: a real checkout of
     its repository inside the projects folder that holds no other project."""
-    path = Path(project["path"])
-    if project["kind"] != "git" or not is_checkout_of(path, project["url"]):
+    path = project_folder(project)
+    if project_kind(project) != "git" or path is None or not is_checkout_of(path, project["url"]):
         return None
     resolved = path.resolve()
     if projects_dir().resolve() not in resolved.parents:
         return None
     for other in data["projects"].values():
-        other_path = Path(other["path"]).resolve()
+        if (other_folder := project_folder(other)) is None:
+            continue
+        other_path = other_folder.resolve()
         if other_path == resolved or resolved in other_path.parents:
             return None
     return path
@@ -1035,14 +1076,14 @@ def removal_info(query: str) -> dict:
     info = {
         "id": project_id,
         "name": project["name"],
-        "kind": project["kind"],
-        "path": project["path"],
+        "kind": project_kind(project),
+        "path": project.get("path"),
         "url": project.get("url"),
         "users": project_users(data, project_id),
         "clone": None,
         "local_work": None,
     }
-    if project["kind"] == "git":
+    if info["kind"] == "git":  # a repository's folder is always its clone
         # As remove_project sees it: after this project is gone, other projects may still hold the clone.
         others = {**data, "projects": {k: v for k, v in data["projects"].items() if k != project_id}}
         if not os.path.lexists(project["path"]):
@@ -1076,7 +1117,7 @@ def remove_project(query: str, clone: str = "keep") -> list[str]:
                 )
             project = data["projects"].pop(project_id)
         messages.append(f"project {name} removed")
-        if project["kind"] != "git" or not os.path.lexists(project["path"]) or clone == "keep":
+        if project_kind(project) != "git" or not os.path.lexists(project["path"]) or clone == "keep":
             return messages
         path = deletable_clone(data, project)
         if path is None:
@@ -1090,8 +1131,12 @@ def remove_project(query: str, clone: str = "keep") -> list[str]:
     return messages
 
 
-def rename_project(query: str, new_name: str) -> tuple[str, str]:
-    """Rename a project; its tasks keep it (they store its id). Returns (old, new)."""
+def rename_project(query: str, new_name: str) -> tuple[str, str, str | None]:
+    """Rename a project; its tasks keep it (they store its id). Returns (old, new, a note or None).
+
+    A project without a folder is found in workspaces only by name, so
+    workspaces still named the old way no longer count as it: the note says so.
+    """
     store = Store()
     with store.projects_lock(), store.edit() as data:
         project_id = resolve_project(data, query)
@@ -1099,7 +1144,50 @@ def rename_project(query: str, new_name: str) -> tuple[str, str]:
         check_name_free(data, name, exclude=project_id)
         project = data["projects"][project_id]
         old, project["name"] = project["name"], name
-    return old, name
+        # Only where sync can remove it: found there, and its workspace open in a session the daemon reads.
+        found_in = [t["title"] for t in data["tasks"].values() if t["state"] != "archived"
+                    and project_id in task_list(t, "found_projects") and project_id in task_list(t, "workspace_projects")]
+    note = None
+    if project_kind(project) == "name" and found_in and old.lower() != name.lower():
+        with contextlib.suppress(ItmError):
+            if not load_config()["herdr"]["remove_projects_without_workspace"]:
+                return old, name, None
+        note = (f"workspaces named {old} no longer count as it (it has no folder), so it may leave "
+                f"{', '.join(found_in)} unless they are renamed {name}")
+    return old, name, note
+
+
+def set_project_folder(query: str, folder: str | None) -> list[str]:
+    """Give a project without a repository a folder, move its folder, or (None) make it a name only.
+
+    Nothing on disk changes. A repository project's folder is its clone and
+    stays. Running tasks with the project keep their workspaces; which of
+    them count as the project now follows the new folder (R10.3), so they
+    are named in the result.
+    """
+    store = Store()
+    path = folder_spec(folder.strip()) if folder is not None else None
+    with store.projects_lock(), store.edit() as data:
+        project_id = resolve_project(data, query)
+        project = data["projects"][project_id]
+        if project_kind(project) == "git":
+            raise ItmError(f"{project['name']}'s folder is itm's clone of {project['url']}; it cannot be changed")
+        if path is not None:
+            check_project_free(data, {"path": path}, exclude=project_id)
+        old = project.get("path")
+        if path is None:
+            project.pop("path", None)
+        else:
+            project["path"] = path
+        users = [t["title"] for t in data["tasks"].values()
+                 if project_id in task_projects(t) and t["state"] != "archived"]
+    if path == old:
+        return [f"{project['name']} already has that folder" if path else f"{project['name']} has no folder"]
+    messages = [f"{project['name']} is now in {display_path(path)}" if path else f"{project['name']} has no folder now"]
+    if users:
+        how = "by the new folder" if path else "only when named after it"
+        messages.append(f"workspaces of {', '.join(users)} count as it {how} from now on")
+    return messages
 
 
 def looks_like_path(text: str) -> bool:
@@ -2129,9 +2217,11 @@ def edit_task(
 
 def project_change_messages(name: str, added: list[dict]) -> list[str]:
     """Say what new projects mean for a task's session, opening workspaces in a running one."""
-    added = [p for p in added if p.get("path")]  # a project without a folder gets no workspace
-    messages = [f"{display_path(p['path'])} is missing, so it gets no workspace"
-                for p in added if not Path(p["path"]).is_dir()]
+    # A note, not a failure: a project without a folder has nothing to open.
+    messages = [f"{p['name']} has no folder, so it gets no workspace" for p in added if not p.get("path")]
+    added = [p for p in added if p.get("path")]
+    messages += [f"{display_path(p['path'])} is missing, so it gets no workspace"
+                 for p in added if not Path(p["path"]).is_dir()]
     present = [p for p in added if Path(p["path"]).is_dir()]
     if not present:
         return messages
@@ -2306,8 +2396,8 @@ def project_rows(data: dict) -> list[dict]:
         {
             "id": project_id,
             "name": project["name"],
-            "kind": project["kind"],
-            "path": project["path"],
+            "kind": project_kind(project),
+            "path": project.get("path"),  # None for a name only
             "url": project.get("url"),
             "tasks": len(project_users(data, project_id)),
         }
@@ -2322,8 +2412,13 @@ def cmd_project_add(kind: str, source: str, name: str | None) -> int:
 
 
 def cmd_project_rename(query: str, new_name: str) -> int:
-    old, name = rename_project(query, new_name)
-    print(f"project {old} renamed to {name}")
+    old, name, note = rename_project(query, new_name)
+    print(f"project {old} renamed to {name}" + (f"; {note}" if note else ""))
+    return 0
+
+
+def cmd_project_set(query: str, folder: str | None) -> int:
+    print("; ".join(set_project_folder(query, folder)))
     return 0
 
 
@@ -2334,7 +2429,7 @@ def cmd_project_list(as_json: bool) -> int:
     else:
         for row in rows:
             tasks = f"{row['tasks']} task" + ("" if row["tasks"] == 1 else "s")
-            print(f"{row['name']}\t{row['kind']}\t{row['url'] or display_path(row['path'])}\t{tasks}")
+            print(f"{row['name']}\t{row['kind']}\t{project_where(row)}\t{tasks}")
     return 0
 
 
@@ -2351,7 +2446,7 @@ def cmd_project_remove(query: str, delete_clone: bool | None) -> int:
         # Nothing is deleted without a question: only the dialog can choose "if-clean".
         info = removal_info(query)
         mode = "keep"
-        where = display_path(info["path"])
+        where = display_path(info["path"]) if info["path"] else ""  # only a repository's clone is asked about
         if info["clone"] == "foreign":
             notes.append(f"kept {where}: not a clone itm can delete")
         elif info["clone"] == "deletable" and info["local_work"]:
@@ -2396,7 +2491,9 @@ def current_workspace(sessions: dict[str, dict]) -> tuple[str, dict]:
 def add_workspace_project(session: str, workspace: dict, project_id: str) -> list[str]:
     """Name a workspace after its project and give the project to the session's task; returns what happened."""
     data = Store().load()
-    project = data["projects"][project_id]
+    project = data["projects"].get(project_id)
+    if project is None:  # removed while a dialog was open
+        raise ItmError("the project no longer exists")
     messages = []
     try:
         # A named workspace keeps its name. Herdr takes a label starting with "-" as is ("--" would be part of it).
@@ -2430,24 +2527,115 @@ def check_workspace_folder(folder: str) -> None:
                        f" open the workspace in a project's folder, or use `itm project add dir {display_path(folder)}`")
 
 
+def named_like(projects: dict, workspace: dict) -> str | None:
+    """A project without a folder named like a workspace's label or folder, ignoring case.
+
+    An unnamed workspace in ``~/code/client-x`` is labeled "client-x", which
+    does not count as a name (``automatic_label``), so the project "Client-X"
+    would not be found by name alone.
+    """
+    names = {workspace.get("label", "").strip().lower(), os.path.basename(workspace["folder"].rstrip(os.sep)).lower()}
+    found = [pid for pid, p in projects.items() if project_kind(p) == "name" and p["name"].lower() in names - {""}]
+    return found[0] if len(found) == 1 else None
+
+
+def folder_problem(projects: dict, project_id: str, folder: str) -> str | None:
+    """Why a workspace's folder cannot go to a project without one (the hotkey's rules), else None:
+    the home folder or above it, a folder itm's projects folder holds, a folder of (or in) another project."""
+    try:
+        check_workspace_folder(folder)
+        path = folder_spec(folder)
+    except ItmError as exc:
+        return str(exc)
+    if (holder := folder_project(projects, path)) not in (None, project_id):
+        return f"{display_path(path)} is in project {projects[holder]['name']}"
+    return None
+
+
+def give_folder(project_id: str, folder: str) -> None:
+    """Give a project without a folder the folder of a workspace, if it still has none.
+
+    Checked again under the projects lock: another command may have given it
+    one, or saved a project there, meanwhile.
+    """
+    store = Store()
+    with store.projects_lock(), store.edit() as data:
+        project = data["projects"].get(project_id)
+        if project is None:
+            raise ItmError("the project no longer exists")
+        if project.get("path") or project.get("url"):
+            raise ItmError(f"{project['name']} has a folder already")
+        if problem := folder_problem(data["projects"], project_id, folder):
+            raise ItmError(problem)
+        project["path"] = folder_spec(folder)
+
+
+def offer_folder(project_id: str, folder: str, ask: bool) -> list[str]:
+    """Ask whether a project without a folder gets the workspace's folder; returns what happened.
+
+    It changes which workspaces count as the project in every task, so it is
+    never done without a yes (``ask``: a terminal, and no ``--name``); a
+    folder it could not get is not asked about. Otherwise the result says how.
+    """
+    data = Store().load()
+    project = data["projects"].get(project_id)
+    if project is None:
+        raise ItmError("the project no longer exists")
+    if problem := folder_problem(data["projects"], project_id, folder):
+        return [f"{project['name']} kept without a folder: {problem}"]
+    hint = f"`itm project set {shlex.quote(project['name'])} --dir {shlex.quote(folder)}` gives it this folder"
+    if not ask:
+        return [f"{project['name']} kept without a folder; {hint}"]
+    answer = screens().confirm_folder(project["name"], display_path(folder))
+    if answer is None:
+        raise Cancelled("cancelled")
+    if not answer:
+        return [f"{project['name']} kept without a folder"]
+    try:
+        give_folder(project_id, folder)
+    except ItmError as exc:
+        return [f"{project['name']} kept without a folder: {exc}"]
+    return [f"{project['name']} is now in {display_path(folder)}"]
+
+
 def cmd_project_add_workspace(name: str | None) -> int:
-    """Save the folder of the workspace this runs in as a project, and give it to the current task."""
+    """Save the folder of the workspace this runs in as a project, and give it to the current task.
+
+    A project without a folder that the workspace is named after (or named
+    like) is offered the folder instead of a new project.
+    """
     sessions = list_sessions()
     session, workspace = current_workspace(sessions)
-    project_id = workspace_project(Store().load()["projects"], workspace, repositories=True)
-    if project_id is None:
+    projects = Store().load()["projects"]
+    project_id = workspace_project(projects, workspace, repositories=True)
+    if project_id is None and name is None:
+        project_id = named_like(projects, workspace)
+    notes = []
+    tty = sys.stdin.isatty() and sys.stdout.isatty()
+    if project_id is not None and project_kind(projects[project_id]) == "name":
+        notes = offer_folder(project_id, workspace["folder"], ask=tty and name is None)
+    elif project_id is None:
         check_workspace_folder(workspace["folder"])
         # A workspace the user named carries the name they want; an unnamed one is named after its folder.
         default = name or workspace["label"].strip() or None
-        if name or not (sys.stdin.isatty() and sys.stdout.isatty()):
+        if name or not tty:
             project_id = add_project("dir", workspace["folder"], default)
         else:
             project_id = screens().add_project_dialog("dir", workspace["folder"], default or "")
             if project_id is None:
                 raise Cancelled("cancelled")
-    project = Store().load()["projects"][project_id]
-    print(f"project {project['name']} ({display_path(project['path'])})"
-          + "".join(f"; {line}" for line in add_workspace_project(session, workspace, project_id)))
+    lines = notes + add_workspace_project(session, workspace, project_id)
+    project = Store().load()["projects"].get(project_id)
+    if project is None:  # removed while a dialog was open
+        raise ItmError("the project no longer exists")
+    print(f"project {project['name']} ({project_where(project)})" + "".join(f"; {line}" for line in lines))
+    # A popup closes as soon as the command exits: keep what went wrong on screen, as errors are.
+    warnings = [line for line in lines if "kept without a folder:" in line or "kept without a folder;" in line
+                or line.startswith("could not")]
+    if warnings and os.environ.get("ITM_POPUP"):
+        for line in warnings:
+            print(f"itm: {line}", file=sys.stderr)
+        time.sleep(2.5)
     return 0
 
 
@@ -2728,10 +2916,16 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--json", action="store_true")
     p = sub.add_parser("project", help="saved git repositories and folders tasks can start in")
     projects = p.add_subparsers(dest="project_command", required=True)
-    p = projects.add_parser("add", help="clone and save a git repository, or save a folder")
-    p.add_argument("kind", choices=("git", "dir"))
-    p.add_argument("source", help="git URL or folder path")
+    p = projects.add_parser("add", help="clone and save a git repository, save a folder, or save a name only")
+    p.add_argument("kind", choices=("git", "dir", "name"))
+    p.add_argument("source", help="git URL, folder path, or (name) the project's name")
     p.add_argument("--name", help="defaults to the repository or folder name")
+    p = projects.add_parser("set", help="give a project without a repository a folder, move it, or make it a name only")
+    p.add_argument("name")
+    folder = p.add_mutually_exclusive_group(required=True)
+    # A default other than None: argparse counts an option as given only when it stores something else.
+    folder.add_argument("--dir", dest="folder", metavar="PATH", default=UNSET)
+    folder.add_argument("--no-dir", dest="folder", action="store_const", const=None, default=UNSET)
     p = projects.add_parser("add-workspace", help="save the folder of the Herdr workspace you are in, for the current task")
     p.add_argument("--name", help="defaults to the workspace's name; without it, a terminal gets the add dialog")
     p = projects.add_parser("list", help="saved projects with their tasks and last use")
@@ -2800,6 +2994,8 @@ def run(args: argparse.Namespace) -> int:
             match args.project_command:
                 case "add":
                     return cmd_project_add(args.kind, args.source, args.name)
+                case "set":
+                    return cmd_project_set(args.name, args.folder)
                 case "add-workspace":
                     return cmd_project_add_workspace(args.name)
                 case "list":

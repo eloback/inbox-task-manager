@@ -193,7 +193,9 @@ class TuiTest(unittest.IsolatedAsyncioTestCase):
             await self.typed(pilot, "one")
             await pilot.press("enter")
             await self.typed(pilot, "two")
-            app.screen.query_one("#snooze", Select).value = "p1"  # 1 hour
+            # By label: presets are in time order, so "This evening" comes before "1 hour" after 19:00.
+            hour = [label for label, _ in app.screen.presets].index("1 hour")
+            app.screen.query_one("#snooze", Select).value = f"p{hour}"
             await pilot.press("ctrl+s")
             await self.settle(pilot, app)
             self.assertEqual(len(app.screen_stack), 1)  # snoozed: no switch
@@ -730,12 +732,15 @@ class TuiTest(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             self.assertEqual(app.screen.query_one("#pquery", Input).value, "bkdxy")
             app.screen.query_one("#pquery", Input).focus()
-            await pilot.press("backspace", "backspace", "backspace", "backspace", "e")  # nothing selected and replaced
+            # Nothing selected and replaced. "bac": a prefix of the name, which outranks any match in the
+            # (random) temp folder path the folder projects have.
+            await pilot.press("backspace", "backspace", "backspace", "backspace", "a", "c")
             await pilot.pause()
-            self.assertEqual(app.screen.query_one("#pquery", Input).value, "be")
+            self.assertEqual(app.screen.query_one("#pquery", Input).value, "bac")
             rows = self.choices(app)
             self.assertIn("backend", rows[0])
-            self.assertTrue(rows[-2].startswith("+ Add git") and rows[-1].startswith("+ Add local folder"))
+            self.assertTrue(rows[-3].startswith("+ Add git") and rows[-2].startswith("+ Add local folder"))
+            self.assertTrue(rows[-1].startswith("+ New project “bac”"))  # last: never what Enter picks first
             await pilot.press("enter")
             await pilot.pause()
             self.assertEqual(type(app.screen).__name__, "TaskForm")
@@ -1175,6 +1180,130 @@ class TuiTest(unittest.IsolatedAsyncioTestCase):
                 await pilot.press("space")  # usable again
                 await app.workers.wait_for_complete()
         self.assertEqual(len(calls), 2)
+
+    # ---------------------------------------------------- name-only projects
+    async def test_the_name_only_tab(self):
+        app = tui.DialogApp(tui.AddProjectScreen("name", focus="name", name="Client X"))
+        async with app.run_test(size=(110, 34)) as pilot:
+            await pilot.pause(0.4)
+            self.assertFalse(app.screen.query_one("#source-row").display)
+            self.assertEqual(app.screen.focused.id, "pname")
+            self.assertIn("no folder", text_of(app.screen.query_one("#status")))
+            await pilot.press("left", "left")  # the cursor moves in the name; the kind stays
+            self.assertEqual(app.screen.kind, "name")
+            await pilot.press("ctrl+right")  # the tabs cycle
+            await pilot.pause()
+            self.assertEqual(app.screen.kind, "git")
+            await pilot.press("ctrl+left")
+            await pilot.pause()
+            self.assertEqual(app.screen.kind, "name")
+            await pilot.press("enter")
+            await self.settle(pilot, app)
+        project = self.store.load()["projects"][app.return_value]
+        self.assertEqual((project["name"], core.project_kind(project)), ("Client X", "name"))
+
+    async def test_new_project_row_goes_through_the_dialog(self):
+        core.add_project("dir", str(self.folder("code/api")), "api")
+        app = tui.DialogApp(tui.TaskForm())
+        async with app.run_test(size=(110, 34)) as pilot:
+            await pilot.pause()
+            field = app.screen.query_one("#project", tui.ProjectField)
+            field.focus()
+            await self.typed(pilot, "zz top")  # matches nothing
+            await pilot.pause()
+            rows = self.choices(app)
+            self.assertTrue(rows[-1].startswith("+ New project “zz top”"), rows)
+            highlighted = app.screen.query_one("#pchoices", OptionList).highlighted
+            self.assertNotIn("New project", rows[highlighted])  # Enter on a typo saves nothing
+            app.screen.query_one("#pchoices", OptionList).highlighted = len(rows) - 1
+            await pilot.press("enter")
+            await pilot.pause(0.4)
+            self.assertEqual((type(app.screen).__name__, app.screen.kind), ("AddProjectScreen", "name"))
+            self.assertEqual(app.screen.query_one("#pname", Input).value, "zz top")
+            self.assertEqual(len(self.store.load()["projects"]), 1)  # nothing saved before the dialog's Enter
+            await pilot.press("enter")
+            await self.settle(pilot, app)
+            self.assertEqual(type(app.screen).__name__, "TaskForm")
+            pid, = field.value
+            self.assertEqual(core.project_kind(self.store.load()["projects"][pid]), "name")
+            self.assertIn("No folder, so no workspace: zz top", text_of(app.screen.query_one("#where")))
+            self.assertIn(f"Starts in {self.root / 'home'}", text_of(app.screen.query_one("#where")))
+
+    async def test_name_only_projects_in_the_list_preview_and_projects_screen(self):
+        pid = core.add_project("name", "Client X")
+        with self.store.edit() as data:  # never started: the preview says where it starts
+            core.set_task_projects(data["tasks"]["task-b"], [pid])
+        app = tui.Switcher()
+        async with app.run_test(size=(120, 34)) as pilot:
+            await self.settle(pilot, app)
+            olist = app.query_one("#list", OptionList)
+            olist.highlighted = [i for i, _ in self.labels(app)].index("task-b")
+            await pilot.pause()
+            preview = text_of(app.query_one("#preview"))
+            self.assertIn("◆ Client X  name", preview)
+            self.assertIn("no folder", preview)
+            self.assertNotIn("missing", preview)
+            self.assertIn(f"starts in {self.root / 'home'}", preview)
+            await pilot.press("ctrl+p")
+            await self.settle(pilot, app)
+            self.assertIn("press prefix+shift+a in its workspace", text_of(app.screen.query_one("#phint")))
+            await pilot.press("ctrl+d")  # used by a task: refused, nothing to choose
+            await self.settle(pilot, app)
+            self.assertIn("Used by 1 task", " ".join(text_of(s) for s in app.screen.query(Static)))
+
+    async def test_kind_keys(self):
+        app = tui.DialogApp(tui.AddProjectScreen("git"))
+        async with app.run_test(size=(110, 34)) as pilot:
+            await pilot.pause()
+            await pilot.press("left")  # plain arrows stop at the ends: no jump from git to "Name only"
+            await pilot.pause()
+            self.assertEqual(app.screen.kind, "git")
+            await pilot.press("right", "right")
+            await pilot.pause()
+            self.assertEqual(app.screen.kind, "name")
+            await pilot.press("ctrl+right")  # Ctrl cycles
+            await pilot.pause()
+            self.assertEqual(app.screen.kind, "git")
+            app.screen.busy = True  # a clone being started: the kind stays
+            await pilot.press("ctrl+left")
+            await pilot.pause()
+            self.assertEqual(app.screen.kind, "git")
+
+    async def test_the_projects_hint_goes_with_the_last_project(self):
+        core.add_project("name", "Client X")
+        app = tui.Switcher()
+        async with app.run_test(size=(120, 34)) as pilot:
+            await self.settle(pilot, app)
+            await pilot.press("ctrl+p")
+            await self.settle(pilot, app)
+            self.assertIn("has no folder", text_of(app.screen.query_one("#phint")))
+            await pilot.press("ctrl+d")
+            await self.settle(pilot, app)
+            await pilot.press("enter")  # forget it
+            await self.settle(pilot, app)
+            self.assertEqual(text_of(app.screen.query_one("#phint")), "")
+
+    async def test_removing_a_name_only_project(self):
+        core.add_project("name", "Client X")
+        info = core.removal_info("Client X")
+        app = tui.DialogApp(tui.RemoveProjectScreen(info))
+        async with app.run_test(size=(110, 34)) as pilot:
+            await pilot.pause()
+            self.assertIn("It has no folder; nothing is deleted.", " ".join(text_of(s) for s in app.screen.query(Static)))
+            await pilot.press("enter")
+            await pilot.pause()
+        self.assertEqual(app.return_value, "keep")
+
+    async def test_the_give_folder_question(self):
+        for key, answer in (("y", True), ("n", False), ("escape", None)):
+            with self.subTest(key=key):
+                app = tui.DialogApp(tui.ConfirmFolderScreen("Client X", "~/code/client-x"))
+                async with app.run_test(size=(100, 20)) as pilot:
+                    await pilot.pause()
+                    self.assertIn("Give ~/code/client-x to Client X?", text_of(app.screen.query_one(".dtitle")))
+                    await pilot.press(key)
+                    await pilot.pause()
+                self.assertEqual(app.return_value, answer)
 
     async def test_add_dialog_can_start_with_a_name(self):
         folder = self.folder("code/new-thing")
