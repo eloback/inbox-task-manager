@@ -1,0 +1,21 @@
+# itm's daemon as a systemd user service (Linux without the home-manager module).
+#   cp inbox-task-manager.service ~/.config/systemd/user/
+#   systemctl --user enable --now inbox-task-manager
+# ExecStart needs an absolute path: `command -v itm` prints it. The service
+# does not read your shell profile, so herdr must be on the PATH below, and
+# XDG_CONFIG_HOME / XDG_STATE_HOME / XDG_DATA_HOME must match your shell's
+# when you set them (add Environment= lines).
+
+[Unit]
+Description=inbox-task-manager agent notifications and snooze timers
+# Desktop notifications need the graphical session's notification daemon.
+After=graphical-session.target
+
+[Service]
+ExecStart=%h/.local/bin/itm daemon
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

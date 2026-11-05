@@ -1,0 +1,64 @@
+# Suggested Herdr key bindings for inbox-task-manager. Copy them into your
+# Herdr config (~/.config/herdr/config.toml), after the `key = value` lines
+# of your [keys] section (a [[keys.command]] table ends those).
+#
+# Popups close when their command exits; ITM_POPUP=1 keeps command-line
+# errors on screen long enough to read. A popup runs its command through a
+# shell with the Herdr server's environment, so `itm` must be on that PATH
+# (or write its full path).
+
+[[keys.command]]
+key = "prefix+shift+s"
+type = "popup"
+command = "ITM_POPUP=1 itm"
+description = "tasks"
+width = "80%"
+height = "80%"
+
+[[keys.command]]
+key = "prefix+t"
+type = "popup"
+command = "ITM_POPUP=1 itm new"
+description = "new task"
+width = "70%"
+height = 26
+
+[[keys.command]]
+key = "prefix+shift+z"
+type = "popup"
+command = "ITM_POPUP=1 itm snooze"
+description = "snooze task"
+width = "60%"
+height = 18
+
+# prefix+e is Herdr's edit_scrollback; this edits the task's notes.md.
+[[keys.command]]
+key = "prefix+shift+e"
+type = "popup"
+command = "ITM_POPUP=1 itm notes"
+description = "task notes"
+width = "80%"
+height = "80%"
+
+[[keys.command]]
+key = "prefix+i"
+type = "popup"
+command = "ITM_POPUP=1 itm jump"
+description = "task waiting longest"
+width = "60%"
+height = 4
+
+# prefix+tab is Herdr's cycle_pane_next by default; choose another key if
+# you use that.
+[[keys.command]]
+key = "prefix+tab"
+type = "popup"
+command = "ITM_POPUP=1 itm last"
+description = "previous task"
+width = "60%"
+height = 4
+
+# itm shows its notifications as Herdr toasts in the attached session.
+# Add this to your existing [ui.toast] section if you have one.
+[ui.toast]
+delivery = "herdr"
