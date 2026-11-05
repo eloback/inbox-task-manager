@@ -40,6 +40,16 @@ description = "task notes"
 width = "80%"
 height = "80%"
 
+# Save the workspace you are in as a project of the current task (and name
+# the workspace after it, so Herdr stops renaming it when its folder changes).
+[[keys.command]]
+key = "prefix+shift+a"
+type = "popup"
+command = "ITM_POPUP=1 itm project add-workspace"
+description = "workspace as project"
+width = "70%"
+height = 18
+
 [[keys.command]]
 key = "prefix+i"
 type = "popup"

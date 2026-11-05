@@ -45,7 +45,6 @@ import inbox_task_manager as core
 THEME = "catppuccin-mocha"
 VIEWS = [("inbox", "Inbox"), ("snoozed", "Snoozed"), ("archived", "Archived"), ("all", "All")]
 REFRESH_SECONDS = 2.0
-NO_PROJECT = "-"
 NEW_ROW = "__new__"
 
 # Clone processes started by this app; stopped when it exits for any reason.
@@ -176,6 +175,10 @@ def project_name(snap: Snapshot, project_id: str | None) -> str | None:
     return project["name"] if project else None
 
 
+def project_names(snap: Snapshot, task: dict) -> list[str]:
+    return [name for pid in core.task_projects(task) if (name := project_name(snap, pid))]
+
+
 def blocked_agents(snap: Snapshot, name: str) -> list[dict]:
     return [a for a in snap.status.get(name, {}).get("agents", []) if a.get("status") == "blocked"]
 
@@ -202,10 +205,13 @@ def filter_token(name: str) -> str:
     return f'@"{name}"' if " " in name else f"@{name}"
 
 
-def badge(name: str | None, width: int = 10) -> Content:
+def badge(name: str | None, width: int = 10, more: int = 0) -> Content:
+    """A project name in ``width`` cells; ``more`` other projects show as "+n"."""
     if not name:
         return Content(" " * width)
-    text = markup("[$secondary]◆ $n[/]", n=name if len(name) <= width - 3 else name[: width - 4] + "…")
+    extra = f" +{more}" if more else ""
+    room = width - 3 - len(extra)
+    text = markup("[$secondary]◆ $n[/][$text-muted]$e[/]", n=name if len(name) <= room else name[: room - 1] + "…", e=extra)
     return text + Content(" " * max(1, width - text.cell_length))
 
 
@@ -239,7 +245,8 @@ def task_row(snap: Snapshot, name: str, task: dict, now: float) -> Content:
     title_text = task["title"] if len(task["title"]) <= 28 else task["title"][:27] + "…"
     title = Content.from_markup(f"{icon} $t", t=title_text)
     pad = max(2, 31 - title.cell_length)
-    return title + Content(" " * pad) + badge(project_name(snap, task.get("project"))) + detail
+    names = project_names(snap, task)
+    return title + Content(" " * pad) + badge(names[0] if names else None, 12, more=len(names) - 1) + detail
 
 
 _NOTES_META = re.compile(r"\*Created .*\*")
@@ -466,17 +473,18 @@ def saved_repository(projects: dict, url: str) -> str | None:
 
 
 class ProjectField(Static, can_focus=True):
-    """The task form's project. Enter, Space, typing, a paste or a click opens ``ProjectPicker``.
+    """The task form's projects. Enter, Space, typing, a paste or a click opens ``ProjectPicker``.
 
-    ``value`` is a project id or ``NO_PROJECT``; a change posts ``Changed``.
-    Keys that arrive before the picker is up go into that same picker, never
-    into a second one.
+    ``value`` is a tuple of project ids, the first where the session starts;
+    Backspace removes the last one. A change posts ``Changed``. Keys that
+    arrive before the picker is up go into that same picker, never into a
+    second one.
     """
 
-    value = reactive(NO_PROJECT, init=False)
+    value = reactive((), init=False)
 
     class Changed(Message):
-        def __init__(self, field: ProjectField, value: str) -> None:
+        def __init__(self, field: ProjectField, value: tuple[str, ...]) -> None:
             super().__init__()
             self.field, self.value = field, value
 
@@ -484,11 +492,11 @@ class ProjectField(Static, can_focus=True):
         def control(self) -> ProjectField:
             return self.field
 
-    def __init__(self, projects: dict, value: str, **kwargs) -> None:
+    def __init__(self, projects: dict, value: Sequence[str], **kwargs) -> None:
         super().__init__("", **kwargs)
         self.projects = projects
         self.picker: ProjectPicker | None = None
-        self.set_reactive(ProjectField.value, value)
+        self.set_reactive(ProjectField.value, tuple(value))
 
     def on_mount(self) -> None:
         self.show()
@@ -497,22 +505,52 @@ class ProjectField(Static, can_focus=True):
         self.show()
         self.post_message(self.Changed(self, self.value))
 
+    # has_focus is not set yet while the Focus and Blur handlers run: they say it.
     def on_focus(self) -> None:
-        self.show()
+        self.show(focused=True)
 
     def on_blur(self) -> None:
+        self.show(focused=False)
+
+    def on_resize(self) -> None:
         self.show()
 
-    def show(self) -> None:
-        project = self.projects.get(self.value)
-        text = project_line(project) if project else markup("[$text-muted]No project[/]")
-        if self.has_focus:
-            text = text + markup("  [$accent]enter or type to search[/]")
-        self.update(text)
+    def show(self, focused: bool | None = None) -> None:
+        chosen = [self.projects[pid] for pid in self.value if pid in self.projects]
+        width = self.content_size.width or 60
+        hint = Content("")
+        if self.has_focus if focused is None else focused:  # the key hint is never cut off: the projects give way
+            hint = markup("  [$accent]$h[/]", h="enter or type to add" + (" · ⌫ removes the last" if chosen else ""))
+        if not chosen:
+            text = markup("[$text-muted]No project[/]")
+        elif len(chosen) == 1 and project_line(chosen[0]).cell_length + hint.cell_length <= width:
+            text = project_line(chosen[0])
+        else:
+            text, shown = Content(""), 0
+            for i, project in enumerate(chosen):
+                rest = len(chosen) - i - 1
+                room = width - hint.cell_length - text.cell_length - (len(f"+{rest}") if rest else 0)
+                size = min(len(project["name"]), 20) + 4  # name_badge is exactly this wide
+                if size > room:
+                    if shown or room < 6:
+                        break
+                    size = room  # the first one, shortened
+                text, shown = text + name_badge(project["name"], size), shown + 1
+            if shown < len(chosen):
+                text = text + markup("[$text-muted]$n[/]", n=f"+{len(chosen) - shown}" if shown
+                                     else f"{len(chosen)} projects")
+        self.update(text + hint)
 
     def on_key(self, event) -> None:
         if event.key in ("enter", "space") and self.picker is None:
             text = ""
+        elif event.key == "backspace":
+            event.stop()
+            if self.picker is not None:  # typed before the picker's search box was up: it belongs there
+                self.picker.feed_backspace()
+            else:
+                self.value = self.value[:-1]
+            return
         elif event.is_printable and event.character:
             text = event.character
         else:
@@ -533,7 +571,7 @@ class ProjectField(Static, can_focus=True):
             self.picker.feed(text)
             return
 
-        def picked(value: str | None) -> None:
+        def picked(value: tuple[str, ...] | None) -> None:
             self.picker = None
             if value is not None:
                 self.projects = core.Store().load()["projects"]  # the picker may have added one
@@ -548,9 +586,10 @@ class ProjectField(Static, can_focus=True):
 class ProjectPicker(Dialog):
     """Fuzzy finder over the saved projects; a typed path lists folders to add, a URL offers a clone.
 
-    Returns a project id, ``NO_PROJECT``, or None (Esc: the form keeps its choice).
-    Rows are (label, action): ("project", id), ("none",), ("add", kind, source)
-    or ("folder", path, saved project id or None).
+    Picking a project adds it to ``chosen``, or removes it when chosen already.
+    Returns the new tuple of project ids, or None (Esc: the form keeps its
+    projects). Rows are (label, action): ("project", id), ("none",), ("add",
+    kind, source) or ("folder", path, saved project id or None).
     """
 
     BINDINGS = [
@@ -560,9 +599,9 @@ class ProjectPicker(Dialog):
         Binding("tab,shift+tab", "complete", show=False, priority=True),
     ]
 
-    def __init__(self, current: str = NO_PROJECT, query: str = "") -> None:
+    def __init__(self, chosen: Sequence[str] = (), query: str = "") -> None:
         super().__init__()
-        self.current = current
+        self.chosen = tuple(chosen)
         self.query_text = query
         self.data = core.Store().load()
         self.folders = {pid: Path(p["path"]).is_dir() for pid, p in self.data["projects"].items()}
@@ -572,13 +611,13 @@ class ProjectPicker(Dialog):
 
     def compose(self) -> ComposeResult:
         with Vertical(id="dialog", classes="wide"):
-            yield Static("Project", classes="dtitle")
+            yield Static("Projects", classes="dtitle")
             # No select_on_focus: the key that opened the picker must not be replaced by the next one.
             yield Input(self.query_text, placeholder="Search projects, or type ~/folder, /folder or a git URL",
                         id="pquery", compact=True, select_on_focus=False)
             yield OptionList(id="pchoices")
             yield Static("", id="pstatus")
-            yield Static(markup("[$accent b]enter[/] choose   [$accent b]tab[/] complete a folder   "
+            yield Static(markup("[$accent b]enter[/] add · remove a ✓ one   [$accent b]tab[/] complete a folder   "
                                 "[$accent b]↑↓[/] move   [$accent b]esc[/] back"), classes="dhint")
 
     def on_mount(self) -> None:
@@ -596,6 +635,13 @@ class ProjectPicker(Dialog):
             self.query_text += text
             return
         boxes.first(Input).insert_text_at_cursor(text)
+
+    def feed_backspace(self) -> None:
+        boxes = self.query("#pquery")
+        if not boxes:
+            self.query_text = self.query_text[:-1]
+            return
+        boxes.first(Input).action_delete_left()
 
     def on_key(self, event) -> None:
         # Keys that arrive after this screen is up but before the search box has
@@ -624,11 +670,17 @@ class ProjectPicker(Dialog):
             rows = self.project_rows(text)
         self.show_rows(text, rows)
 
+    def project_row(self, pid: str, matched: Sequence[int] = ()) -> tuple:
+        """A saved project's row, marked ✓ when chosen (picking it then removes it)."""
+        mark = markup("[$success]✓[/] ") if pid in self.chosen else Content("  ")
+        return mark + project_line(self.data["projects"][pid], matched, not self.folders.get(pid, True)), ("project", pid)
+
     def project_rows(self, text: str) -> list[tuple]:
         projects = core.projects_by_recent(self.data["projects"])
+        none = (markup("  [$text-muted]Remove all projects[/]"), ("none",))
         if not text:
-            rows = [(markup("[$text-muted]No project[/]"), ("none",))]
-            rows += [(project_line(p, missing=not self.folders.get(pid, True)), ("project", pid)) for pid, p in projects]
+            rows = [none] if self.chosen else []
+            rows += [self.project_row(pid) for pid, _ in projects]
         else:
             scored = []
             for rank, (pid, p) in enumerate(projects):
@@ -638,16 +690,13 @@ class ProjectPicker(Dialog):
                 score = max(name[0] if name else 0, int(where[0] * 0.8) if where else 0)
                 if score:
                     matched = name[1] if name and name[0] >= score else ()
-                    scored.append((-score, rank, (project_line(p, matched, not self.folders.get(pid, True)),
-                                                  ("project", pid))))
+                    scored.append((-score, rank, self.project_row(pid, matched)))
             rows = [row for *_, row in sorted(scored, key=lambda r: r[:2])]
-            if core.fuzzy_match(text, "No project"):
-                rows.append((markup("[$text-muted]No project[/]"), ("none",)))
             if looks_like_git_url(text):
                 saved = saved_repository(self.data["projects"], text)
                 if saved:
-                    rows.insert(0, (project_line(self.data["projects"][saved]) + markup("  [$text-muted]saved[/]"),
-                                    ("project", saved)))
+                    prompt, action = self.project_row(saved)
+                    rows.insert(0, (prompt + markup("  [$text-muted]saved[/]"), action))
                 else:
                     rows.insert(0, (markup("[$accent]+ Clone[/] $u", u=text), ("add", "git", text)))
         rows += [(markup("[$accent]+ Add git repository…[/]"), ("add", "git", "")),
@@ -674,7 +723,8 @@ class ProjectPicker(Dialog):
             project = self.data["projects"].get(pid) if pid else None
             line = markup(f"{prefix}$p", p=path)
             if project:
-                line = line + markup("  [$secondary]◆ $n[/] [$text-muted]saved[/]", n=project["name"])
+                line = line + markup("  [$secondary]◆ $n[/] [$text-muted]$s[/]", n=project["name"],
+                                     s="✓ chosen" if pid in self.chosen else "saved")
             return line
 
         # The folder the text names, when it exists (the parent's listing says so).
@@ -713,9 +763,10 @@ class ProjectPicker(Dialog):
             choices.highlighted = None
         elif text:
             choices.highlighted = 0
-        else:
-            choices.highlighted = next((i for i, (_, action) in enumerate(rows) if action == ("project", self.current)
-                                        or (action == ("none",) and self.current == NO_PROJECT)), 0)
+        else:  # the most recent project not chosen yet: adding one is the common case; never "remove all"
+            choices.highlighted = next((i for i, (_, action) in enumerate(rows)
+                                        if action[0] == "project" and action[1] not in self.chosen),
+                                       next((i for i, (_, action) in enumerate(rows) if action[0] == "add"), 0))
 
     def action_move(self, step: int) -> None:
         choices = self.query_one("#pchoices", OptionList)
@@ -744,30 +795,33 @@ class ProjectPicker(Dialog):
     def clicked(self, event: OptionList.OptionSelected) -> None:
         self.pick(self.rows[int(event.option.id)][1])
 
+    def toggled(self, pid: str) -> tuple[str, ...]:
+        return tuple(p for p in self.chosen if p != pid) if pid in self.chosen else (*self.chosen, pid)
+
     def pick(self, action: tuple) -> None:
         kind = action[0]
         if kind == "project":
-            self.dismiss(action[1])
+            self.dismiss(self.toggled(action[1]))
         elif kind == "none":
-            self.dismiss(NO_PROJECT)
+            self.dismiss(())
         elif kind == "folder" and action[2]:
-            self.dismiss(action[2])  # already saved: that project
+            self.dismiss(self.toggled(action[2]))  # already saved: that project
         else:
             add_kind, source = ("dir", action[1]) if kind == "folder" else action[1:]
             screen = AddProjectScreen(add_kind, source=source, focus="name" if source else "source")
 
             def added(pid: str | None) -> None:  # returns nothing: Textual awaits what a callback returns
                 if pid:
-                    self.dismiss(pid)
+                    self.dismiss((*self.chosen, pid))
 
             self.app.push_screen(screen, added)
 
 
 class TaskForm(Dialog):
-    """New task (title, description, project, snooze) or edit task.
+    """New task (title, description, projects, snooze) or edit task.
 
-    Returns {"title", "description", "project", "until"} for a new task, and
-    {"title", "description"} plus "project" when it changed for an edit.
+    Returns {"title", "description", "projects", "until"} for a new task, and
+    {"title", "description", "add", "remove"} (project ids) for an edit.
     ``session_effect`` (edit only) is ``core.project_change_effect`` for the task.
     """
 
@@ -777,7 +831,7 @@ class TaskForm(Dialog):
         self,
         title: str = "",
         description: str | None = None,
-        project: str | None = None,
+        projects: Sequence[str] | None = None,
         until: int | str | None = None,
         task: dict | None = None,
         task_name: str | None = None,
@@ -788,13 +842,24 @@ class TaskForm(Dialog):
         self.editing = task is not None
         self.initial_title = (task or {}).get("title", title or "")
         self.initial_desc = (task or {}).get("description", description or "")
-        self.project = (task or {}).get("project") or project or NO_PROJECT
-        self.initial_project = self.project
+        self.data = core.Store().load()
+        given = core.task_projects(task) if task else list(projects or [])
+        self.projects = self.initial_projects = tuple(p for p in given if p in self.data["projects"])
+        # Projects whose workspace is open are kept while projects follow workspaces
+        # (edit_task's rule: a running session, a running daemon keeping the record).
+        self.config_error = None
+        self.pinned: set[str] = set()
+        if task is not None and session_effect == "running":
+            try:
+                follows = core.load_config()["herdr"]["projects_from_workspaces"]
+            except core.ItmError as exc:  # treated as off, like the daemon does
+                follows, self.config_error = False, str(exc)
+            if follows and core.read_status()[1]:
+                self.pinned = set(core.task_list(task, "workspace_projects"))
         self.until = until
         self.task_name = task_name
         self.session_effect = session_effect
         self.cannot_switch = cannot_switch
-        self.data = core.Store().load()
         # Fixed while the form is open, so indexes stay valid (core rejects a
         # time that has passed meanwhile). No "until an agent": a new task has
         # no agents yet.
@@ -811,10 +876,8 @@ class TaskForm(Dialog):
                 yield TextArea(self.initial_desc, id="desc", compact=True, soft_wrap=True, show_line_numbers=False,
                                tab_behavior="focus", placeholder="Optional. Enter adds a line.")
             with Horizontal(classes="field"):
-                yield Static("Project", classes="label")
-                value = self.project if self.project in self.data["projects"] else NO_PROJECT
-                self.project = self.initial_project = value
-                yield ProjectField(self.data["projects"], value, id="project")
+                yield Static("Projects", classes="label")
+                yield ProjectField(self.data["projects"], self.projects, id="project")
             if not self.editing:
                 with Horizontal(classes="field"):
                     yield Static("Snooze", classes="label")
@@ -849,10 +912,10 @@ class TaskForm(Dialog):
         self.query_one("#snooze-text", Input).value = datetime.fromtimestamp(until).strftime("%Y-%m-%d %H:%M")
 
     def typed(self) -> bool:
-        """Whether Esc would lose something: text, or (when editing) a changed project."""
+        """Whether Esc would lose something: text, or (when editing) changed projects."""
         title = self.query_one("#title", Input).value.strip()
         desc = self.query_one("#desc", TextArea).text.strip()
-        changed_project = self.editing and self.project != self.initial_project
+        changed_project = self.editing and self.projects != self.initial_projects
         return changed_project or (title, desc) != (self.initial_title.strip(), (self.initial_desc or "").strip())
 
     def action_cancel(self) -> None:
@@ -881,8 +944,13 @@ class TaskForm(Dialog):
     @on(ProjectField.Changed, "#project")
     def project_changed(self, event: ProjectField.Changed) -> None:
         self.data = core.Store().load()  # the picker may have added a project
-        self.project = event.value
+        self.projects = tuple(event.value)
         self.update_where()
+
+    def blocked_removals(self) -> list[str]:
+        """Names of removed projects that still have a workspace (the edit would be refused)."""
+        return [self.data["projects"][pid]["name"] for pid in self.initial_projects
+                if pid not in self.projects and pid in self.pinned and pid in self.data["projects"]]
 
     def snooze_value(self) -> int | str | None:
         """The chosen snooze; raises ItmError for a time that does not parse."""
@@ -899,25 +967,34 @@ class TaskForm(Dialog):
 
     def update_where(self) -> None:
         where = self.query_one("#where", Static)
+        projects = [self.data["projects"][pid] for pid in self.projects if pid in self.data["projects"]]
         if self.editing:
             lines = [markup("[$text-muted]Session[/]   $s", s=self.task_name or "")]
-            project = self.data["projects"].get(self.project)
-            if project and self.project != self.initial_project:
-                folder = core.display_path(project["path"])
-                if not Path(project["path"]).is_dir():
-                    effect = "[$error]Its folder $f is missing; the session would start in $d instead[/]"
-                else:
-                    effect = "[$text-muted]" + {
-                        "starts": "Its session will start in $f",
-                        "tab": "Its session keeps running where it is; a new tab opens in $f",
-                        "stopped": "Its stopped session keeps its folders; open a tab in $f when you need it",
-                        None: "Herdr did not answer, so it is unknown whether its session runs",
-                    }[self.session_effect] + "[/]"
-                lines.append(markup(effect, f=folder, d=core.display_path(core.task_dir())))
+            added = [self.data["projects"][pid] for pid in self.projects
+                     if pid not in self.initial_projects and pid in self.data["projects"]]
+            missing = [core.display_path(p["path"]) for p in added if not Path(p["path"]).is_dir()]
+            present = [core.display_path(p["path"]) for p in added if Path(p["path"]).is_dir()]
+            if missing:
+                lines.append(markup("[$error]$f missing, so no workspace opens there[/]", f=", ".join(missing)))
+            if present:
+                lines.append(markup("[$text-muted]" + {
+                    "starts": "Its session will start with a workspace in $f",
+                    "running": "A workspace opens in $f, in its running session",
+                    "stopped": "Its stopped session keeps its workspaces; open one in $f when you need it",
+                    None: "Herdr did not answer, so it is unknown whether its session runs",
+                }[self.session_effect] + "[/]", f=", ".join(present)))
+            if blocked := self.blocked_removals():
+                lines.append(markup("[$error]$n still has a workspace in this task; close it in Herdr first[/]",
+                                    n=", ".join(blocked)))
+            if self.config_error:
+                lines.append(markup("[$warning]Settings ignored, projects do not follow workspaces: $e[/]",
+                                    e=self.config_error))
             where.update(join_lines(lines))
             return
-        project = self.data["projects"].get(self.project)
-        folder = core.display_path(project["path"]) if project else core.display_path(core.task_dir())
+        # As the session will: the first project whose folder exists, a workspace for each.
+        present = [p for p in projects if p.get("path") and Path(p["path"]).is_dir()]
+        missing = [p["name"] for p in projects if p not in present]
+        folder = core.display_path(present[0]["path"] if present else core.task_dir())
         title = self.query_one("#title", Input).value
         try:
             snoozed = self.snooze_value() is not None
@@ -929,8 +1006,14 @@ class TaskForm(Dialog):
             then = f"Saved without switching: {self.cannot_switch}"
         else:
             then = "Then switches you to it"
-        where.update(markup("[$text-muted]Starts in[/] $f\n[$text-muted]Session[/]   task-$s\n[$text-muted]$t[/]",
-                            f=folder, s=core.slugify(title) if title.strip() else "…", t=then))
+        lines = [markup("[$text-muted]Starts in[/] $f", f=folder)]
+        if len(present) > 1:
+            lines.append(markup("[$text-muted]Workspaces[/] $n", n=" · ".join(p["name"] for p in present)))
+        if missing:
+            lines.append(markup("[$error]Missing, so no workspace: $n[/]", n=", ".join(missing)))
+        lines += [markup("[$text-muted]Session[/]   task-$s", s=core.slugify(title) if title.strip() else "…"),
+                  markup("[$text-muted]$t[/]", t=then)]
+        where.update(join_lines(lines))
 
     @on(Input.Submitted, "#title")
     @on(Input.Submitted, "#snooze-text")
@@ -942,19 +1025,23 @@ class TaskForm(Dialog):
             self.query_one("#title", Input).focus()
             return
         desc = self.query_one("#desc", TextArea).text.strip()
-        project = None if self.project == NO_PROJECT else self.project
         if self.editing:
-            result = {"title": title, "description": desc}
-            if self.project != self.initial_project:
-                result["project"] = project
-            self.dismiss(result)
+            if blocked := self.blocked_removals():
+                error.update(markup("[$error]$n still has a workspace in this task; close it in Herdr first, or turn "
+                                    "off “projects follow workspaces” in the settings (ctrl+s in the switcher).[/]",
+                                    n=", ".join(blocked)))
+                return
+            self.dismiss({"title": title, "description": desc,
+                          "add": [p for p in self.projects if p not in self.initial_projects],
+                          "remove": [p for p in self.initial_projects if p not in self.projects],
+                          "order": list(self.projects) if self.projects != self.initial_projects else []})
             return
         try:
             until = self.snooze_value()
         except core.ItmError as exc:
             error.update(markup("[$error]$e[/]", e=exc))
             return
-        self.dismiss({"title": title, "description": desc or None, "project": project, "until": until})
+        self.dismiss({"title": title, "description": desc or None, "projects": list(self.projects), "until": until})
 
 
 class AddProjectScreen(Dialog):
@@ -967,10 +1054,11 @@ class AddProjectScreen(Dialog):
         Binding("tab", "complete_or_next", show=False, priority=True),
     ]
 
-    def __init__(self, kind: str, source: str = "", focus: str = "source") -> None:
+    def __init__(self, kind: str, source: str = "", focus: str = "source", name: str = "") -> None:
         super().__init__()
         self.kind = kind
         self.source = source
+        self.name_text = name
         self.start_focus = focus
         self.proc: asyncio.subprocess.Process | None = None
         self.stopping = False
@@ -988,7 +1076,7 @@ class AddProjectScreen(Dialog):
                 yield Input(self.source, id="source", compact=True, suggester=self.suggester)
             with Horizontal(classes="field"):
                 yield Static("Name", classes="label")
-                yield Input(id="pname", compact=True)
+                yield Input(self.name_text, id="pname", compact=True)
             yield Static("", id="status")
             yield Static(markup("[$accent b]enter[/] add   [$accent b]tab[/] complete   "
                                 "[$accent b]←→[/] git / folder (empty source)   [$accent b]esc[/] back"), classes="dhint")
@@ -1241,7 +1329,8 @@ class RemoveProjectScreen(Dialog):
             yield Static(markup("Remove project [b]$n[/b]?", n=info["name"]), classes="dtitle")
             if info["users"]:
                 yield Static(markup("[$error]Used by $c task(s), archived ones included:[/]\n$t\n\n"
-                                    "[$text-muted]Delete those tasks first. Removing a project never touches a task.[/]",
+                                    "[$text-muted]Remove it from those tasks (ctrl+e) or delete them first. Removing a "
+                                    "project never touches a task.[/]",
                                     c=len(info["users"]), t="\n".join(f"  · {u}" for u in info["users"])))
                 yield Static(markup("[$accent b]esc[/] back"), classes="dhint")
                 return
@@ -1314,24 +1403,130 @@ class RenameProjectScreen(Dialog):
             self.dismiss(new)
 
 
+SETTINGS = [
+    ("Herdr integration", [
+        ("herdr", "projects_from_workspaces", "Projects follow workspaces",
+         "A running task's projects are the saved projects its workspaces are in (the folder Herdr names a "
+         "workspace after). Off: projects change only when you edit them."),
+        ("herdr", "remove_projects_without_workspace", "Remove a project when its workspace closes",
+         "With the above: a project found in a workspace leaves the task once its workspace closed; projects you "
+         "added yourself stay. Off: projects are only added."),
+    ]),
+]
+
+
+class SettingsScreen(Dialog):
+    """The settings in ``config.toml``, saved as they are toggled."""
+
+    BINDINGS = [
+        Binding("space", "toggle", show=False),
+        Binding("ctrl+j", "move(1)", show=False),
+        Binding("ctrl+k", "move(-1)", show=False),
+    ]
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.config: dict | None = None
+        self.error: str | None = None
+        self.saving = False  # one save at a time: a toggle reads the value the last save left
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="dialog", classes="wide"):
+            yield Static("Settings", classes="dtitle")
+            yield OptionList(id="settings")
+            yield Static("", id="status")
+            yield Static(markup("[$accent b]enter / space[/] toggle   [$accent b]esc[/] close"), classes="dhint")
+
+    def on_mount(self) -> None:
+        self.load()
+        self.query_one("#settings", OptionList).focus()
+
+    def load(self) -> None:
+        try:
+            self.config, self.error = core.load_config(), None
+        except core.ItmError as exc:  # shown, and nothing can be toggled until the file is fixed
+            self.config, self.error = None, str(exc)
+        self.rebuild()
+
+    def rebuild(self) -> None:
+        settings = self.query_one("#settings", OptionList)
+        keep = settings.highlighted
+        settings.clear_options()
+        for section, entries in SETTINGS:
+            settings.add_option(Option(markup("[b]$s[/b]", s=section), disabled=True))
+            for group, key, label, help_text in entries:
+                on = self.config[group][key] if self.config else core.CONFIG_DEFAULTS[group][key]
+                box = "[$success]●[/] " if on else "[$text-muted]○[/] "
+                settings.add_option(Option(markup(box + "$l\n  [$text-muted]$h[/]", l=label, h=help_text),
+                                           id=f"{group}.{key}", disabled=self.config is None))
+        where = core.display_path(core.config_path())
+        self.query_one("#status", Static).update(
+            markup("[$error]$e[/]", e=self.error) if self.error else
+            markup("[$text-muted]Saved in $p; the daemon reads it on every pass.[/]", p=where))
+        enabled = [i for i in range(settings.option_count) if not settings.get_option_at_index(i).disabled]
+        settings.highlighted = keep if keep in enabled else (enabled[0] if enabled else None)
+
+    def action_move(self, step: int) -> None:
+        settings = self.query_one("#settings", OptionList)
+        settings.action_cursor_down() if step > 0 else settings.action_cursor_up()
+
+    def action_toggle(self) -> None:
+        settings = self.query_one("#settings", OptionList)
+        if settings.highlighted is not None:
+            self.toggle(settings.get_option_at_index(settings.highlighted).id)
+
+    @on(OptionList.OptionSelected, "#settings")
+    def selected(self, event: OptionList.OptionSelected) -> None:
+        self.toggle(event.option.id)
+
+    def toggle(self, option_id: str | None) -> None:
+        if not option_id or self.config is None or self.saving:
+            return
+        group, key = option_id.split(".", 1)
+        value = not self.config[group][key]
+        self.saving = True
+
+        def save() -> None:  # writes (fsync) run in a worker
+            try:
+                core.set_config(group, key, value)
+            except Exception as exc:  # noqa: BLE001 - any failure is shown, and the screen keeps working
+                self.app.call_from_thread(self.failed, str(exc) or type(exc).__name__)
+                return
+            self.app.call_from_thread(self.saved)
+
+        self.run_worker(save, thread=True, exit_on_error=False)
+
+    def saved(self) -> None:
+        self.saving = False
+        self.load()
+
+    def failed(self, error: str) -> None:
+        self.saving = False
+        self.load()
+        self.query_one("#status", Static).update(markup("[$error]Not saved: $e[/]", e=error))
+
+
 HELP = [
     ("Task list", [
         ("typing", "search titles; @name or @\"a name\" shows one project's tasks"),
         ("↑ ↓ / ctrl+k ctrl+j", "move"), ("enter", "open · wake & open · reopen · create"),
         ("tab / shift+tab", "next / previous view"), ("alt+1…9", "open row 1–9"),
-        ("ctrl+n", "new task form"), ("ctrl+e", "edit title, description, project"),
+        ("ctrl+n", "new task form"), ("ctrl+e", "edit title, description, projects"),
         ("ctrl+z", "snooze"), ("ctrl+u", "wake a snoozed task"), ("ctrl+a", "archive (asks when running)"),
         ("ctrl+d", "delete"), ("ctrl+o", "the task's notes, in your editor"), ("ctrl+p", "projects"),
+        ("ctrl+s", "settings (Herdr integration)"),
         ("? / F1", "this help (? while the search is empty)"),
         ("esc", "close"),
     ]),
     ("Task form", [("enter", "create (in Title)"), ("tab", "next field"), ("ctrl+s", "save from any field"),
-                   ("enter / typing", "on Project: open the project finder"),
+                   ("enter / typing", "on Projects: open the project finder"),
+                   ("backspace", "on Projects: remove the last one"),
                    ("esc", "cancel; asks when you typed something")]),
     ("Project finder", [("typing", "find a saved project (letters in order, any case)"),
+                        ("enter", "add it; on a ✓ project, remove it"),
                         ("~/… or /…", "list folders; enter adds one as a project"),
                         ("tab", "go into the highlighted folder"), ("a git URL", "clone it, or pick it when saved"),
-                        ("↑ ↓ / ctrl+k ctrl+j", "move"), ("enter", "choose"), ("esc", "back, choice unchanged")]),
+                        ("↑ ↓ / ctrl+k ctrl+j", "move"), ("esc", "back, projects unchanged")]),
     ("Add project", [("tab", "complete a folder path"), ("←→", "git / folder (empty source)"),
                      ("enter", "add (clone)"), ("esc", "back; stops a clone")]),
     ("Projects", [("enter", "show its tasks"), ("ctrl+k ctrl+j", "move"), ("ctrl+n", "add"), ("ctrl+r", "rename"),
@@ -1399,7 +1594,7 @@ class ProjectsScreen(Screen):
         plist.clear_options()
         now = time.time()
         for pid, p in core.projects_by_recent(snap.data["projects"]):
-            tasks = [t for t in snap.data["tasks"].values() if t.get("project") == pid]
+            tasks = [t for t in snap.data["tasks"].values() if pid in core.task_projects(t)]
             open_ = sum(t["state"] != "archived" for t in tasks)
             count = f"{len(tasks)} task{'s' if len(tasks) != 1 else ''}" + (f" · {open_} open" if tasks else "")
             where = core.project_where(p)
@@ -1499,6 +1694,7 @@ class ItmApp(App):
     .dtitle { text-style: bold; padding: 0 0 1 0; }
     .dhint { padding: 1 0 0 0; }
     #presets, #clone { height: auto; max-height: 8; border: none; background: $surface; margin-top: 1; }
+    #settings { height: auto; max-height: 16; border: none; background: $surface; }
     #pchoices { height: auto; max-height: 12; border: none; background: $surface; margin-top: 1; }
     #pquery { background: $surface-lighten-1; padding: 0 1; }
     #project { width: 1fr; height: 1; background: $surface-lighten-1; padding: 0 1; }
@@ -1572,6 +1768,7 @@ class Switcher(ItmApp):
         Binding("ctrl+e", "edit", "edit", priority=True),
         Binding("ctrl+p", "projects", "projects", priority=True),
         Binding("ctrl+o", "notes", "notes", priority=True),
+        Binding("ctrl+s", "settings", "settings", priority=True),
         Binding("f1", "help", "all keys", priority=True),
         # "?" opens help only while the search box is empty (SearchInput); otherwise it is typed.
         Binding("question_mark", "help_if_empty", show=False, priority=True),
@@ -1581,7 +1778,7 @@ class Switcher(ItmApp):
     ] + [Binding(f"alt+{n}", f"jump({n})", show=False, priority=True) for n in range(1, 10)]
 
     MAIN_ACTIONS = {"open", "view", "new", "snooze", "wake", "archive", "delete", "edit", "projects", "notes", "move",
-                    "jump", "help", "help_if_empty", "quit"}
+                    "jump", "settings", "help", "help_if_empty", "quit"}
 
     def __init__(self, view: str = "inbox") -> None:
         super().__init__()
@@ -1711,12 +1908,13 @@ class Switcher(ItmApp):
         except core.ItmError:
             return None, tokens[0]
 
-    def default_project(self) -> str | None:
+    def default_projects(self) -> list[str]:
+        """A new task's projects: the @name filter's, else the first one of the task you are in."""
         project, unknown = self.filter_project()
         if project or unknown:
-            return project
+            return [project] if project else []
         current = self.snapshot.data["tasks"].get(self.snapshot.current or "")
-        return current.get("project") if current else None
+        return core.task_projects(current)[:1] if current else []
 
     def visible(self) -> list[tuple[str, dict]]:
         _, text = parse_query(self.search_text())
@@ -1727,7 +1925,7 @@ class Switcher(ItmApp):
         rows = [
             (name, task) for name, task in snap.data["tasks"].items()
             if in_view(task, self.view) and text.lower() in task["title"].lower()
-            and (project is None or task.get("project") == project)
+            and (project is None or project in core.task_projects(task))
         ]
         order = {"active": 0, "snoozed": 1, "archived": 2}
         return sorted(rows, key=lambda r: (not blocked_agents(snap, r[0]), order[r[1]["state"]],
@@ -1758,10 +1956,10 @@ class Switcher(ItmApp):
         if unknown:
             olist.add_option(Option(markup("[$warning]No project named “$u”[/]", u=unknown), disabled=True))
         if not rows and text:
-            into = project_name(snap, self.default_project())
+            into = [name for pid in self.default_projects() if (name := project_name(snap, pid))]
             label = markup("[$accent]+[/] Create task “$q”", q=text)
             if into:
-                label = label + markup(" in [$secondary]◆ $p[/]", p=into)
+                label = label + markup(" in [$secondary]◆ $p[/]", p=into[0])
             olist.add_option(Option(label, id=NEW_ROW))
         ids = [olist.get_option_at_index(i).id for i in range(olist.option_count)]
         enabled = [i for i in range(olist.option_count) if not olist.get_option_at_index(i).disabled]
@@ -1800,13 +1998,16 @@ class Switcher(ItmApp):
         name, task = picked
         now = time.time()
         parts = [markup("[b]$t[/b]", t=task["title"])]
-        project = snap.data["projects"].get(task.get("project") or "")
-        if project:
-            parts.append(markup("[$secondary]◆ $n[/]  [$text-muted]$k[/]", n=project["name"], k=project["kind"]))
-            parts.append(markup("[$text-muted]$w[/]", w=core.project_where(project)))
-            if not snap.folders.get(task["project"], True):
-                parts.append(markup("[$error]Its folder is missing; the session starts in $d instead.[/]",
-                                    d=core.display_path(core.task_dir())))
+        running = snap.sessions.get(name, {}).get("running")
+        open_ = set(task.get("workspace_projects", [])) if running else set()
+        for pid in core.task_projects(task):
+            if (project := snap.data["projects"].get(pid)) is None:
+                continue
+            parts.append(markup("[$secondary]◆ $n[/]  [$text-muted]$k[/]", n=project["name"], k=project["kind"])
+                         + (markup("  [$success]workspace open[/]") if pid in open_ else Content("")))
+            parts.append(markup("[$text-muted]  $w[/]", w=core.project_where(project)))
+            if not snap.folders.get(pid, True):
+                parts.append(markup("[$error]  Its folder is missing, so it gets no workspace.[/]"))
         if task.get("description"):
             parts.append(Content(""))
             lines = task["description"].splitlines()
@@ -1838,8 +2039,11 @@ class Switcher(ItmApp):
             if not snap.listed:
                 parts.append(markup("[$warning]Session unknown: Herdr is not answering[/]"))
             elif name not in snap.sessions:
-                folder = core.display_path(project["path"]) if project else core.display_path(core.task_dir())
-                parts.append(markup("[$text-muted]Not started yet · starts in $f[/]", f=folder))
+                folders = [p["path"] for pid in core.task_projects(task)
+                           if (p := snap.data["projects"].get(pid)) and snap.folders.get(pid, True)]
+                folder = core.display_path(folders[0] if folders else core.task_dir())
+                more = f", with {len(folders)} workspaces" if len(folders) > 1 else ""
+                parts.append(markup("[$text-muted]Not started yet · starts in $f$m[/]", f=folder, m=more))
             elif not snap.sessions[name].get("running"):
                 parts.append(markup("[$text-muted]Session stopped · opens where you left it[/]"))
             elif snap.fresh:
@@ -1893,7 +2097,7 @@ class Switcher(ItmApp):
     def action_open(self) -> None:
         if self.highlighted_id() == NEW_ROW:
             _, text = parse_query(self.search_text())
-            self.create({"title": text, "description": None, "project": self.default_project(), "until": None})
+            self.create({"title": text, "description": None, "projects": self.default_projects(), "until": None})
             return
         if picked := self.current_task():
             self.switch(picked[0])
@@ -1912,13 +2116,13 @@ class Switcher(ItmApp):
                 self.query_one("#search", Input).value = ""
                 self.flash(f"Saved “{answers['title']}” without switching: {self.snapshot.switch_problem}", True)
 
-        self.run_core(core.create_task, answers["title"], answers["description"], answers["project"], answers["until"],
+        self.run_core(core.create_task, answers["title"], answers["description"], answers["projects"], answers["until"],
                       done=created)
 
     def action_new(self) -> None:
         _, text = parse_query(self.search_text())
         cannot = None if self.snapshot.can_switch else self.snapshot.switch_problem
-        self.push_screen(TaskForm(text, project=self.default_project(), cannot_switch=cannot), self.create)
+        self.push_screen(TaskForm(text, projects=self.default_projects(), cannot_switch=cannot), self.create)
 
     def leave_if_current(self, name: str) -> None:
         """After moving this client off its own task, the popup must not stay open in that session."""
@@ -1982,13 +2186,16 @@ class Switcher(ItmApp):
 
         def saved(answers: dict | None) -> None:
             if answers:
-                self.run_core(core.edit_task, name, answers["title"], answers["description"],
-                              answers.get("project", core.UNSET), done=done)
+                self.run_core(lambda: core.edit_task(name, answers["title"], answers["description"], add=answers["add"],
+                                                     remove=answers["remove"], order=answers["order"]), done=done)
 
         self.push_screen(TaskForm(task=task, task_name=name, session_effect=effect), saved)
 
     def action_projects(self) -> None:
         self.push_screen(ProjectsScreen())
+
+    def action_settings(self) -> None:
+        self.push_screen(SettingsScreen())
 
     def action_notes(self) -> None:
         """Edit the highlighted task's notes; the app steps aside while the editor runs."""
@@ -2045,9 +2252,9 @@ def switcher(view: str = "inbox") -> tuple[str, str] | None:
     return run(Switcher(view))
 
 
-def task_form(title: str = "", description: str | None = None, project: str | None = None,
+def task_form(title: str = "", description: str | None = None, projects: Sequence[str] | None = None,
               until: int | str | None = None, cannot_switch: str | None = None) -> dict | None:
-    return run(DialogApp(TaskForm(title, description, project, until, cannot_switch=cannot_switch)))
+    return run(DialogApp(TaskForm(title, description, projects, until, cannot_switch=cannot_switch)))
 
 
 def edit_form(name: str) -> dict | None:
@@ -2071,3 +2278,8 @@ def confirm_delete(title: str) -> bool:
 
 def remove_project_dialog(info: dict) -> str | None:
     return run(DialogApp(RemoveProjectScreen(info)))
+
+
+def add_project_dialog(kind: str, source: str = "", name: str = "") -> str | None:
+    """The add dialog, filled in; returns the new project's id, or None."""
+    return run(DialogApp(AddProjectScreen(kind, source=source, focus="name" if source else "source", name=name)))

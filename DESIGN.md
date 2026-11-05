@@ -46,7 +46,37 @@ Verified against Herdr 0.9.3. Re-check them after a Herdr upgrade.
   server without a client.
 - **Tabs.** `herdr tab create --cwd <path> --label <name> --focus|--no-focus`
   against a session's socket opens a tab in a running session (in its active
-  workspace). itm uses it when a running task gets a new project.
+  workspace). The label names the tab, not the workspace.
+- **Workspace names.** A workspace keeps `custom_name` and `identity_cwd` in
+  the session's `session.json`. Its label is `custom_name` when set, else the
+  last segment of `identity_cwd` (the folder name, not a repository's name).
+  `identity_cwd` follows the working folder of one pane only: the first pane
+  (in layout order) of the first tab (in tab order). A `cd` in another tab or
+  pane, or focusing another tab, changes nothing; when that pane or tab
+  closes, the next first pane takes over; moving a tab to the front makes its
+  first pane the one. Herdr keeps tracking `identity_cwd` for a named
+  workspace but shows the name. A name comes from `workspace create --label`
+  or `workspace rename` (or `prefix+shift+w`) and survives a restart. There
+  is no way back to no name: `workspace rename <id> ""` sets an empty label.
+- **The workspace's folder over the API.** No call reports `identity_cwd`.
+  `herdr api snapshot` has the workspaces, the tabs in order, each tab's
+  layout with its panes in layout order, and each pane's `cwd`, which is
+  enough to find the first pane of the first tab. `session.json` has it too,
+  but is Herdr's internal format and is saved a few seconds late.
+- **Building a session before attaching.** `HERDR_SESSION=<name> herdr
+  server` starts a session with no workspace; `workspace create --cwd <path>
+  --label <name>` then adds them, and `herdr session attach` to that session
+  shows them and adds none. `herdr session attach` itself takes one folder
+  (its working folder) and no workspace name.
+- **CLI arguments.** Options take their value as the next argument, also one
+  starting with `-` (`--label -web`); `--opt=value` is refused ("unknown
+  option"), and `--` is not special (`workspace rename w1 -- x` names it
+  "-- x"). `workspace rename <id> <label>…` joins its words with spaces. A
+  `--cwd` that does not exist silently becomes `$HOME`.
+- **Popup environment.** A popup command gets the workspace, tab and pane it
+  was opened over as `HERDR_ACTIVE_WORKSPACE_ID`, `HERDR_ACTIVE_TAB_ID`,
+  `HERDR_ACTIVE_PANE_ID` and `HERDR_ACTIVE_PANE_CWD`, and no
+  `HERDR_WORKSPACE_ID` (a pane's own variable).
 
 ## 2. Rules that must stay true
 
@@ -57,8 +87,10 @@ Verified against Herdr 0.9.3. Re-check them after a Herdr upgrade.
 - Herdr owns layouts and agents. itm owns task metadata and its own
   bookkeeping:
   - `$XDG_STATE_HOME/inbox-task-manager/tasks.json`: tasks (title, optional
-    description and project id, state, times), saved projects keyed by id,
-    tombstones;
+    description and project ids, state, times, workspace bookkeeping), saved
+    projects keyed by id, tombstones;
+  - `$XDG_CONFIG_HOME/inbox-task-manager/config.toml`: settings (user
+    content; itm changes one line at a time);
   - `$XDG_DATA_HOME/inbox-task-manager/projects/<host>/<path>`: clones of
     git projects (`ITM_PROJECTS_DIR` overrides the root);
   - `$XDG_DATA_HOME/inbox-task-manager/tasks/<session>/notes.md`: task
@@ -134,7 +166,9 @@ Verified against Herdr 0.9.3. Re-check them after a Herdr upgrade.
   "Herdr not answering" when the session list fails, instead of showing
   every task as not started.
 - Every Herdr query and notification call has a timeout. `herdr session
-  attach` and the detached stop/delete run without one on purpose. One failed
+  attach`, the detached stop/delete and the headless `herdr server` of a
+  first start run without one on purpose (the server is detached; waiting
+  for it is bounded by `SESSION_START_TIMEOUT`). One failed
   daemon pass must never stop the daemon.
 - The status cache is ignored when older than 15 s. A UI must then say the
   daemon is not running instead of showing zero waiting agents.
@@ -160,15 +194,83 @@ Verified against Herdr 0.9.3. Re-check them after a Herdr upgrade.
   `name` field, never by the key. Commands accept a name (ignoring case) or an
   id. `itm list --json` rows carry the name as `project` and the id as
   `project_id`.
-- A task's session starts in its project's folder on the first start only;
-  Herdr restores it afterwards. The project can still change at any time
-  (`edit_task`): a session that never started will start in the new folder,
-  a running one gets a new tab there (`herdr tab create --cwd`, focused when
-  it is the caller's own task), and a stopped one keeps its folders. Edits
-  report which of these happened. The edit is saved first; the session list
-  is read only afterwards and only when a project was added, so a Herdr
-  failure (listing or opening the tab) becomes a note and never undoes or
-  blocks the edit. A missing project folder is reported as such.
+- A task has a list of project ids (`projects`); the first is where its
+  session starts. A `tasks.json` with the older single `project` is
+  converted when read (`Store._read`), so every reader sees `projects`.
+- A task's session gets its project workspaces on the first start only;
+  Herdr restores them afterwards. The attach loop asks Herdr whether the
+  session exists (`first_start`); when it does not and the task has projects
+  with folders, it starts the session headless and opens one workspace per
+  project, named after the project, before attaching (`prepare_first_start`,
+  `start_with_workspaces`, section 1). This runs under a lock per session in
+  `<runtime>/starting/`, checking `first_start` again inside: two clients
+  handed to the same new task must not both build it; and a session that
+  turns out to have workspaces gets none. The server gets no `HERDR_*`
+  variables but `HERDR_SESSION`; one that exits with an error is not waited
+  for (`SESSION_START_TIMEOUT` bounds the wait). A failure is printed and the
+  attach goes on (Herdr then starts the session as usual). Projects can
+  still change at any time (`edit_task`): a session that never started will
+  start with them, a running one gets a named workspace per added project
+  (`herdr workspace create --cwd --label`, the first focused when it is the
+  caller's own task), and a stopped one keeps its workspaces. Edits report
+  which of these happened. The edit is saved first; the session list is read
+  only afterwards and only when a project was added, so a Herdr failure
+  (listing or opening a workspace) becomes a note and never undoes or blocks
+  the edit. A missing project folder is reported as such, and gets no
+  workspace (Herdr would open it in `$HOME`).
+- itm never closes a workspace: it may run agents and programs the user
+  started.
+- Projects have two sources (REQUIREMENTS.md R10.1): the daemon's workspace
+  sync and hand edits (form, CLI). The sync keeps the ids it added in
+  `found_projects` and removes only those; a hand edit removes any, and one
+  that names a project (even one already there) takes it out of
+  `found_projects`, making it the user's. `itm project add-workspace` adds
+  its project as found while sync is on (closing that workspace removes it),
+  else by hand (`edit_task(found=True)`).
+- Projects without a folder (a name only) are not supported yet. The
+  workspace code skips projects without `path` (`project_roots`,
+  `task_folders`, `project_change_messages`, `project_where`); most other
+  code (adding, listing, removing projects, the TUI's folder checks) still
+  reads `path`, so supporting them means a pass over those.
+- Workspace sync (`poll_once`, when `projects_from_workspaces` is on): for
+  each running task session the daemon reads the workspaces' folders from
+  `herdr api snapshot` (`session_workspaces`) and maps each workspace to a
+  project (`workspace_project`): a workspace named after a saved project
+  (its label is not just its folder's name, which is what an unnamed
+  workspace shows) is in that project wherever its first pane went;
+  otherwise the innermost saved project holding its folder
+  (`folder_project`). Project folders are resolved once per pass
+  (`project_roots`), outside the store lock. The projects found are added
+  to the task (`sync_task_projects`) and recorded in `workspace_projects`.
+  With `remove_projects_without_workspace`, a found project that was in
+  that record and is not open now is removed, but only on a trusted pass:
+  not when a workspace's folder is unknown, and not for a session the
+  daemon did not read on its pass before (`settled`, the daemon's memory:
+  a session just started or restored, or the daemon itself just started).
+  An untrusted pass only adds and keeps the record, so a workspace that
+  closed meanwhile is noticed on the next trusted pass. A session with no
+  workspaces at all is skipped. Archived tasks are left alone. The sync
+  writes no notes (the daemon never does).
+- `workspace_projects` is only true while the daemon reads the session: the
+  daemon drops it for a task whose session is not running, and for every
+  task while sync is off; archiving drops it at once. Unnamed workspaces
+  follow their first pane, as their Herdr name does, so a `cd` there moves
+  the workspace to another project (removal included); named workspaces
+  do not.
+- Only saved projects are matched. The home folder, where tasks without
+  projects start, is in no project unless it is itself saved; a project
+  inside it does not claim it (a test keeps this true).
+- While sync is on and the daemon runs (a fresh status cache), a hand edit
+  keeps a project in `workspace_projects` instead of removing it and says
+  so ("could not remove …"); the rest of the edit is saved. The next pass
+  would add it back. Closing the workspace is the user's call. The form
+  shows this before saving for a running session.
+- `itm project add-workspace` refuses the home folder, a folder above it
+  and `task_dir()`: saved, such a folder would hold every workspace under
+  it and sync would add it to every task. `itm project add dir` still
+  saves them. It finds the workspace from `HERDR_ACTIVE_WORKSPACE_ID` (a
+  popup), else the focused one, never a pane's `HERDR_WORKSPACE_ID`, which
+  stays what it was when the pane moves to another workspace.
 - Adding and removing projects hold `.projects.lock` (`itm new` only updates
   a project's `last_used_at`, under the store lock). A clone runs under the
   projects lock but outside the store lock, because it can take minutes and
@@ -200,7 +302,7 @@ Verified against Herdr 0.9.3. Re-check them after a Herdr upgrade.
     stays ignored during the clone and cancel would then not stop it;
   - is stopped with SIGTERM on cancel and whenever the TUI exits, because in
     its own session it no longer gets the popup's SIGHUP.
-- Removing a project is refused while any task uses it, archived ones
+- Removing a project is refused while any task has it, archived ones
   included. Only a real checkout of the project's repository inside the
   projects folder, holding no other project, is ever deleted. A clone with
   local work is kept unless deletion is asked for explicitly
@@ -234,6 +336,25 @@ Verified against Herdr 0.9.3. Re-check them after a Herdr upgrade.
   description and project. The daemon never writes notes.
 - An editor that has the file open and saves after itm appended drops that
   entry (nvim warns that the file changed). Accepted.
+
+### Settings
+- `config.toml` is read on every use (`load_config`): the daemon every pass,
+  so a toggle in the switcher applies without a restart. A missing file is
+  the defaults. Unknown settings and values that are not booleans are
+  errors, so a typo does not silently do nothing.
+- `set_config` changes one `key = value` line in its section (or adds it),
+  keeps everything else, and checks that the result parses with the new
+  value before writing (atomically). A file it cannot follow (dotted keys,
+  inline tables) is refused with "edit it by hand" and left unchanged.
+- A broken file (also one that is not UTF-8) never stops the daemon: it
+  logs it once and runs without workspace sync (the safe choice: nothing is
+  added or removed) until the file is fixed. Everything else treats it as
+  off too (`follows_workspaces`); the Settings screen and the edit form show
+  the error.
+- `set_config` holds `.config.lock` next to the file, writes through a
+  symlink to its target (home-manager, stow), and turns a failed write into
+  an `ItmError`; the Settings screen saves one toggle at a time and shows
+  any failure.
 
 ### Notifications
 - Herdr's own toasts cover the attached session; the daemon notifies only for
@@ -365,8 +486,8 @@ The switcher and its dialogs follow these principles.
   import helper is `screens()`: a function named `tui` would shadow the
   submodule in `from inbox_task_manager import tui`.
 - **Popup sizes** (`contrib/herdr-keys.toml`): switcher 80% × 80%, task form 70% × 26
-  rows, snooze 60% × 18, notes 80% × 80%, jump and last 60% × 4 (only an
-  error is ever shown).
+  rows, snooze 60% × 18, notes 80% × 80%, workspace as project 70% × 18 (the
+  add dialog), jump and last 60% × 4 (only an error is ever shown).
   Dialogs are at most 100% of the popup, so a narrow terminal shrinks them.
 
 ### 2026-11-05: task notes, project finder, folder completion
@@ -419,6 +540,42 @@ The switcher and its dialogs follow these principles.
   Herdr's key bindings are not part of the module: users keep their own Herdr
   config and copy `contrib/herdr-keys.toml`.
 
+### 2026-11-05: several projects per task, Herdr workspaces as a source
+- **Why.** A task often spans repositories, and the user works in a Herdr
+  workspace per project; Herdr renames a workspace without a name whenever
+  its first pane changes folder (section 1), which itm's first workspace
+  always was (`herdr session attach` cannot name it).
+- **Choices.** Tasks hold a list of projects; the first is where the session
+  starts. A session's first start builds one named workspace per project
+  (headless start, then attach). Adding a project to a running task opens a
+  named workspace instead of the tab it opened before. The daemon follows
+  workspaces (on by default, a setting) by their folder, the one Herdr names
+  them after, not by the focused pane or every pane: a tab or pane opened to
+  look at another repository does not make it part of the task. A workspace
+  named after a project stays with it (itm names the ones it opens), so a
+  `cd` in its first pane does not move it. Projects have sources and the
+  sync removes only what it found. Settings went into a TOML file with a
+  screen in the switcher, which writes it line by line. `prefix+shift+a`
+  turns the workspace you are in into a project of the current task in one
+  step.
+- **Reviewed** (design, core and TUI reviews before merging). Changed after
+  them: `workspace_projects` dropped for sessions that stopped and while
+  sync is off, and refusals need a running daemon (a stale record blocked
+  removals for good); untrusted passes only add; first starts locked per
+  session; refused removals keep the rest of an edit; a settings file that
+  is not UTF-8 no longer stops the daemon; the hotkey refuses the home
+  folder.
+- **Considered.** Reading `identity_cwd` from `session.json` (exact, but an
+  internal format saved seconds late); matching every workspace by label
+  (an unnamed workspace's label is a folder name and can equal another
+  project's name: only a label that is not the folder's name counts);
+  closing a workspace when its project is removed (it may run agents); a
+  removal delay (debounce) for unnamed workspaces whose first pane wanders
+  (their Herdr name wanders too; named ones are stable).
+- **Not changed:** the form adds projects in order (removing and adding
+  changes which is first, and the order is kept); renaming a project leaves
+  workspace names alone (such a workspace then goes by its folder again).
+
 ## 5. Known gaps
 
 - **Agent titles.** The text shown for an agent is its terminal title (for
@@ -427,6 +584,19 @@ The switcher and its dialogs follow these principles.
   recently attached client, whichever session it is in.
 - **Short terminals.** The fixed 26-row form popup has not been tried on a
   terminal shorter than that.
+- **Workspace folder after a pane swap.** `session_workspaces` takes the
+  first pane in layout order; whether Herdr's identity pane follows a
+  `pane swap` (position) or keeps the pane (its root) was not checked.
+- **First start, end to end.** The headless start with several named
+  workspaces was checked by hand against Herdr 0.9.3 (attach adds none); the
+  attach loop's use of it is covered by unit tests only. While it runs (up
+  to `SESSION_START_TIMEOUT`), the loop's marker already names the new task
+  but no attach child exists, so a hand-off in that window (which waits
+  2 s) is dropped.
+- **Repositories by remote.** A workspace in a checkout of a saved git
+  repository other than itm's clone (your own clone, a worktree) is not
+  matched to it: projects are matched by folder, not by remote URL.
+- **Settings files** are rewritten with LF line endings.
 - **Alt+3…9.** Alt+1, Alt+2 and Alt+5 were sent to a Herdr popup; the others
   are assumed to arrive the same way.
 - **macOS and the BSDs.** The `ps` paths, `osascript` and the launchd agent
@@ -455,7 +625,8 @@ The switcher and its dialogs follow these principles.
   takes BSD-style options, which BusyBox's does not),
   missing programs and the snooze phrases itm reads itself,
   `test_tui.py` for the screens with `App.run_test()` against a temporary
-  home. Clones are tested with a fake child (`self_command` patched to a small
+  home. Every fixture sets `XDG_CONFIG_HOME` to its temporary folder too, so
+  no test reads or writes the real `config.toml`. Clones are tested with a fake child (`self_command` patched to a small
   script), including cancel and a failure that needs a password.
 - In `buildPythonApplication`, `doCheck = true` is what runs
   `installCheckPhase`; `doInstallCheck` alone is overridden.

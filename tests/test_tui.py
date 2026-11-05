@@ -33,6 +33,7 @@ class TuiTest(unittest.IsolatedAsyncioTestCase):
             "XDG_STATE_HOME": str(self.root / "state"),
             "XDG_DATA_HOME": str(self.root / "data"),
             "XDG_RUNTIME_DIR": str(self.root / "run"),
+            "XDG_CONFIG_HOME": str(self.root / "config"),
             "ITM_TASK_DIR": str(self.root / "home"),
         }
         self.env = mock.patch.dict(os.environ, env)
@@ -166,7 +167,7 @@ class TuiTest(unittest.IsolatedAsyncioTestCase):
             await pilot.press("enter")
             await self.settle(pilot, app)
         self.assertEqual(app.return_value, ("switch", "task-rate-limits"))
-        self.assertEqual(self.task("task-rate-limits")["project"], api)
+        self.assertEqual(self.task("task-rate-limits")["projects"], [api])
 
     async def test_unknown_project_filter(self):
         self.assertEqual(tui.parse_query('@"my app" fix @api'), (["my app", "api"], "fix"))
@@ -180,7 +181,7 @@ class TuiTest(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(labels[-1].startswith("+ Create task “Fix”") and " in " not in labels[-1])
             await pilot.press("ctrl+n")
             await pilot.pause()
-            self.assertEqual(app.screen.query_one("#project", tui.ProjectField).value, tui.NO_PROJECT)
+            self.assertEqual(app.screen.query_one("#project", tui.ProjectField).value, ())
 
     async def test_form_creates_with_description_and_snooze(self):
         app = tui.Switcher()
@@ -330,35 +331,40 @@ class TuiTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.task("task-a")["state"], "archived")
         self.assertIsNone(app.return_value)
 
-    async def test_edit_renames_and_adds_a_project_to_a_running_task(self):
+    async def test_edit_renames_and_adds_projects_to_a_running_task(self):
         api = core.add_project("dir", str(self.folder("code/api")), "api")
+        web = core.add_project("dir", str(self.folder("code/web")), "web")
+        old = core.add_project("dir", str(self.folder("code/old")), "old")
+        with self.store.edit() as data:
+            core.set_task_projects(data["tasks"]["task-a"], [old])
         self.sessions["task-a"] = {"running": True, "socket_path": "/sock/a"}
-        with mock.patch.object(core, "open_project_tab") as open_tab:
+        with mock.patch.object(core, "open_project_workspace") as open_workspace:
             app = tui.Switcher()
             async with app.run_test(size=(110, 34)) as pilot:
                 await self.settle(pilot, app)
                 await pilot.press("ctrl+e")
                 await pilot.pause()
                 app.screen.query_one("#title", Input).value = "Fix login fast"
-                app.screen.query_one("#project", tui.ProjectField).value = api
+                app.screen.query_one("#project", tui.ProjectField).value = (api, web)
                 await pilot.pause()
-                self.assertIn("a new tab opens in", text_of(app.screen.query_one("#where")))
+                self.assertIn("A workspace opens in", text_of(app.screen.query_one("#where")))
                 await pilot.press("ctrl+s")
                 await self.settle(pilot, app)
-                self.assertIn("opened a tab in", text_of(app.query_one("#msg")))
+                self.assertIn("opened a workspace in", text_of(app.query_one("#msg")))
         task = self.task("task-a")
-        self.assertEqual((task["title"], task["project"]), ("Fix login fast", api))
-        self.assertEqual(open_tab.call_args.args[0], "task-a")
+        self.assertEqual((task["title"], task["projects"]), ("Fix login fast", [api, web]))
+        self.assertEqual([c.args[0] for c in open_workspace.call_args_list], ["/sock/a", "/sock/a"])
+        self.assertEqual([c.args[1]["name"] for c in open_workspace.call_args_list], ["api", "web"])
 
     async def test_edit_form_says_what_a_new_project_does(self):
         api = core.add_project("dir", str(self.folder("code/api")), "api")
-        cases = {"starts": "will start in", "stopped": "keeps its folders", None: "did not answer"}
+        cases = {"starts": "will start with a workspace in", "stopped": "keeps its workspaces", None: "did not answer"}
         for effect, text in cases.items():
             with self.subTest(effect=effect):
                 app = tui.DialogApp(tui.TaskForm(task=self.task("task-a"), task_name="task-a", session_effect=effect))
                 async with app.run_test(size=(110, 34)) as pilot:
                     await pilot.pause()
-                    app.screen.query_one("#project", tui.ProjectField).value = api
+                    app.screen.query_one("#project", tui.ProjectField).value = (api,)
                     await pilot.pause()
                     self.assertIn(text, text_of(app.screen.query_one("#where")))
                     await pilot.press("escape")  # only the project changed: still asks
@@ -368,18 +374,18 @@ class TuiTest(unittest.IsolatedAsyncioTestCase):
     async def test_failed_edit_notes_are_shown_as_errors(self):
         api = core.add_project("dir", str(self.folder("code/api")), "api")
         self.sessions["task-a"] = {"running": True, "socket_path": "/sock/a"}
-        with mock.patch.object(core, "open_project_tab", side_effect=core.ItmError("no answer")):
+        with mock.patch.object(core, "open_project_workspace", side_effect=core.ItmError("no answer")):
             app = tui.Switcher()
             async with app.run_test(size=(110, 34)) as pilot:
                 await self.settle(pilot, app)
                 with mock.patch.object(app, "flash") as flash:
                     await pilot.press("ctrl+e")
                     await pilot.pause()
-                    app.screen.query_one("#project", tui.ProjectField).value = api
+                    app.screen.query_one("#project", tui.ProjectField).value = (api,)
                     await pilot.pause()
                     await pilot.press("ctrl+s")
                     await self.settle(pilot, app)
-        self.assertIn("could not open a tab", flash.call_args.args[0])
+        self.assertIn("could not open a workspace", flash.call_args.args[0])
         self.assertTrue(flash.call_args.kwargs.get("error"))
 
     async def test_vim_keys_stay_in_dialogs_and_lists(self):
@@ -450,7 +456,7 @@ class TuiTest(unittest.IsolatedAsyncioTestCase):
         api = core.add_project("dir", str(self.folder("code/api")), "api")
         notes = core.add_project("dir", str(self.folder("notes")), "notes")
         with self.store.edit() as data:
-            data["tasks"]["task-a"]["project"] = api
+            data["tasks"]["task-a"]["project"] = api  # as tasks.json had it before projects became a list
         app = tui.Switcher()
         async with app.run_test(size=(110, 30)) as pilot:
             await self.settle(pilot, app)
@@ -489,7 +495,7 @@ class TuiTest(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             self.assertEqual(app.query_one("#search", Input).value, "@backend ")
             self.assertEqual([i for i, _ in self.labels(app) if i], ["task-a"])
-        self.assertEqual(self.task("task-a")["project"], api)  # the rename kept the task
+        self.assertEqual(self.task("task-a")["projects"], [api])  # the rename kept the task
 
     async def add_dialog(self, pilot, app, source, name=""):
         await pilot.press("ctrl+p", "ctrl+n")
@@ -559,7 +565,7 @@ class TuiTest(unittest.IsolatedAsyncioTestCase):
                 await pilot.press("enter")
                 done = await self.wait_for(pilot, app, lambda: type(app.screen).__name__ == "TaskForm")
                 self.assertTrue(done)
-                project = app.screen.query_one("#project", tui.ProjectField).value
+                project, = app.screen.query_one("#project", tui.ProjectField).value
         self.assertEqual(self.store.load()["projects"][project]["name"], "backend")
         self.assertEqual(tui._children, set())
 
@@ -733,19 +739,35 @@ class TuiTest(unittest.IsolatedAsyncioTestCase):
             await pilot.press("enter")
             await pilot.pause()
             self.assertEqual(type(app.screen).__name__, "TaskForm")
-            self.assertEqual(field.value, backend)
+            self.assertEqual(field.value, (backend,))
             self.assertIn("code/backend", text_of(app.screen.query_one("#where")))
-            await pilot.press("enter")  # Enter on the field opens it empty, on the current project
+            await pilot.press("enter")  # Enter on the field opens it empty, on a project not chosen yet
             await pilot.pause()
             self.assertEqual(app.screen.query_one("#pquery", Input).value, "")
-            self.assertIn("backend", self.choices(app)[app.screen.query_one("#pchoices", OptionList).highlighted])
-            self.assertIn("[b]notes", " ".join(self.choices(app)))
+            rows = self.choices(app)
+            self.assertTrue(rows[0].startswith("  Remove all projects"), rows)
+            self.assertTrue(next(r for r in rows if "backend" in r).startswith("✓"), rows)
+            self.assertNotIn("backend", rows[app.screen.query_one("#pchoices", OptionList).highlighted])
+            self.assertIn("[b]notes", " ".join(rows))
             await self.typed(pilot, "zzz")
             await pilot.pause()
             self.assertIn("No project matches", text_of(app.screen.query_one("#pstatus")))
-            await pilot.press("escape")  # back: the choice stays
+            await pilot.press("escape")  # back: the projects stay
             await pilot.pause()
-            self.assertEqual((type(app.screen).__name__, field.value), ("TaskForm", backend))
+            self.assertEqual((type(app.screen).__name__, field.value), ("TaskForm", (backend,)))
+            await self.typed(pilot, "api")  # typing on the field adds another
+            await pilot.press("enter")
+            await pilot.pause()
+            api = core.resolve_project(core.Store().load(), "api")
+            self.assertEqual(field.value, (backend, api))
+            self.assertIn("Workspaces backend · api", text_of(app.screen.query_one("#where")))
+            await self.typed(pilot, "backend")  # picking a chosen one removes it
+            await pilot.press("enter")
+            await pilot.pause()
+            self.assertEqual(field.value, (api,))
+            await pilot.press("backspace")  # removes the last one
+            await pilot.pause()
+            self.assertEqual(field.value, ())
 
     async def test_picker_keys_stay_in_the_picker(self):
         core.add_project("dir", str(self.folder("code/api")), "api")
@@ -760,10 +782,10 @@ class TuiTest(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             self.assertEqual(app.screen.focused.id, "pquery")
             self.assertEqual(app.screen.query_one("#pchoices", OptionList).highlighted, 1)
-            await pilot.press("enter")
+            await pilot.press("ctrl+k", "enter")
             await pilot.pause()
             self.assertEqual(type(app.screen).__name__, "TaskForm")
-            self.assertNotEqual(app.screen.query_one("#project", tui.ProjectField).value, tui.NO_PROJECT)
+            self.assertEqual(len(app.screen.query_one("#project", tui.ProjectField).value), 1)
 
     async def test_picker_completes_folders_and_adds_one(self):
         base = self.folder("work")
@@ -796,7 +818,7 @@ class TuiTest(unittest.IsolatedAsyncioTestCase):
             await pilot.press("enter")
             await self.settle(pilot, app)
             self.assertEqual(type(app.screen).__name__, "TaskForm")
-            added = self.store.load()["projects"][field.value]
+            added = self.store.load()["projects"][field.value[-1]]
             self.assertEqual((added["name"], added["path"]), ("alpha", str(base / "alpha")))
             await pilot.press("enter")  # a saved folder picks its project
             await pilot.pause()
@@ -804,7 +826,8 @@ class TuiTest(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(await self.wait_for(pilot, app, lambda: "Use" in " ".join(self.choices(app))))
             await pilot.press("enter")
             await pilot.pause()
-            self.assertEqual(field.value, saved)
+            self.assertEqual(field.value[-1], saved)
+            self.assertEqual(len(field.value), 2)
 
     async def test_picker_waits_for_a_slow_folder(self):
         base = self.folder("slow")
@@ -858,7 +881,7 @@ class TuiTest(unittest.IsolatedAsyncioTestCase):
             self.assertIn("◆ real saved", self.choices(app)[0])
             await pilot.press("enter")
             await pilot.pause()
-            self.assertEqual(field.value, saved)
+            self.assertEqual(field.value, (saved,))
 
     async def test_picker_finds_a_saved_repository_by_url(self):
         folder = self.folder("clones/api")
@@ -875,7 +898,7 @@ class TuiTest(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("+ Clone", " ".join(self.choices(app)))
             await pilot.press("enter")
             await pilot.pause()
-            self.assertEqual(field.value, "p1")
+            self.assertEqual(field.value, ("p1",))
 
     async def test_add_dialog_completes_folders_with_tab(self):
         base = self.folder("work")
@@ -950,6 +973,218 @@ class TuiTest(unittest.IsolatedAsyncioTestCase):
             await pilot.press("ctrl+d")
             await pilot.pause()
             self.assertIn("agents and notes", " ".join(text_of(s) for s in app.screen.query(Static)))
+
+    # ------------------------------------------------- projects and workspaces
+    async def test_preview_lists_every_project_and_its_open_workspace(self):
+        api = core.add_project("dir", str(self.folder("code/api")), "api")
+        web = core.add_project("dir", str(self.folder("code/web")), "web")
+        with self.store.edit() as data:
+            core.set_task_projects(data["tasks"]["task-a"], [api, web])
+            data["tasks"]["task-a"]["workspace_projects"] = [web]
+        self.sessions["task-a"] = {"running": True, "socket_path": "/sock/a"}
+        app = tui.Switcher()
+        async with app.run_test(size=(120, 34)) as pilot:
+            await self.settle(pilot, app)
+            self.assertIn("◆ api +1", self.labels(app)[1][1])
+            preview = text_of(app.query_one("#preview")).splitlines()
+            self.assertTrue(any("◆ api" in l and "workspace open" not in l for l in preview), preview)
+            self.assertTrue(any("◆ web" in l and "workspace open" in l for l in preview), preview)
+            app.query_one("#search", Input).value = "@web"
+            await pilot.pause()
+            self.assertEqual([i for i, _ in self.labels(app) if i], ["task-a"])  # any of its projects
+
+    async def test_a_project_with_an_open_workspace_is_not_removed_in_the_form(self):
+        api = core.add_project("dir", str(self.folder("code/api")), "api")
+        with self.store.edit() as data:
+            core.set_task_projects(data["tasks"]["task-a"], [api])
+            data["tasks"]["task-a"]["workspace_projects"] = [api]
+        app = tui.DialogApp(tui.TaskForm(task=self.task("task-a"), task_name="task-a", session_effect="running"))
+        async with app.run_test(size=(110, 34)) as pilot:
+            await pilot.pause()
+            app.screen.query_one("#project", tui.ProjectField).value = ()
+            await pilot.pause()
+            self.assertIn("api still has a workspace", text_of(app.screen.query_one("#where")))
+            await pilot.press("ctrl+s")
+            await pilot.pause()
+            self.assertEqual(type(app.screen).__name__, "TaskForm")
+            self.assertIn("close it in Herdr first", text_of(app.screen.query_one("#error")))
+        core.set_config("herdr", "projects_from_workspaces", False)  # then only edits change projects
+        app = tui.DialogApp(tui.TaskForm(task=self.task("task-a"), task_name="task-a", session_effect="running"))
+        async with app.run_test(size=(110, 34)) as pilot:
+            await pilot.pause()
+            app.screen.query_one("#project", tui.ProjectField).value = ()
+            await pilot.pause()
+            await pilot.press("ctrl+s")
+            await pilot.pause()
+        self.assertEqual(app.return_value["remove"], [api])
+
+    async def test_settings_toggle_and_save(self):
+        app = tui.Switcher()
+        async with app.run_test(size=(110, 34)) as pilot:
+            await self.settle(pilot, app)
+            await pilot.press("ctrl+s")
+            await pilot.pause()
+            self.assertEqual(type(app.screen).__name__, "SettingsScreen")
+            screen_text = " ".join(text_of(s) for s in app.screen.query(Static))
+            self.assertIn("config.toml", screen_text)
+            await pilot.press("enter")  # the first setting: projects follow workspaces
+            await self.settle(pilot, app)
+            self.assertFalse(core.load_config()["herdr"]["projects_from_workspaces"])
+            await pilot.press("down", "space")
+            await self.settle(pilot, app)
+            self.assertFalse(core.load_config()["herdr"]["remove_projects_without_workspace"])
+            await pilot.press("ctrl+n")  # list keys stay off behind the screen
+            await pilot.pause()
+            self.assertEqual(type(app.screen).__name__, "SettingsScreen")
+            await pilot.press("escape")
+            await pilot.pause()
+            self.assertEqual(len(app.screen_stack), 1)
+
+    async def test_settings_show_a_broken_file(self):
+        core.config_path().parent.mkdir(parents=True)
+        core.config_path().write_text("[herdr\n")
+        app = tui.DialogApp(tui.SettingsScreen())
+        async with app.run_test(size=(110, 34)) as pilot:
+            await pilot.pause()
+            self.assertIn("not valid TOML", text_of(app.screen.query_one("#status")))
+            await pilot.press("enter", "space")
+            await pilot.pause()
+        self.assertEqual(core.config_path().read_text(), "[herdr\n")  # nothing written
+
+    async def test_remove_all_is_never_the_default(self):
+        api = core.add_project("dir", str(self.folder("code/api")), "api")
+        app = tui.DialogApp(tui.TaskForm(projects=[api]))
+        async with app.run_test(size=(110, 34)) as pilot:
+            await pilot.pause()
+            field = app.screen.query_one("#project", tui.ProjectField)
+            field.focus()
+            await pilot.press("enter")  # every project is chosen: the default is adding a new one
+            await pilot.pause()
+            self.assertIn("Add git", self.choices(app)[app.screen.query_one("#pchoices", OptionList).highlighted])
+            await self.typed(pilot, "res")  # matches no project, and "remove all" is not offered for a search
+            await pilot.pause()
+            self.assertFalse(any("Remove all" in row for row in self.choices(app)))
+            await pilot.press("enter")
+            await pilot.pause()
+            self.assertEqual(field.value, (api,))
+
+    async def test_the_field_fits_many_projects_and_its_hint(self):
+        ids = [core.add_project("dir", str(self.folder(f"code/{n}")), f"project-with-a-long-name-{n}")
+               for n in range(5)]
+        app = tui.DialogApp(tui.TaskForm(projects=ids))
+        async with app.run_test(size=(90, 34)) as pilot:
+            await pilot.pause()
+            field = app.screen.query_one("#project", tui.ProjectField)
+            field.focus()
+            await pilot.pause()
+            shown = text_of(field)
+            self.assertIn("⌫ removes the last", shown)  # the hint is never cut off
+            self.assertRegex(shown, r"\+\d")  # the others are counted
+            self.assertLessEqual(len(shown), field.content_size.width)
+
+    async def test_backspace_before_the_picker_is_up_reaches_it(self):
+        core.add_project("dir", str(self.folder("code/api")), "api")
+        app = tui.DialogApp(tui.TaskForm())
+        async with app.run_test(size=(110, 34)) as pilot:
+            await pilot.pause()
+            field = app.screen.query_one("#project", tui.ProjectField)
+            field.focus()
+            for key in ("a", "b", "backspace"):
+                field.post_message(events.Key(key, key if key != "backspace" else None))
+            await pilot.pause()
+            self.assertEqual(app.screen.query_one("#pquery", Input).value, "a")
+
+    async def test_the_new_task_form_says_where_it_really_starts(self):
+        gone = core.add_project("dir", str(self.folder("code/gone")), "gone")
+        api = core.add_project("dir", str(self.folder("code/api")), "api")
+        (self.root / "code/gone").rmdir()
+        app = tui.DialogApp(tui.TaskForm(projects=[gone, api]))
+        async with app.run_test(size=(110, 34)) as pilot:
+            await pilot.pause()
+            where = text_of(app.screen.query_one("#where"))
+        self.assertIn(f"Starts in {self.root / 'code/api'}", where)
+        self.assertIn("Missing, so no workspace: gone", where)
+
+    async def test_reordering_in_the_edit_form_is_kept(self):
+        api = core.add_project("dir", str(self.folder("code/api")), "api")
+        web = core.add_project("dir", str(self.folder("code/web")), "web")
+        with self.store.edit() as data:
+            core.set_task_projects(data["tasks"]["task-a"], [api, web])
+        app = tui.Switcher()
+        async with app.run_test(size=(110, 34)) as pilot:
+            await self.settle(pilot, app)
+            await pilot.press("ctrl+e")
+            await pilot.pause()
+            app.screen.query_one("#project", tui.ProjectField).value = (web, api)
+            await pilot.pause()
+            await pilot.press("ctrl+s")
+            await self.settle(pilot, app)
+        self.assertEqual(self.task("task-a")["projects"], [web, api])
+
+    async def test_a_broken_settings_file_does_not_break_the_forms(self):
+        core.config_path().parent.mkdir(parents=True)
+        core.config_path().write_bytes(b"# n\xe3o\n")  # Latin-1
+        api = core.add_project("dir", str(self.folder("code/api")), "api")
+        with self.store.edit() as data:
+            core.set_task_projects(data["tasks"]["task-a"], [api])
+            data["tasks"]["task-a"]["workspace_projects"] = [api]
+        self.sessions["task-a"] = {"running": True, "socket_path": "/sock/a"}
+        app = tui.Switcher()
+        async with app.run_test(size=(110, 34)) as pilot:
+            await self.settle(pilot, app)
+            await pilot.press("ctrl+n")
+            await pilot.pause()
+            self.assertEqual(type(app.screen).__name__, "TaskForm")
+            await pilot.press("escape")
+            await pilot.pause()
+            await pilot.press("ctrl+e")
+            await pilot.pause()
+            app.screen.query_one("#project", tui.ProjectField).value = ()
+            await pilot.pause()
+            where = text_of(app.screen.query_one("#where"))
+            self.assertIn("Settings ignored", where)
+            self.assertNotIn("still has a workspace", where)  # off, as for the daemon
+            await pilot.press("escape", "y")
+            await pilot.pause()
+            await pilot.press("ctrl+s")
+            await pilot.pause()
+            self.assertEqual(type(app.screen).__name__, "SettingsScreen")
+            self.assertIn("cannot read", text_of(app.screen.query_one("#status")))
+
+    async def test_a_failed_save_is_shown_and_saves_do_not_overlap(self):
+        calls = []
+        gate = threading.Event()
+        self.addCleanup(gate.set)
+
+        def slow_failing(group, key, value):
+            calls.append((key, value))
+            gate.wait(5)
+            raise OSError("read-only file system")
+
+        app = tui.DialogApp(tui.SettingsScreen())
+        with mock.patch.object(core, "set_config", slow_failing):
+            async with app.run_test(size=(110, 34)) as pilot:
+                await pilot.pause()
+                await pilot.press("space", "space", "down", "space")  # one save at a time
+                await pilot.pause()
+                gate.set()
+                await app.workers.wait_for_complete()
+                await pilot.pause()
+                self.assertEqual(calls, [("projects_from_workspaces", False)])
+                self.assertIn("Not saved: read-only file system", text_of(app.screen.query_one("#status")))
+                await pilot.press("space")  # usable again
+                await app.workers.wait_for_complete()
+        self.assertEqual(len(calls), 2)
+
+    async def test_add_dialog_can_start_with_a_name(self):
+        folder = self.folder("code/new-thing")
+        app = tui.DialogApp(tui.AddProjectScreen("dir", source=str(folder), focus="name", name="My Thing"))
+        async with app.run_test(size=(110, 34)) as pilot:
+            await pilot.pause(0.4)
+            self.assertEqual(app.screen.query_one("#pname", Input).value, "My Thing")
+            await pilot.press("enter")
+            await self.settle(pilot, app)
+        self.assertEqual(self.store.load()["projects"][app.return_value]["name"], "My Thing")
 
 
 if __name__ == "__main__":

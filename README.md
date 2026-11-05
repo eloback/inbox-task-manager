@@ -12,7 +12,9 @@ switches between them in place.
   agents needs you; archive it to stop its session and reopen it later, with
   Herdr restoring the layout and resuming its agents.
 - **Projects.** Save git repositories (cloned for you) and folders once, and
-  start tasks in them.
+  give a task one or more of them: its session starts with a named Herdr
+  workspace per project. The daemon keeps a running task's projects in step
+  with the workspaces you open and close (a setting).
 - **Notes.** Every task has a markdown file for its context, kept through
   archive and reopen.
 - **Switch in place.** From a Herdr popup, the switcher moves your terminal to
@@ -90,16 +92,17 @@ aarch64-linux and aarch64-darwin; elsewhere use its overlay.
 
 ```sh
 itm                          # the task switcher
-itm new "Fix the login bug" -p api -d "Users get logged out after 5 min"
+itm new "Fix the login bug" -p api -p web -d "Users get logged out after 5 min"
 itm attach [task]            # attach outside Herdr, or switch inside it
 itm snooze [task] 2h         # or: tomorrow 9:00, friday 2pm, --until-agent
 itm wake | archive | reopen | delete <task>
-itm edit <task> --title "…" --project api
+itm edit <task> --title "…" --add-project api   # --remove-project, --project (sets), --no-project
 itm notes [task]             # open notes.md; --append TEXT, --path
 itm jump                     # the task whose agent has waited longest
 itm last                     # back to the previous task
 itm project add git git@github.com:acme/api.git
 itm project add dir ~/src/scratch --name scratch
+itm project add-workspace    # the Herdr workspace you are in, for the current task
 itm project list | rename | remove
 itm list --json              # for scripts; itm status for a bar or title
 itm current                  # the Herdr session this terminal is in
@@ -126,6 +129,7 @@ Herdr, with [`contrib/herdr-keys.toml`](contrib/herdr-keys.toml):
 | `prefix+shift+z` | snooze the current task         |
 | `prefix+i`       | task whose agent waited longest |
 | `prefix+shift+e` | notes of the current task       |
+| `prefix+shift+a` | save this workspace as a project of the task |
 | `prefix+tab`     | previous task (replaces Herdr's pane cycling) |
 
 Switcher (`?` with an empty search, or F1, shows them all):
@@ -139,15 +143,54 @@ Switcher (`?` with an empty search, or F1, shows them all):
 | Alt+1…9             | open row 1–9                                  |
 | Ctrl+N              | New task form                                 |
 | Ctrl+Z / Ctrl+U     | snooze / wake                                 |
-| Ctrl+E              | edit title, description and project           |
+| Ctrl+E              | edit title, description and projects          |
 | Ctrl+A / Ctrl+D     | archive (asks when running) / delete (asks)   |
 | Ctrl+P              | projects                                      |
 | Ctrl+O              | notes of the task in your editor              |
+| Ctrl+S              | settings (Herdr integration)                  |
 | `?` / F1            | all keys (`?` while the search box is empty)  |
 | Esc                 | close                                         |
 
 In the switcher's search box, Ctrl+A, Ctrl+E, Ctrl+D, Ctrl+U and Ctrl+K are
 taken by these actions; Home, End, Delete and Shift selection still edit the text.
+
+### Projects and workspaces
+
+A task's first project is where its session starts; each project gets a
+Herdr workspace named after it on the first start, and one opens when you
+add a project to a running task. Herdr renames a workspace without a name
+whenever the first pane of its first tab changes folder; a named one keeps
+its name.
+
+Workspaces are one source of a task's projects. With **projects follow
+workspaces** on, the daemon adds to a running task every saved project a
+workspace of its session is in: a workspace named after a project belongs to
+it, any other is judged by that same first pane's folder (a tab or pane you
+open to look at another repository does not count). With **remove a project
+when its workspace closes** on, a project found this way leaves the task again
+when its workspace closes; projects you added yourself stay. Only saved
+projects count: a workspace in your home folder is in no project unless you
+saved the home folder itself.
+
+To make a new workspace a project, open it in Herdr and press
+`prefix+shift+a`: itm saves its folder (the add dialog lets you name it),
+names the workspace after the project, and adds it to the task (as found in
+that workspace while projects follow workspaces). Your home folder and the
+folders above it are refused there; `itm project add dir ~` saves it if you
+really want it.
+
+### Settings
+
+`~/.config/inbox-task-manager/config.toml` (`$XDG_CONFIG_HOME`), also changed
+from the switcher's Settings screen (Ctrl+S), which keeps your comments:
+
+```toml
+[herdr]
+projects_from_workspaces = true            # a running task's projects follow its workspaces
+remove_projects_without_workspace = true   # ...and a project found there leaves when its workspace closes
+```
+
+The daemon reads it on every pass, so changes apply without a restart.
 
 Project finder (the task form's Project field: Enter or start typing): typing
 narrows the saved projects; `~/`, `/` or `./` lists folders, Tab goes into the

@@ -1,4 +1,5 @@
 import contextlib
+import json
 import os
 import shutil
 import signal
@@ -166,7 +167,7 @@ class TaskLogicTest(unittest.TestCase):
 class PollTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
-        env = {"XDG_STATE_HOME": self.tmp.name, "XDG_RUNTIME_DIR": self.tmp.name}
+        env = {"XDG_STATE_HOME": self.tmp.name, "XDG_RUNTIME_DIR": self.tmp.name, "XDG_CONFIG_HOME": self.tmp.name}
         self.env = mock.patch.dict(os.environ, env)
         self.env.start()
         self.store = itm.Store()
@@ -190,6 +191,7 @@ class PollTest(unittest.TestCase):
         self.patches = [
             mock.patch.object(itm, "list_sessions", lambda: self.sessions),
             mock.patch.object(itm, "list_agents", lambda socket: self.agents[socket]),
+            mock.patch.object(itm, "session_workspaces", lambda socket: None),
             mock.patch.object(itm, "live_clients", lambda: {}),
             mock.patch.object(itm, "deliver"),
         ]
@@ -403,6 +405,7 @@ class ProjectEnvTest(unittest.TestCase):
             "XDG_STATE_HOME": str(self.root / "state"),
             "XDG_DATA_HOME": str(self.root / "data"),
             "XDG_RUNTIME_DIR": str(self.root / "run"),
+            "XDG_CONFIG_HOME": str(self.root / "config"),
             "ITM_TASK_DIR": str(self.root / "home"),
             "GIT_CONFIG_NOSYSTEM": "1",
             "GIT_CONFIG_GLOBAL": os.devnull,
@@ -516,7 +519,7 @@ class ProjectTest(ProjectEnvTest):
     def test_rename_frees_the_name_and_keeps_tasks(self):
         api_id = self.add_api()
         with self.store.edit() as data:
-            data["tasks"]["task-a"] = itm.new_task("A", project=api_id)
+            data["tasks"]["task-a"] = itm.new_task("A", projects=[api_id])
         with mock.patch("builtins.print"):
             itm.cmd_project_rename("api", "acme-api")
         with self.fake_clone():
@@ -524,7 +527,7 @@ class ProjectTest(ProjectEnvTest):
         data = self.store.load()
         self.assertEqual(data["projects"][api_id]["name"], "acme-api")
         self.assertEqual(data["projects"][other_id]["name"], "api")
-        self.assertEqual(data["tasks"]["task-a"]["project"], api_id)
+        self.assertEqual(data["tasks"]["task-a"]["projects"], [api_id])
 
     def test_rename_checks_the_new_name(self):
         self.add_api()
@@ -658,10 +661,11 @@ class ProjectTest(ProjectEnvTest):
                 "p2": {"name": "gone", "kind": "dir", "path": str(self.root / "gone")},
             },
             "tasks": {
-                "task-a": itm.new_task("A", project="p1"),
-                "task-b": itm.new_task("B", project="p1"),
+                "task-a": itm.new_task("A", projects=["p1"]),
+                "task-b": itm.new_task("B", projects=["p1"]),
                 "task-plain": itm.new_task("Plain"),
-                "task-gone": itm.new_task("Gone", project="p2"),
+                "task-gone": itm.new_task("Gone", projects=["p2"]),
+                "task-both": itm.new_task("Both", projects=["p2", "p1"]),
             },
         }
         self.assertEqual(itm.task_cwd(data, "task-a"), path)
@@ -669,15 +673,106 @@ class ProjectTest(ProjectEnvTest):
         self.assertEqual(itm.task_cwd(data, "task-plain"), itm.task_dir())
         with mock.patch("sys.stderr"):
             self.assertEqual(itm.task_cwd(data, "task-gone"), itm.task_dir())
+            # The first project whose folder exists.
+            self.assertEqual(itm.task_cwd(data, "task-both"), path)
+            self.assertEqual(itm.task_folders(data, "task-both"), [("api", path)])
 
     def test_attach_starts_the_session_in_the_project_folder(self):
         path = self.folder("code/api")
         api_id = itm.add_project("dir", str(path), "api")
         with self.store.edit() as data:
-            data["tasks"]["task-a"] = itm.new_task("A", project=api_id)
-        with mock.patch.object(itm.subprocess, "run") as run, mock.patch.object(itm.shutil, "which", return_value="/bin/herdr"):
+            data["tasks"]["task-a"] = itm.new_task("A", projects=[api_id])
+        started = {"task-a": {"running": False, "socket_path": "/sock/a"}}
+        with mock.patch.object(itm.subprocess, "run") as run, mock.patch.object(itm.shutil, "which", return_value="/bin/herdr"), \
+                mock.patch.object(itm, "list_sessions", return_value=started), \
+                mock.patch.object(itm, "start_with_workspaces") as build:
             itm.attach_loop("task-a")
+        # A session that ran before is restored by Herdr: only attached.
+        build.assert_not_called()
         run.assert_called_once_with(["herdr", "session", "attach", "task-a"], cwd=path, check=False)
+
+    def test_first_start_opens_a_named_workspace_per_project(self):
+        api, web = self.folder("code/api"), self.folder("code/web")
+        ids = [itm.add_project("dir", str(api), "api"), itm.add_project("dir", str(web), "web"),
+               itm.add_project("dir", str(self.folder("gone")), "gone")]
+        shutil.rmtree(self.root / "gone")
+        with self.store.edit() as data:
+            data["tasks"]["task-a"] = itm.new_task("A", projects=[ids[2], ids[1], ids[0]])
+        with mock.patch.object(itm.subprocess, "run") as run, mock.patch.object(itm.shutil, "which", return_value="/bin/herdr"), \
+                mock.patch.object(itm, "list_sessions", return_value={}), \
+                mock.patch.object(itm, "start_with_workspaces") as build, mock.patch("sys.stderr"):
+            itm.attach_loop("task-a")
+        build.assert_called_once_with("task-a", [("web", web), ("api", api)])  # missing folders left out
+        run.assert_called_once_with(["herdr", "session", "attach", "task-a"], cwd=web, check=False)
+        # A failure to build them still attaches.
+        with mock.patch.object(itm.subprocess, "run") as run, mock.patch.object(itm.shutil, "which", return_value="/bin/herdr"), \
+                mock.patch.object(itm, "list_sessions", return_value={}), \
+                mock.patch.object(itm, "start_with_workspaces", side_effect=itm.ItmError("no")), \
+                mock.patch("sys.stderr") as err:
+            itm.attach_loop("task-a")
+        run.assert_called_once()
+        self.assertIn("workspaces may be missing", "".join(str(c.args[0]) for c in err.write.call_args_list))
+
+    def test_start_with_workspaces(self):
+        api, web = self.folder("code/api"), self.folder("code/web")
+        sessions = iter([{}, {"task-a": {"running": True, "socket_path": "/sock/a"}}])
+        calls = []
+
+        def herdr(args, socket=None):
+            calls.append((args, socket))
+            return {"result": {"workspaces": []}}
+
+        with mock.patch.object(itm.subprocess, "Popen") as popen, \
+                mock.patch.dict(os.environ, {"HERDR_SOCKET_PATH": "/elsewhere", "HERDR_WORKSPACE_ID": "w9"}), \
+                mock.patch.object(itm, "list_sessions", side_effect=lambda: next(sessions)), \
+                mock.patch.object(itm, "herdr_json", side_effect=herdr), mock.patch.object(itm.time, "sleep"):
+            popen.return_value.poll.return_value = None  # still running
+            itm.start_with_workspaces("task-a", [("api", api), ("-web", web)])
+        argv, kwargs = popen.call_args.args[0], popen.call_args.kwargs
+        self.assertEqual((argv, kwargs["env"]["HERDR_SESSION"], kwargs["cwd"]), (["herdr", "server"], "task-a", api))
+        self.assertTrue(kwargs["start_new_session"])
+        self.assertFalse([k for k in kwargs["env"] if k.startswith("HERDR_") and k != "HERDR_SESSION"])
+        self.assertEqual(calls, [
+            (["workspace", "list"], "/sock/a"),
+            (["workspace", "create", "--cwd", str(api), "--label", "api", "--focus"], "/sock/a"),
+            # Herdr takes a value starting with "-" as is (checked against Herdr 0.9.3).
+            (["workspace", "create", "--cwd", str(web), "--label", "-web", "--no-focus"], "/sock/a"),
+        ])
+        with mock.patch.object(itm.subprocess, "Popen") as popen, mock.patch.object(itm, "list_sessions", return_value={}), \
+                mock.patch.object(itm, "SESSION_START_TIMEOUT", 0), mock.patch.object(itm.time, "sleep"), \
+                self.assertRaisesRegex(itm.ItmError, "did not start"):
+            popen.return_value.poll.return_value = None
+            itm.start_with_workspaces("task-a", [("api", api)])
+        with mock.patch.object(itm.subprocess, "Popen") as popen, mock.patch.object(itm, "list_sessions", return_value={}), \
+                mock.patch.object(itm.time, "sleep") as sleep, self.assertRaisesRegex(itm.ItmError, "exited with 1"):
+            popen.return_value.poll.return_value = popen.return_value.returncode = 1
+            itm.start_with_workspaces("task-a", [("api", api)])
+        sleep.assert_not_called()  # not waited for
+        # Built already (another client won the race): no workspaces added.
+        calls.clear()
+        running = {"task-a": {"running": True, "socket_path": "/sock/a"}}
+        with mock.patch.object(itm.subprocess, "Popen"), mock.patch.object(itm, "list_sessions", return_value=running), \
+                mock.patch.object(itm, "herdr_json", side_effect=lambda a, s=None: calls.append(a) or
+                                  {"result": {"workspaces": [{"workspace_id": "w1"}]}}):
+            itm.start_with_workspaces("task-a", [("api", api)])
+        self.assertEqual(calls, [["workspace", "list"]])
+
+    def test_first_start_is_built_once(self):
+        api = self.folder("code/api")
+        api_id = itm.add_project("dir", str(api), "api")
+        with self.store.edit() as data:
+            data["tasks"]["task-a"] = itm.new_task("A", projects=[api_id])
+        sessions: dict = {}
+
+        def build(name, folders):  # the session exists once built
+            sessions[name] = {"running": True}
+
+        with mock.patch.object(itm, "list_sessions", side_effect=lambda: sessions), \
+                mock.patch.object(itm, "start_with_workspaces", side_effect=build) as start:
+            data = self.store.load()
+            self.assertEqual(itm.prepare_first_start("task-a", data), [("api", api)])
+            self.assertEqual(itm.prepare_first_start("task-a", data), [("api", api)])  # a second client
+        start.assert_called_once()
 
     def test_projects_by_recent(self):
         projects = {
@@ -689,7 +784,7 @@ class ProjectTest(ProjectEnvTest):
     def test_remove_refused_while_used(self):
         a_id = itm.add_project("dir", str(self.folder("a")), "a")
         with self.store.edit() as data:
-            data["tasks"]["task-x"] = {**itm.new_task("X", project=a_id), "state": "archived"}
+            data["tasks"]["task-x"] = {**itm.new_task("X", projects=[a_id]), "state": "archived"}
         with self.assertRaisesRegex(itm.ItmError, "project 'a' is used by 1 task"):
             itm.cmd_project_remove("a", None)
         self.assertIn(a_id, self.store.load()["projects"])
@@ -899,29 +994,30 @@ class TaskEnvTest(ProjectEnvTest):
             itm.cmd_new(kwargs.pop("title", None), **kwargs)
         return screens.task_form
 
-    def answers(self, title="Ask", description=None, project=None, until=None):
-        return {"title": title, "description": description, "project": project, "until": until}
+    def answers(self, title="Ask", description=None, projects=(), until=None):
+        return {"title": title, "description": description, "projects": list(projects), "until": until}
 
 
 class NewTaskTest(TaskEnvTest):
     def test_description_and_project(self):
         api_id = itm.add_project("dir", str(self.folder("code/api")), "api")
-        itm.cmd_new("Fix login", description="  token expires  ", project="API")
+        web_id = itm.add_project("dir", str(self.folder("code/web")), "web")
+        itm.cmd_new("Fix login", description="  token expires  ", projects=["API", "web", web_id])
         task = self.task("task-fix-login")
-        self.assertEqual((task["description"], task["project"]), ("token expires", api_id))
+        self.assertEqual((task["description"], task["projects"]), ("token expires", [api_id, web_id]))
         self.switch_to.assert_called_once_with("task-fix-login")
 
     def test_creating_a_task_marks_its_project_used(self):
         old_id = itm.add_project("dir", str(self.folder("old")), "old")
         new_id = itm.add_project("dir", str(self.folder("new")), "new")
         with mock.patch.object(itm, "now", return_value=itm.now() + 60):
-            itm.cmd_new("Use old", project="old")
+            itm.cmd_new("Use old", projects=["old"])
         self.assertEqual([pid for pid, _ in itm.projects_by_recent(self.store.load()["projects"])], [old_id, new_id])
 
     def test_plain_task_has_no_optional_fields(self):
         itm.cmd_new("Plain", description="   ")
         self.assertNotIn("description", self.task("task-plain"))
-        self.assertNotIn("project", self.task("task-plain"))
+        self.assertNotIn("projects", self.task("task-plain"))
 
     def test_snoozed_at_creation_does_not_switch(self):
         itm.cmd_new("Later", snooze="2h")
@@ -931,25 +1027,25 @@ class NewTaskTest(TaskEnvTest):
         self.switch_to.assert_not_called()
 
     def test_invalid_input_writes_nothing(self):
-        for kwargs in ({"snooze": "soonish"}, {"project": "missing"}):
+        for kwargs in ({"snooze": "soonish"}, {"projects": ["missing"]}):
             with self.subTest(**kwargs), self.assertRaises(itm.ItmError):
                 itm.cmd_new("Nope", **kwargs)
         self.assertEqual(self.store.load()["tasks"], {})
 
     def test_form_gets_what_was_given(self):
         api_id = itm.add_project("dir", str(self.folder("code/api")), "api")
-        form = self.form(self.answers(title="Given", description="d", project=api_id), title="Given",
-                         description="d", project="API", snooze="1h", interactive=True)
+        form = self.form(self.answers(title="Given", description="d", projects=[api_id]), title="Given",
+                         description="d", projects=["API"], snooze="1h", interactive=True)
         kwargs = form.call_args.kwargs
-        self.assertEqual((kwargs["title"], kwargs["description"], kwargs["project"]), ("Given", "d", api_id))
+        self.assertEqual((kwargs["title"], kwargs["description"], kwargs["projects"]), ("Given", "d", [api_id]))
         self.assertGreater(kwargs["until"], itm.now())
-        self.assertEqual(self.task("task-given")["project"], api_id)
+        self.assertEqual(self.task("task-given")["projects"], [api_id])
 
     def test_form_answers(self):
         api_id = itm.add_project("dir", str(self.folder("code/api")), "api")
-        self.form(self.answers(description="notes", project=api_id, until=itm.now() + 600))
+        self.form(self.answers(description="notes", projects=[api_id], until=itm.now() + 600))
         task = self.task("task-ask")
-        self.assertEqual((task["description"], task["project"], task["state"]), ("notes", api_id, "snoozed"))
+        self.assertEqual((task["description"], task["projects"], task["state"]), ("notes", [api_id], "snoozed"))
         self.switch_to.assert_not_called()
 
     def test_form_without_optional_fields_switches(self):
@@ -977,19 +1073,24 @@ class NewTaskTest(TaskEnvTest):
 
     def test_rows_show_the_project_name(self):
         api_id = itm.add_project("dir", str(self.folder("code/api")), "api")
-        itm.cmd_new("Fix", project="api")
+        web_id = itm.add_project("dir", str(self.folder("code/web")), "web")
+        itm.cmd_new("Fix", projects=["api", "web"])
         row = itm.task_rows(self.store.load(), "all", {}, {})[0]
+        # "project" and "project_id" keep naming the first project for scripts written before.
         self.assertEqual((row["project"], row["project_id"]), ("api", api_id))
+        self.assertEqual(row["projects"], [{"id": api_id, "name": "api"}, {"id": web_id, "name": "web"}])
         self.assertEqual(itm.project_rows(self.store.load()), [
             {"id": api_id, "name": "api", "kind": "dir", "path": str(self.folder("code/api")), "url": None, "tasks": 1},
+            {"id": web_id, "name": "web", "kind": "dir", "path": str(self.folder("code/web")), "url": None, "tasks": 1},
         ])
 
     def test_list_prints_project_and_waiting(self):
         itm.add_project("dir", str(self.folder("code/api")), "api")
-        itm.cmd_new("Fix", project="api")
+        itm.add_project("dir", str(self.folder("code/web")), "web")
+        itm.cmd_new("Fix", projects=["api", "web"])
         with mock.patch("builtins.print") as out:
             itm.cmd_list("all", as_json=False)
-        self.assertEqual(out.call_args[0][0], "task-fix\tactive\tFix\tapi\t0")
+        self.assertEqual(out.call_args[0][0], "task-fix\tactive\tFix\tapi,web\t0")
 
 
 class EditTaskTest(TaskEnvTest):
@@ -1002,55 +1103,70 @@ class EditTaskTest(TaskEnvTest):
         with self.assertRaisesRegex(itm.ItmError, "title cannot be empty"):
             itm.edit_task("task-old", title=" ")
 
-    def test_project_can_change_and_says_what_happens_to_the_session(self):
+    def test_projects_can_change_and_say_what_happens_to_the_session(self):
         api_id = itm.add_project("dir", str(self.folder("code/api")), "api")
+        web_id = itm.add_project("dir", str(self.folder("code/web")), "web")
         itm.cmd_new("Later", snooze="1h")
-        self.assertEqual(itm.edit_task("task-later", project="api"), [f"its session will start in {self.folder('code/api')}"])
-        self.assertEqual(self.task("task-later")["project"], api_id)
-        self.assertEqual(itm.edit_task("task-later", project=None), [])
-        self.assertNotIn("project", self.task("task-later"))
+        self.assertEqual(itm.edit_task("task-later", add=["api"]),
+                         [f"its session will start with a workspace in {self.folder('code/api')}"])
+        self.assertEqual(itm.edit_task("task-later", add=["web"]),
+                         [f"its session will start with a workspace in {self.folder('code/web')}"])
+        self.assertEqual(self.task("task-later")["projects"], [api_id, web_id])
+        self.assertEqual(itm.edit_task("task-later", remove=["API"]), [])
+        self.assertEqual(self.task("task-later")["projects"], [web_id])
+        self.assertEqual(itm.edit_task("task-later", remove=["api"]), [])  # not there: nothing to do
+        self.assertEqual(self.task("task-later")["projects"], [web_id])
+        with self.assertRaisesRegex(itm.ItmError, "no project named 'nope'"):
+            itm.edit_task("task-later", remove=["nope"])
+        self.assertEqual(itm.edit_task("task-later", projects=[]), [])
+        self.assertNotIn("projects", self.task("task-later"))
         stopped = {"task-later": {"running": False, "socket_path": "/sock/later"}}
         with mock.patch.object(itm, "list_sessions", return_value=stopped):
-            notes = itm.edit_task("task-later", title="Fine", project="api")
-        self.assertIn("stopped session keeps its folders", notes[0])
-        self.assertEqual((self.task("task-later")["title"], self.task("task-later")["project"]), ("Fine", api_id))
+            notes = itm.edit_task("task-later", title="Fine", projects=["web", "api"])
+        self.assertIn("stopped session keeps its workspaces", notes[0])
+        task = self.task("task-later")
+        self.assertEqual((task["title"], task["projects"]), ("Fine", [web_id, api_id]))
 
-    def test_a_running_session_gets_a_tab_in_the_new_project(self):
+    def test_a_running_session_gets_a_named_workspace_per_new_project(self):
         api_id = itm.add_project("dir", str(self.folder("code/api")), "api")
+        web_id = itm.add_project("dir", str(self.folder("code/web")), "web")
         itm.cmd_new("Run", switch=False)
         running = {"task-run": {"running": True, "socket_path": "/sock/run"}}
         with mock.patch.object(itm, "list_sessions", return_value=running), \
                 mock.patch.object(itm, "herdr_json", return_value={}) as herdr:
-            notes = itm.edit_task("task-run", project="api")
-        herdr.assert_called_once_with(
-            ["tab", "create", "--cwd", str(self.folder("code/api")), "--label", "api", "--no-focus"], "/sock/run")
-        self.assertEqual(notes, [f"opened a tab in {self.folder('code/api')}"])
-        self.assertEqual(self.task("task-run")["project"], api_id)
-        # A failure to open the tab does not undo the change; it is reported.
-        itm.edit_task("task-run", project=None)
+            notes = itm.edit_task("task-run", add=["api", "web"])
+        self.assertEqual([c.args for c in herdr.call_args_list], [
+            (["workspace", "create", "--cwd", str(self.folder("code/api")), "--label", "api", "--no-focus"], "/sock/run"),
+            (["workspace", "create", "--cwd", str(self.folder("code/web")), "--label", "web", "--no-focus"], "/sock/run"),
+        ])
+        self.assertEqual(notes, [f"opened a workspace in {self.folder('code/api')}",
+                                 f"opened a workspace in {self.folder('code/web')}"])
+        self.assertEqual(self.task("task-run")["projects"], [api_id, web_id])
+        # A failure to open one does not undo the change; it is reported.
+        itm.edit_task("task-run", remove=["api"])
         with mock.patch.object(itm, "list_sessions", return_value=running), \
                 mock.patch.object(itm, "herdr_json", side_effect=itm.ItmError("no answer")):
-            self.assertIn("could not open a tab", itm.edit_task("task-run", project="api")[0])
-        self.assertEqual(self.task("task-run")["project"], api_id)
+            self.assertIn("could not open a workspace", itm.edit_task("task-run", add=["api"])[0])
+        self.assertEqual(self.task("task-run")["projects"], [web_id, api_id])
 
     def test_edit_reports_without_failing(self):
         api_id = itm.add_project("dir", str(self.folder("code/api")), "api")
         itm.cmd_new("Run", switch=False)
         broken = mock.patch.object(itm, "list_sessions", side_effect=itm.ItmError("no answer"))
         with broken:
-            # Clearing or keeping the project never asks Herdr.
-            self.assertEqual(itm.edit_task("task-run", title="T", project=None), [])
-            notes = itm.edit_task("task-run", project="api")  # saved even though Herdr does not answer
+            # Removing or keeping projects never asks Herdr.
+            self.assertEqual(itm.edit_task("task-run", title="T", projects=[]), [])
+            notes = itm.edit_task("task-run", add=["api"])  # saved even though Herdr does not answer
         self.assertIn("could not tell whether its session runs", notes[0])
-        self.assertEqual(self.task("task-run")["project"], api_id)
+        self.assertEqual(self.task("task-run")["projects"], [api_id])
         with broken:
-            self.assertEqual(itm.edit_task("task-run", title="Same", project="API"), [])
+            self.assertEqual(itm.edit_task("task-run", title="Same", add=["API"]), [])
         shutil.rmtree(self.folder("code/api"))
-        itm.edit_task("task-run", project=None)
+        itm.edit_task("task-run", projects=[])
         with broken:
-            self.assertIn("is missing", itm.edit_task("task-run", project="api")[0])
+            self.assertIn("is missing", itm.edit_task("task-run", add=["api"])[0])
 
-    def test_editing_the_task_you_are_in_focuses_the_new_tab(self):
+    def test_editing_the_task_you_are_in_focuses_the_new_workspace(self):
         itm.add_project("dir", str(self.folder("code/api")), "api")
         itm.cmd_new("Here", switch=False)
         running = {"task-here": {"running": True, "socket_path": "/sock/here"}}
@@ -1058,17 +1174,436 @@ class EditTaskTest(TaskEnvTest):
                 mock.patch.object(itm, "list_sessions", return_value=running), \
                 mock.patch.object(itm, "herdr_json", return_value={}) as herdr, \
                 mock.patch("builtins.print") as out:
-            itm.cmd_edit("here", None, None, "api")
+            itm.cmd_edit("here", None, None, add=["api"])
         self.assertIn("--focus", herdr.call_args.args[0])
-        self.assertEqual(out.call_args.args[0], f"task-here updated; opened a tab in {self.folder('code/api')}")
+        self.assertEqual(out.call_args.args[0], f"task-here updated; opened a workspace in {self.folder('code/api')}")
 
     def test_cmd_edit_opens_the_form_without_options(self):
+        api_id = itm.add_project("dir", str(self.folder("code/api")), "api")
         itm.cmd_new("Old")
         screens = mock.Mock()
-        screens.edit_form.return_value = {"title": "From form", "description": "d"}
+        screens.edit_form.return_value = {"title": "From form", "description": "d", "add": [api_id], "remove": []}
         with mock.patch.object(itm, "screens", return_value=screens):
-            itm.cmd_edit("old", None, None, itm.UNSET)
-        self.assertEqual(self.task("task-old")["title"], "From form")
+            itm.cmd_edit("old", None, None)
+        self.assertEqual((self.task("task-old")["title"], self.task("task-old")["projects"]), ("From form", [api_id]))
+
+    def test_cli_options(self):
+        itm.add_project("dir", str(self.folder("code/api")), "api")
+        itm.add_project("dir", str(self.folder("code/web")), "web")
+        itm.main(["new", "Both", "-p", "api", "-p", "web", "--no-switch"])
+        self.assertEqual([self.project(n)["id"] for n in ("api", "web")], self.task("task-both")["projects"])
+        itm.main(["edit", "both", "--remove-project", "api"])
+        itm.main(["edit", "both", "--add-project", "api"])
+        self.assertEqual([self.project(n)["id"] for n in ("web", "api")], self.task("task-both")["projects"])
+        itm.main(["edit", "both", "--no-project"])
+        self.assertNotIn("projects", self.task("task-both"))
+        with mock.patch("builtins.print") as out:
+            self.assertEqual(itm.main(["edit", "both", "--project", "api", "--add-project", "web"]), 1)
+        self.assertIn("set the projects", out.call_args.args[0])
+
+
+class WorkspaceSyncTest(TaskEnvTest):
+    """Projects found in a running task's workspaces (the daemon's sync)."""
+
+    def setUp(self):
+        super().setUp()
+        self.api = itm.add_project("dir", str(self.folder("code/api")), "api")
+        self.web = itm.add_project("dir", str(self.folder("code/web")), "web")
+
+    def workspaces(self, *folders):
+        return [{"id": f"w{i}", "label": "", "focused": i == 0, "folder": str(f) if f else None}
+                for i, f in enumerate(folders)]
+
+    def test_folders_map_to_the_innermost_saved_project(self):
+        projects = self.store.load()["projects"]
+        lib = itm.add_project("dir", str(self.folder("code/api/lib")), "lib")
+        projects = self.store.load()["projects"]
+        self.assertEqual(itm.folder_project(projects, str(self.folder("code/api/src"))), self.api)
+        self.assertEqual(itm.folder_project(projects, str(self.folder("code/api/lib/x"))), lib)
+        self.assertIsNone(itm.folder_project(projects, str(self.root / "code/apix")))  # a prefix is not a folder
+        self.assertIsNone(itm.folder_project(projects, None))
+        found = itm.workspace_projects(projects, self.workspaces(self.folder("code/web"), self.folder("code/api"),
+                                                                 self.folder("code/api/src"), None))
+        self.assertEqual(found, ([self.web, self.api], False))  # one workspace's folder is unknown
+
+    def test_home_is_not_a_project_unless_saved(self):
+        # Tasks without a project start in the home folder; projects inside it must not claim it.
+        home = itm.task_dir()
+        home.mkdir(parents=True, exist_ok=True)
+        inside = itm.add_project("dir", str(self.folder("home/code/app")), "app")
+        projects = self.store.load()["projects"]
+        self.assertIsNone(itm.folder_project(projects, str(home)))
+        self.assertEqual(itm.workspace_projects(projects, self.workspaces(home)), ([], True))
+        with mock.patch.dict(os.environ, {"HOME": str(home)}):
+            self.assertIsNone(itm.folder_project(projects, os.path.expanduser("~")))
+        self.assertEqual(itm.folder_project(projects, str(home / "code/app")), inside)
+        # A project without a folder (named only) never matches a workspace.
+        projects["named"] = {"name": "named", "kind": "name"}
+        self.assertIsNone(itm.folder_project(projects, str(home)))
+
+    def test_found_projects_come_and_go_with_their_workspaces(self):
+        task = itm.new_task("T", projects=[self.api])
+        itm.sync_task_projects(task, [self.api, self.web], remove=True)
+        self.assertEqual((task["projects"], task["found_projects"]), ([self.api, self.web], [self.web]))
+        itm.sync_task_projects(task, [self.api], remove=True)  # web's workspace closed
+        self.assertEqual(task["projects"], [self.api])
+        self.assertNotIn("found_projects", task)
+        itm.sync_task_projects(task, [], remove=True)  # api was added by hand: it stays
+        self.assertEqual(task["projects"], [self.api])
+        self.assertNotIn("workspace_projects", task)
+
+    def test_without_removal_projects_are_only_added(self):
+        task = itm.new_task("T")
+        itm.sync_task_projects(task, [self.web], remove=False)
+        itm.sync_task_projects(task, [], remove=False)
+        self.assertEqual(task["projects"], [self.web])
+
+    def test_a_workspace_still_opening_does_not_remove_its_project(self):
+        task = itm.new_task("T")
+        itm.sync_task_projects(task, [self.web], remove=True)
+        task["workspace_projects"] = []  # e.g. the daemon restarted with the session rebuilt
+        itm.sync_task_projects(task, [], remove=True)
+        self.assertEqual(task["projects"], [self.web])  # never seen closing: kept
+
+    def test_adding_by_hand_keeps_a_found_project(self):
+        itm.cmd_new("Run", switch=False)
+        with self.store.edit() as data:
+            itm.sync_task_projects(data["tasks"]["task-run"], [self.web], remove=True)
+        itm.edit_task("task-run", add=["web"])  # already there: now the user's
+        self.assertNotIn("found_projects", self.task("task-run"))
+        with self.store.edit() as data:
+            itm.sync_task_projects(data["tasks"]["task-run"], [], remove=True)
+        self.assertEqual(self.task("task-run")["projects"], [self.web])
+
+    def daemon_running(self):
+        itm.write_atomic(itm.status_path(), json.dumps({"updated_at": itm.now(), "sessions": {}}))
+
+    def test_a_project_with_an_open_workspace_is_kept_while_following(self):
+        itm.cmd_new("Run", projects=["api", "web"], switch=False)
+        with self.store.edit() as data:
+            itm.sync_task_projects(data["tasks"]["task-run"], [self.api], remove=True)
+        self.daemon_running()
+        notes = itm.edit_task("task-run", title="Renamed", remove=["api", "web"])
+        self.assertIn("could not remove api: it still has a workspace", notes[0])
+        task = self.task("task-run")  # the rest of the edit is saved
+        self.assertEqual((task["title"], task["projects"]), ("Renamed", [self.api]))
+        # Without a running daemon nothing keeps the record current: it does not hold the project.
+        itm.status_path().unlink()
+        itm.edit_task("task-run", remove=["api"])
+        self.assertNotIn("projects", self.task("task-run"))
+        itm.edit_task("task-run", add=["api"])
+        with self.store.edit() as data:
+            itm.sync_task_projects(data["tasks"]["task-run"], [self.api], remove=True)
+        self.daemon_running()
+        itm.set_config("herdr", "projects_from_workspaces", False)
+        self.assertEqual(itm.edit_task("task-run", remove=["api"]), [])
+        self.assertNotIn("projects", self.task("task-run"))
+        # A broken settings file is "off", as for the daemon.
+        itm.set_config("herdr", "projects_from_workspaces", True)
+        itm.config_path().write_bytes(b"# n\xe3o\n")
+        self.assertFalse(itm.follows_workspaces())
+
+    def test_a_named_workspace_stays_with_its_project(self):
+        projects = self.store.load()["projects"]
+        api, web = self.folder("code/api"), self.folder("code/web")
+        named = {"id": "w1", "label": "api", "focused": True, "folder": str(web / "src")}  # its pane went to web
+        self.assertEqual(itm.workspace_project(projects, named), self.api)
+        self.assertEqual(itm.workspace_project(projects, {**named, "label": "API", "folder": None}), self.api)
+        # An unnamed workspace's label is its folder's name: it says nothing about projects.
+        other = self.folder("other/api")
+        self.assertIsNone(itm.workspace_project(projects, {**named, "label": "api", "folder": str(other)}))
+        self.assertEqual(itm.workspace_project(projects, {**named, "label": "web", "folder": str(web)}), self.web)
+        self.assertEqual(itm.workspace_project(projects, {**named, "label": "my stuff", "folder": str(api)}),
+                         self.api)
+
+    def test_untrusted_passes_only_add(self):
+        itm.cmd_new("Run", switch=False)
+        sessions = {"task-run": {"running": True, "socket_path": "/sock/run"}}
+        found = {"/sock/run": self.workspaces(self.folder("code/api"), self.folder("code/web"))}
+        config, settled = itm.parse_config(""), set()
+        with mock.patch.object(itm, "list_sessions", return_value=sessions), \
+                mock.patch.object(itm, "list_agents", return_value=[]), \
+                mock.patch.object(itm, "live_clients", return_value={}), \
+                mock.patch.object(itm, "session_workspaces", side_effect=lambda socket: found[socket]):
+            itm.poll_once(self.store, {}, config, settled)
+            self.assertEqual(settled, {"task-run"})
+            found["/sock/run"] = self.workspaces(self.folder("code/api"), None)  # web's folder unknown
+            itm.poll_once(self.store, {}, config, settled)
+            self.assertEqual(self.task("task-run")["projects"], [self.api, self.web])
+            # A daemon that just started has not read the session before: no removal yet.
+            found["/sock/run"] = self.workspaces(self.folder("code/api"))
+            itm.poll_once(self.store, {}, config, set())
+            self.assertEqual(self.task("task-run")["projects"], [self.api, self.web])
+            itm.poll_once(self.store, {}, config, settled)
+            self.assertEqual(self.task("task-run")["projects"], [self.api])
+
+    def test_the_record_of_open_workspaces_ends_with_the_session(self):
+        itm.cmd_new("Run", projects=["api"], switch=False)
+        itm.cmd_new("Other", projects=["web"], switch=False)
+        with self.store.edit() as data:
+            for name in ("task-run", "task-other"):
+                data["tasks"][name]["workspace_projects"] = itm.task_projects(data["tasks"][name])
+        sessions = {"task-run": {"running": False, "socket_path": "/sock/run"}}
+        with mock.patch.object(itm, "list_sessions", return_value=sessions), \
+                mock.patch.object(itm, "live_clients", return_value={}):
+            itm.poll_once(self.store, {}, itm.parse_config(""))
+        self.assertNotIn("workspace_projects", self.task("task-run"))  # stopped
+        self.assertNotIn("workspace_projects", self.task("task-other"))  # gone
+        with self.store.edit() as data:
+            data["tasks"]["task-run"]["workspace_projects"] = [self.api]
+        with mock.patch.object(itm, "move_clients_off"), mock.patch.object(itm, "stop_session_detached"):
+            itm.archive_task("task-run")
+        self.assertNotIn("workspace_projects", self.task("task-run"))
+
+    def test_hand_edits_and_old_files(self):
+        with self.store.edit() as data:
+            data["tasks"]["task-x"] = {**itm.new_task("X"), "projects": None}
+            data["tasks"]["task-y"] = {**itm.new_task("Y"), "projects": [self.api, self.web], "project": None}
+            data["tasks"]["task-z"] = {**itm.new_task("Z"), "project": self.web}
+            data["tasks"]["task-g"] = {**itm.new_task("G"), "projects": ["gone", self.api]}
+        data = self.store.load()
+        self.assertEqual(itm.task_projects(data["tasks"]["task-x"]), [])
+        self.assertEqual(data["tasks"]["task-y"]["projects"], [self.api, self.web])  # not replaced by "project"
+        self.assertNotIn("project", data["tasks"]["task-y"])
+        self.assertEqual(data["tasks"]["task-z"]["projects"], [self.web])
+        itm.task_rows(data, "all", {}, {})
+        itm.edit_task("task-g", remove=["gone"])  # an id the task holds, of a project no longer saved
+        self.assertEqual(self.task("task-g")["projects"], [self.api])
+        with self.store.edit() as data:
+            data["tasks"]["task-g"]["projects"] = ["gone"]
+        itm.edit_task("task-g", projects=[])
+        self.assertIn("Project removed\n\ngone", itm.notes_path("task-g").read_text())
+
+    def test_order_puts_projects_first(self):
+        itm.cmd_new("Run", projects=["api", "web"], switch=False)
+        itm.edit_task("task-run", order=[self.web, self.api])
+        self.assertEqual(self.task("task-run")["projects"], [self.web, self.api])
+
+    def test_daemon_follows_workspaces(self):
+        itm.cmd_new("Run", projects=["api"], switch=False)
+        sessions = {"task-run": {"running": True, "socket_path": "/sock/run"}}
+        found = {"/sock/run": self.workspaces(self.folder("code/api"), self.folder("code/web/src"))}
+        config = itm.parse_config("")
+        with mock.patch.object(itm, "list_sessions", return_value=sessions), \
+                mock.patch.object(itm, "list_agents", return_value=[]), \
+                mock.patch.object(itm, "live_clients", return_value={}), \
+                mock.patch.object(itm, "session_workspaces", side_effect=lambda socket: found[socket]):
+            itm.poll_once(self.store, {}, config)
+            self.assertEqual(self.task("task-run")["projects"], [self.api, self.web])
+            found["/sock/run"] = []  # starting or restoring: nothing to follow yet
+            itm.poll_once(self.store, {}, config)
+            self.assertEqual(self.task("task-run")["projects"], [self.api, self.web])
+            found["/sock/run"] = self.workspaces(self.folder("code/api"))
+            itm.poll_once(self.store, {}, config)
+            self.assertEqual(self.task("task-run")["projects"], [self.api])
+            # Off: nothing is asked or changed.
+            found["/sock/run"] = self.workspaces(self.folder("code/web"))
+            off = itm.parse_config("[herdr]\nprojects_from_workspaces = false\n")
+            itm.poll_once(self.store, {}, off)
+            self.assertEqual(self.task("task-run")["projects"], [self.api])
+            # An archived task is left alone.
+            with self.store.edit() as data:
+                data["tasks"]["task-run"]["state"] = "archived"
+            itm.poll_once(self.store, {}, config)
+            self.assertEqual(self.task("task-run")["projects"], [self.api])
+
+    def test_session_workspaces_reads_the_first_pane_of_the_first_tab(self):
+        snapshot = {"result": {"snapshot": {
+            "workspaces": [{"workspace_id": "w1", "label": "api", "focused": False},
+                           {"workspace_id": "w2", "label": "web", "focused": True},
+                           {"workspace_id": "w3", "label": "empty"}],
+            # Tab order, not numbers: w1's second tab was moved to the front.
+            "tabs": [{"tab_id": "w1:t3", "workspace_id": "w1"}, {"tab_id": "w1:t1", "workspace_id": "w1"},
+                     {"tab_id": "w2:t1", "workspace_id": "w2"}],
+            "layouts": [{"tab_id": "w1:t1", "panes": [{"pane_id": "w1:p1"}]},
+                        {"tab_id": "w1:t3", "panes": [{"pane_id": "w1:p5"}, {"pane_id": "w1:p2"}]},
+                        {"tab_id": "w2:t1", "panes": [{"pane_id": "w2:p1"}]}],
+            "panes": [{"pane_id": "w1:p1", "cwd": "/a"}, {"pane_id": "w1:p5", "cwd": "/b"},
+                      {"pane_id": "w1:p2", "cwd": "/c"}, {"pane_id": "w2:p1", "cwd": "/d"}],
+        }}}
+        with mock.patch.object(itm, "herdr_json", return_value=snapshot) as herdr:
+            found = itm.session_workspaces("/sock")
+        herdr.assert_called_once_with(["api", "snapshot"], "/sock")
+        self.assertEqual(found, [{"id": "w1", "label": "api", "focused": False, "folder": "/b"},
+                                 {"id": "w2", "label": "web", "focused": True, "folder": "/d"},
+                                 {"id": "w3", "label": "empty", "focused": False, "folder": None}])
+        with mock.patch.object(itm, "herdr_json", side_effect=itm.ItmError("gone")):
+            self.assertIsNone(itm.session_workspaces("/sock"))
+        with mock.patch.object(itm, "herdr_json", return_value={"result": {}}):
+            self.assertIsNone(itm.session_workspaces("/sock"))
+
+
+class AddWorkspaceTest(TaskEnvTest):
+    """`itm project add-workspace` (prefix+shift+a)."""
+
+    def setUp(self):
+        super().setUp()
+        self.code = self.folder("code/new-thing")
+        itm.cmd_new("Here", switch=False)
+        self.sessions = {"task-here": {"running": True, "socket_path": "/sock/here"}}
+        self.found = [{"id": "w1", "label": "other", "focused": False, "folder": str(self.root)},
+                      {"id": "w2", "label": "My Thing", "focused": True, "folder": str(self.code)}]
+        self.calls = []
+        self.extra = [
+            mock.patch.dict(os.environ, {"HERDR_SOCKET_PATH": "/sock/here"}),
+            mock.patch.object(itm, "list_sessions", return_value=self.sessions),
+            mock.patch.object(itm, "session_workspaces", side_effect=lambda socket: self.found),
+            mock.patch.object(itm, "herdr_json", side_effect=lambda args, socket=None: self.calls.append(args) or {}),
+        ]
+        for patch in self.extra:
+            patch.start()
+        os.environ.pop("HERDR_WORKSPACE_ID", None)
+        os.environ.pop("HERDR_ACTIVE_WORKSPACE_ID", None)
+
+    def tearDown(self):
+        for patch in reversed(self.extra):
+            patch.stop()
+        super().tearDown()
+
+    def test_saves_the_focused_workspace_named_like_it_and_gives_it_to_the_task(self):
+        with mock.patch("sys.stdin") as stdin:
+            stdin.isatty.return_value = False  # no terminal: no dialog
+            itm.cmd_project_add_workspace(None)
+        project = self.project("My Thing")
+        self.assertEqual(project["path"], str(self.code))
+        self.assertEqual(self.task("task-here")["projects"], [project["id"]])
+        # Projects follow workspaces: it is one found there, and goes when the workspace closes.
+        self.assertEqual(self.task("task-here")["found_projects"], [project["id"]])
+        self.assertEqual(self.calls, [["workspace", "rename", "w2", "My Thing"]])  # no new workspace
+
+    def test_without_following_workspaces_it_is_added_by_hand(self):
+        itm.set_config("herdr", "projects_from_workspaces", False)
+        itm.cmd_project_add_workspace("mine")
+        self.assertEqual(self.task("task-here")["projects"], [self.project("mine")["id"]])
+        self.assertNotIn("found_projects", self.task("task-here"))
+
+    def test_a_stale_pane_workspace_is_not_trusted_and_a_name_can_be_given(self):
+        # A pane keeps HERDR_WORKSPACE_ID from before it moved; the focused workspace is the one typed in.
+        with mock.patch.dict(os.environ, {"HERDR_WORKSPACE_ID": "w1"}):
+            itm.cmd_project_add_workspace("chosen")
+        self.assertEqual(self.project("chosen")["path"], str(self.code))
+        self.assertEqual(self.calls, [["workspace", "rename", "w2", "chosen"]])
+
+    def test_home_and_folders_above_it_are_refused(self):
+        home = itm.task_dir()
+        home.mkdir(parents=True, exist_ok=True)
+        for folder in (home, self.root, Path("/")):
+            with self.subTest(folder=folder), mock.patch.dict(os.environ, {"HOME": str(home)}):
+                self.found[1]["folder"] = str(folder)
+                with self.assertRaisesRegex(itm.ItmError, "holds every workspace under it"):
+                    itm.cmd_project_add_workspace("everything")
+        self.assertEqual(self.store.load()["projects"], {})
+
+    def test_a_popup_names_the_workspace_it_was_opened_over(self):
+        self.code = self.folder("elsewhere")
+        self.found[0]["folder"] = str(self.code)
+        with mock.patch.dict(os.environ, {"HERDR_ACTIVE_WORKSPACE_ID": "w1"}):
+            itm.cmd_project_add_workspace("popup")
+        self.assertEqual(self.project("popup")["path"], str(self.code))
+        self.assertEqual(self.calls, [["workspace", "rename", "w1", "popup"]])
+
+    def test_a_saved_folder_is_not_added_twice(self):
+        api_id = itm.add_project("dir", str(self.code.parent), "code")
+        itm.cmd_project_add_workspace(None)  # a folder inside a saved project is that project
+        self.assertEqual(list(self.store.load()["projects"]), [api_id])
+        self.assertEqual(self.task("task-here")["projects"], [api_id])
+        self.assertEqual(self.calls, [["workspace", "rename", "w2", "code"]])
+
+    def test_the_dialog_gets_the_folder_and_name(self):
+        screens = mock.Mock()
+        screens.add_project_dialog.return_value = None
+        with mock.patch.object(itm, "screens", return_value=screens), mock.patch("sys.stdin") as stdin, \
+                mock.patch("sys.stdout") as stdout, self.assertRaises(itm.Cancelled):
+            stdin.isatty.return_value = stdout.isatty.return_value = True
+            itm.cmd_project_add_workspace(None)
+        screens.add_project_dialog.assert_called_once_with("dir", str(self.code), "My Thing")
+        self.assertEqual(self.store.load()["projects"], {})
+
+    def test_outside_herdr_or_a_task(self):
+        with mock.patch.dict(os.environ, {"HERDR_SOCKET_PATH": ""}), \
+                self.assertRaisesRegex(itm.ItmError, "run this inside Herdr"):
+            itm.cmd_project_add_workspace("x")
+        self.sessions["work"] = self.sessions.pop("task-here")
+        self.sessions["work"]["socket_path"] = "/sock/here"
+        itm.cmd_project_add_workspace("x")  # saved, and no task to give it to
+        self.assertEqual(self.project("x")["path"], str(self.code))
+
+
+class SettingsTest(TaskEnvTest):
+    def test_defaults_without_a_file(self):
+        self.assertEqual(itm.load_config(), itm.CONFIG_DEFAULTS)
+
+    def test_set_keeps_the_rest_of_the_file(self):
+        path = itm.config_path()
+        path.parent.mkdir(parents=True)
+        path.write_text("# mine\n[herdr]\n# why\nprojects_from_workspaces = true  # keep\n")
+        itm.set_config("herdr", "projects_from_workspaces", False)
+        itm.set_config("herdr", "remove_projects_without_workspace", False)
+        self.assertEqual(path.read_text(), "# mine\n[herdr]\n# why\nprojects_from_workspaces = false  # keep\n"
+                                           "remove_projects_without_workspace = false\n")
+        self.assertFalse(itm.load_config()["herdr"]["remove_projects_without_workspace"])
+
+    def test_set_creates_the_file(self):
+        itm.set_config("herdr", "remove_projects_without_workspace", False)
+        self.assertEqual(itm.config_path().read_text(), "[herdr]\nremove_projects_without_workspace = false\n")
+
+    def test_mistakes_are_errors(self):
+        for text, error in (("[herdr\n", "not valid TOML"), ("[herdr]\nnope = true\n", "unknown setting herdr.nope"),
+                            ("[other]\n", "unknown setting other"),
+                            ("[herdr]\nprojects_from_workspaces = 1\n", "must be true or false")):
+            with self.subTest(text=text), self.assertRaisesRegex(itm.ItmError, error):
+                itm.parse_config(text)
+
+    def test_a_file_it_cannot_change_is_left_alone(self):
+        path = itm.config_path()
+        path.parent.mkdir(parents=True)
+        path.write_text("herdr.projects_from_workspaces = true\n")
+        with self.assertRaises(itm.ItmError):
+            itm.set_config("herdr", "projects_from_workspaces", False)
+        self.assertEqual(path.read_text(), "herdr.projects_from_workspaces = true\n")
+
+    def test_odd_files(self):
+        path = itm.config_path()
+        path.parent.mkdir(parents=True)
+        path.write_bytes(b"# n\xe3o\n")  # Latin-1
+        with self.assertRaisesRegex(itm.ItmError, "cannot read"):
+            itm.load_config()
+        path.write_text('[herdr]\n"projects_from_workspaces" = true\n')  # valid, but not a line it follows
+        with self.assertRaisesRegex(itm.ItmError, "edit it by hand"):
+            itm.set_config("herdr", "projects_from_workspaces", False)
+        # Through a symlink (home-manager, stow): the target changes, the link stays.
+        target = self.root / "dotfiles/itm.toml"
+        target.parent.mkdir()
+        target.write_text("[herdr]\nprojects_from_workspaces = true\n")
+        path.unlink()
+        path.symlink_to(target)
+        itm.set_config("herdr", "projects_from_workspaces", False)
+        self.assertTrue(path.is_symlink())
+        self.assertIn("projects_from_workspaces = false", target.read_text())
+        target.parent.chmod(0o555)
+        try:
+            if not os.access(target.parent, os.W_OK):  # not as root
+                with self.assertRaisesRegex(itm.ItmError, "cannot write"):
+                    itm.set_config("herdr", "projects_from_workspaces", True)
+        finally:
+            target.parent.chmod(0o755)
+
+    def test_the_daemon_goes_on_with_a_broken_file(self):
+        path = itm.config_path()
+        path.parent.mkdir(parents=True)
+        path.write_text("[herdr\n")
+        passes = []
+
+        def poll(store, notified, config, settled):
+            passes.append(config)
+            if len(passes) == 2:
+                raise SystemExit
+        with mock.patch.object(itm, "poll_once", side_effect=poll), mock.patch.object(itm.time, "sleep"), \
+                mock.patch.object(itm.signal, "signal"), mock.patch("builtins.print") as out, self.assertRaises(SystemExit):
+            itm.cmd_daemon()
+        self.assertFalse(passes[0]["herdr"]["projects_from_workspaces"])
+        logged = "".join(str(c.args[0]) for c in out.call_args_list)
+        self.assertEqual(logged.count("settings ignored"), 1)  # once, not every pass
 
 
 class JumpLastStatusTest(TaskEnvTest):
@@ -1149,15 +1684,17 @@ class ReviewFixesTest(TaskEnvTest):
 
     def test_edit_with_the_current_project_after_start(self):
         api_id = itm.add_project("dir", str(self.folder("code/api")), "api")
-        itm.cmd_new("Fix", project="api", switch=False)
+        itm.cmd_new("Fix", projects=["api"], switch=False)
         with mock.patch.object(itm, "list_sessions", return_value={"task-fix": {"running": True}}):
-            itm.edit_task("task-fix", title="Fix it", project="API")  # unchanged project: not an error
+            itm.edit_task("task-fix", title="Fix it", projects=["API"])  # unchanged projects: not an error
+            itm.edit_task("task-fix", add=["API"])
         task = self.task("task-fix")
-        self.assertEqual((task["title"], task["project"]), ("Fix it", api_id))
+        self.assertEqual((task["title"], task["projects"]), ("Fix it", [api_id]))
 
     def test_form_starts_with_the_project_of_the_task_you_are_in(self):
         api_id = itm.add_project("dir", str(self.folder("code/api")), "api")
-        itm.cmd_new("Here", project="api", switch=False)
+        itm.add_project("dir", str(self.folder("code/web")), "web")
+        itm.cmd_new("Here", projects=["api", "web"], switch=False)
         screens = mock.Mock()
         screens.task_form.return_value = None
         with mock.patch.dict(os.environ, {"HERDR_SOCKET_PATH": "/sock"}), \
@@ -1165,7 +1702,7 @@ class ReviewFixesTest(TaskEnvTest):
                 mock.patch.object(itm, "switchable_session", return_value="task-here"), \
                 mock.patch.object(itm, "screens", return_value=screens), self.assertRaises(itm.Cancelled):
             itm.cmd_new(None)
-        self.assertEqual(screens.task_form.call_args.kwargs["project"], api_id)
+        self.assertEqual(screens.task_form.call_args.kwargs["projects"], [api_id])  # its first project
 
     def test_remove_without_a_terminal_keeps_a_clean_clone(self):
         self.add_api()

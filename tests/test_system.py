@@ -217,7 +217,8 @@ class MissingProgramTest(unittest.TestCase):
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
-        self.env = mock.patch.dict(os.environ, {"PATH": self.tmp.name, "XDG_STATE_HOME": self.tmp.name})
+        self.env = mock.patch.dict(os.environ, {"PATH": self.tmp.name, "XDG_STATE_HOME": self.tmp.name,
+                                                  "XDG_CONFIG_HOME": self.tmp.name})
         self.env.start()
 
     def tearDown(self):

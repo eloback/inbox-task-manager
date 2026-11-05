@@ -26,7 +26,7 @@ class NotesTest(TaskEnvTest):
 
     def test_a_new_task_starts_its_notes_with_title_and_description(self):
         itm.add_project("dir", str(self.folder("code/api")), "api")
-        itm.cmd_new("Fix login", description="Safari logs out\nafter 5 minutes", project="api")
+        itm.cmd_new("Fix login", description="Safari logs out\nafter 5 minutes", projects=["api"])
         path = itm.notes_path("task-fix-login")
         self.assertEqual(path, self.root / "data/inbox-task-manager/tasks/task-fix-login/notes.md")
         text = self.notes("task-fix-login")
@@ -35,6 +35,9 @@ class NotesTest(TaskEnvTest):
         itm.cmd_new("Bare")
         self.assertIn("· no project · task-bare*\n", self.notes("task-bare"))
         self.assertTrue(self.notes("task-bare").endswith("task-bare*\n"))
+        itm.add_project("dir", str(self.folder("code/web")), "web")
+        itm.cmd_new("Both", projects=["api", "web"])
+        self.assertIn("· projects api, web · task-both*\n", self.notes("task-both"))
 
     def test_edits_append_only_what_changed(self):
         itm.add_project("dir", str(self.folder("code/api")), "api")
@@ -43,16 +46,16 @@ class NotesTest(TaskEnvTest):
         itm.edit_task("task-fix-login", title=" Fix login ", description="old text ")  # nothing really changed
         self.assertEqual(self.notes("task-fix-login"), before)
         itm.edit_task("task-fix-login", title="Fix login on Safari", description="ITP drops it")
-        itm.edit_task("task-fix-login", project="api")
-        itm.edit_task("task-fix-login", description="", project=None)
+        itm.edit_task("task-fix-login", add=["api"])
+        itm.edit_task("task-fix-login", description="", projects=[])
         added = self.notes("task-fix-login")[len(before):]
         stamp = itm.notes_stamp()[:10]
         self.assertRegex(added, (
             rf"^\n## {stamp} \d\d:\d\d · Title changed\n\nFix login on Safari\n\n"
             rf"## {stamp} \d\d:\d\d · Description changed\n\nITP drops it\n\n"
-            rf"## {stamp} \d\d:\d\d · Project changed\n\napi \(.*code/api\)\n\n"
+            rf"## {stamp} \d\d:\d\d · Project added\n\napi \(.*code/api\)\n\n"
             rf"## {stamp} \d\d:\d\d · Description cleared\n\n"
-            rf"## {stamp} \d\d:\d\d · Project removed\n\n$"))
+            rf"## {stamp} \d\d:\d\d · Project removed\n\napi\n\n$"))
 
     def test_appending_keeps_one_blank_line_after_what_the_user_wrote(self):
         itm.cmd_new("Fix", switch=False)
