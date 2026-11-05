@@ -166,7 +166,9 @@ Workspaces are one source of a task's projects. With **projects follow
 workspaces** on, the daemon adds to a running task every saved project a
 workspace of its session is in: a workspace named after a project belongs to
 it, any other is judged by that same first pane's folder (a tab or pane you
-open to look at another repository does not count). With **remove a project
+open to look at another repository does not count). A Herdr worktree of a
+project, or your own checkout of the same repository (same `origin`), counts
+as that project too. With **remove a project
 when its workspace closes** on, a project found this way leaves the task again
 when its workspace closes; projects you added yourself stay. Only saved
 projects count: a workspace in your home folder is in no project unless you

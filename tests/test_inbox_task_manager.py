@@ -1433,6 +1433,102 @@ class WorkspaceSyncTest(TaskEnvTest):
             self.assertIsNone(itm.session_workspaces("/sock"))
 
 
+class RepositoryMatchTest(TaskEnvTest):
+    """A workspace outside every saved folder, in the same git repository as a saved project."""
+
+    def setUp(self):
+        super().setUp()
+        itm._repositories.clear()
+        self.addCleanup(itm._repositories.clear)
+
+    def git(self, *args, cwd=None):
+        subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True,
+                       env={**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+                            "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"})
+
+    def checkout(self, name, origin=None):
+        path = self.folder(name)
+        self.git("init", "-q", str(path))
+        self.git("commit", "-q", "--allow-empty", "-m", "init", cwd=path)
+        if origin:
+            self.git("remote", "add", "origin", origin, cwd=path)
+        return path
+
+    def workspace(self, folder, label=""):
+        return {"id": "w1", "label": label, "focused": True, "folder": str(folder)}
+
+    def test_a_linked_worktree_is_in_the_project_of_its_checkout(self):
+        api = self.checkout("code/api")
+        api_id = itm.add_project("dir", str(api), "api")
+        self.git("worktree", "add", "-q", str(self.root / "worktrees/api-feature"), "-b", "feature", cwd=api)
+        projects = self.store.load()["projects"]
+        tree = self.root / "worktrees/api-feature"
+        self.assertIsNone(itm.workspace_project(projects, self.workspace(tree)))  # by folder: in none
+        self.assertEqual(itm.workspace_project(projects, self.workspace(tree), repositories=True), api_id)
+        self.assertEqual(itm.repository(str(tree)), (str(api), None))
+
+    def test_another_checkout_is_in_the_project_with_its_remote(self):
+        clone = self.checkout("clones/api", origin="git@github.com:acme/api.git")
+        with self.store.edit() as data:
+            data["projects"]["git1"] = {"name": "api", "kind": "git", "url": "git@github.com:acme/api.git",
+                                        "path": str(clone)}
+        mine = self.checkout("mine/api", origin="https://github.com/acme/api")  # another form of the URL
+        (mine / "src").mkdir()
+        projects = self.store.load()["projects"]
+        self.assertEqual(itm.workspace_project(projects, self.workspace(mine / "src"), repositories=True), "git1")
+        other = self.checkout("mine/web", origin="https://github.com/acme/web")
+        self.assertIsNone(itm.workspace_project(projects, self.workspace(other), repositories=True))
+        self.assertIsNone(itm.workspace_project(projects, self.workspace(self.folder("plain")), repositories=True))
+        # Two saved projects with that remote: in neither.
+        itm.add_project("dir", str(self.checkout("work/api", origin="git@github.com:acme/api")), "work-api")
+        projects = self.store.load()["projects"]
+        self.assertIsNone(itm.workspace_project(projects, self.workspace(mine), repositories=True))
+
+    def test_lookups_are_cached(self):
+        api = self.checkout("code/api", origin="git@github.com:acme/api.git")
+        real_run = subprocess.run
+        with mock.patch.object(itm.subprocess, "run", side_effect=real_run) as run:
+            self.assertEqual(itm.repository(str(api)), (str(api), "github.com/acme/api"))
+            calls = run.call_count
+            itm.repository(str(api))
+            self.assertEqual(run.call_count, calls)
+        self.assertIsNone(itm.repository(str(self.folder("plain"))))
+        with mock.patch.object(itm.subprocess, "run", side_effect=FileNotFoundError("git")):
+            self.assertIsNone(itm.repository(str(self.folder("no-git-here"))))  # git missing: no repository
+
+    def test_herdr_labels_are_not_names(self):
+        # Herdr names an unnamed workspace after its folder, or after the repository it was opened in.
+        self.assertTrue(itm.automatic_label("sub", "/code/api/sub"))
+        self.assertTrue(itm.automatic_label("api", "/code/api/sub"))
+        self.assertFalse(itm.automatic_label("my api", "/code/api/sub"))
+        api_id = itm.add_project("dir", str(self.folder("code/api")), "api")
+        other = self.checkout("other/api")  # another repository with that name
+        (other / "src").mkdir()
+        projects = self.store.load()["projects"]
+        self.assertIsNone(itm.workspace_project(projects, self.workspace(other / "src", "api"), repositories=True))
+        named = self.workspace(self.folder("elsewhere"), "API")
+        self.assertEqual(itm.workspace_project(projects, named), api_id)
+
+    def test_the_daemon_and_the_hotkey_use_it(self):
+        api = self.checkout("code/api")
+        api_id = itm.add_project("dir", str(api), "api")
+        self.git("worktree", "add", "-q", str(self.root / "worktrees/fix"), "-b", "fix", cwd=api)
+        itm.cmd_new("Run", switch=False)
+        sessions = {"task-run": {"running": True, "socket_path": "/sock/run"}}
+        found = [self.workspace(self.root / "worktrees/fix", "fix")]
+        with mock.patch.object(itm, "list_sessions", return_value=sessions), \
+                mock.patch.object(itm, "list_agents", return_value=[]), \
+                mock.patch.object(itm, "live_clients", return_value={}), \
+                mock.patch.object(itm, "session_workspaces", return_value=found):
+            itm.poll_once(self.store, {}, itm.parse_config(""))
+            self.assertEqual(self.task("task-run")["projects"], [api_id])
+            with mock.patch.dict(os.environ, {"HERDR_SOCKET_PATH": "/sock/run"}), \
+                    mock.patch.object(itm, "herdr_json", return_value={}) as herdr:
+                itm.cmd_project_add_workspace(None)  # the worktree's project, not a new one
+        self.assertEqual(list(self.store.load()["projects"]), [api_id])
+        herdr.assert_called_once_with(["workspace", "rename", "w1", "api"], "/sock/run")
+
+
 class AddWorkspaceTest(TaskEnvTest):
     """`itm project add-workspace` (prefix+shift+a)."""
 

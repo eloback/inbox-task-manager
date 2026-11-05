@@ -48,8 +48,13 @@ Verified against Herdr 0.9.3. Re-check them after a Herdr upgrade.
   against a session's socket opens a tab in a running session (in its active
   workspace). The label names the tab, not the workspace.
 - **Workspace names.** A workspace keeps `custom_name` and `identity_cwd` in
-  the session's `session.json`. Its label is `custom_name` when set, else the
-  last segment of `identity_cwd` (the folder name, not a repository's name).
+  the session's `session.json`. Its label is `custom_name` when set, else
+  made up from the folder: a workspace created inside a git repository is
+  labeled after the repository's top folder (`api` for `api/src`, a linked
+  worktree after its own top folder), and once its first pane changed
+  folder, after that folder's name (`src`). Either way it is the name of the
+  folder or of one above it. The API's `worktree` field is set only for
+  workspaces Herdr's own worktree commands made.
   `identity_cwd` follows the working folder of one pane only: the first pane
   (in layout order) of the first tab (in tab order). A `cd` in another tab or
   pane, or focusing another tab, changes nothing; when that pane or tab
@@ -257,6 +262,21 @@ Verified against Herdr 0.9.3. Re-check them after a Herdr upgrade.
   follow their first pane, as their Herdr name does, so a `cd` there moves
   the workspace to another project (removal included); named workspaces
   do not.
+- A workspace's label counts as a name only when it is not the name of its
+  folder or of a folder above it (`automatic_label`): Herdr makes up such
+  labels for unnamed workspaces, and another repository called `api` must
+  not join the project `api`.
+- A workspace whose folder is in no saved project can still be in one by
+  its git repository (`repository_project`, the daemon and the workspace
+  hotkey): a linked worktree is in the project its main work tree is in
+  (Herdr's worktrees live under `~/.herdr/worktrees`, outside the
+  project), and another checkout is in the one saved project whose
+  checkout has the same `origin` remote (normalized as for duplicates,
+  R8.4); with two such projects, in neither. `repository` asks git (`rev-parse
+  --git-common-dir`, `ls-remote --get-url origin`: no network, a timeout,
+  stdin closed) and caches the answer per folder for 5 minutes in the
+  process, so the daemon's pass does not run git every 2 s. Missing git
+  means no repository.
 - Only saved projects are matched. The home folder, where tasks without
   projects start, is in no project unless it is itself saved; a project
   inside it does not claim it (a test keeps this true).
@@ -553,8 +573,9 @@ The switcher and its dialogs follow these principles.
   them after, not by the focused pane or every pane: a tab or pane opened to
   look at another repository does not make it part of the task. A workspace
   named after a project stays with it (itm names the ones it opens), so a
-  `cd` in its first pane does not move it. Projects have sources and the
-  sync removes only what it found. Settings went into a TOML file with a
+  `cd` in its first pane does not move it. A workspace in a linked worktree
+  or another checkout of a saved project's repository is in that project.
+  Projects have sources and the sync removes only what it found. Settings went into a TOML file with a
   screen in the switcher, which writes it line by line. `prefix+shift+a`
   turns the workspace you are in into a project of the current task in one
   step.
@@ -593,9 +614,9 @@ The switcher and its dialogs follow these principles.
   to `SESSION_START_TIMEOUT`), the loop's marker already names the new task
   but no attach child exists, so a hand-off in that window (which waits
   2 s) is dropped.
-- **Repositories by remote.** A workspace in a checkout of a saved git
-  repository other than itm's clone (your own clone, a worktree) is not
-  matched to it: projects are matched by folder, not by remote URL.
+- **Repositories by remote** compare `origin` only; a checkout whose
+  remote has another name, or whose remote changed in the last 5 minutes
+  (the cache), is not matched by remote.
 - **Settings files** are rewritten with LF line endings.
 - **Alt+3…9.** Alt+1, Alt+2 and Alt+5 were sent to a Herdr popup; the others
   are assumed to arrive the same way.

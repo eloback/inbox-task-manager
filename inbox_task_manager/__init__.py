@@ -1244,31 +1244,105 @@ def folder_project(projects: dict, folder: str | None, roots: list[tuple[str, st
     return best
 
 
-def workspace_project(projects: dict, workspace: dict, roots: list[tuple[str, str]] | None = None) -> str | None:
+def automatic_label(label: str, folder: str) -> bool:
+    """Whether ``label`` is what Herdr shows for an unnamed workspace in ``folder``.
+
+    Herdr names one created inside a git repository after the repository's
+    top folder, and after its first pane changed folder after that folder:
+    the name of the folder or of one above it.
+    """
+    path = Path(folder)
+    return any(label == part.name for part in (path, *path.parents) if part.name)
+
+
+def workspace_project(projects: dict, workspace: dict, roots: list[tuple[str, str]] | None = None,
+                      repositories: bool = False) -> str | None:
     """The project a workspace is in.
 
     A workspace named after a project (itm names the ones it opens, and the
-    workspace hotkey names its own) is in it wherever its first pane went.
-    Any other is in the project its folder is in; an unnamed workspace's
-    label is its folder's name, so a label that is the folder's name says
-    nothing.
+    workspace hotkey names its own) is in it wherever its first pane went;
+    a label Herdr made up from the folder says nothing. Any other workspace
+    is in the project its folder is in, else (``repositories``) in the
+    project of the same git repository (``repository_project``).
     """
     label, folder = workspace.get("label", "").strip(), workspace.get("folder")
-    if label and (not folder or label != os.path.basename(folder.rstrip(os.sep))):
+    if label and not (folder and automatic_label(label, folder)):
         named = [pid for pid, p in projects.items() if p["name"].lower() == label.lower()]
         if len(named) == 1:
             return named[0]
-    return folder_project(projects, folder, roots)
+    pid = folder_project(projects, folder, roots)
+    if pid is None and repositories and folder:
+        pid = repository_project(projects, folder, roots)
+    return pid
 
 
-def workspace_projects(projects: dict, workspaces: list[dict],
-                       roots: list[tuple[str, str]] | None = None) -> tuple[list[str], bool]:
+REPOSITORY_CACHE_SECONDS = 300
+GIT_TIMEOUT = 5
+_repositories: dict[str, tuple[float, tuple[str | None, str | None] | None]] = {}
+
+
+def repository(folder: str) -> tuple[str | None, str | None] | None:
+    """(main work tree, normalized ``origin`` URL) of the git repository ``folder`` is in; None outside one.
+
+    For a linked worktree the main work tree is the checkout it was made
+    from. Read with git without the network (``ls-remote --get-url`` only
+    applies ``url.<base>.insteadOf``), with a timeout, and cached per folder
+    for ``REPOSITORY_CACHE_SECONDS``: the daemon asks on every pass.
+    """
+    cached = _repositories.get(folder)
+    if cached and time.monotonic() - cached[0] < REPOSITORY_CACHE_SECONDS:
+        return cached[1]
+
+    def git(*args: str) -> str | None:
+        try:
+            result = subprocess.run(["git", "-C", folder, *args], capture_output=True, text=True, check=False,
+                                    timeout=GIT_TIMEOUT, stdin=subprocess.DEVNULL)
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        return result.stdout.strip() if result.returncode == 0 else None
+
+    found = None
+    if common := git("rev-parse", "--path-format=absolute", "--git-common-dir"):
+        root = os.path.dirname(common) if os.path.basename(common) == ".git" else None  # a bare repository has none
+        url = git("ls-remote", "--get-url", "origin")
+        key = None
+        if url and url != "origin":  # without such a remote, git prints the name back
+            with contextlib.suppress(ItmError):
+                key = normalize_git_url(url)
+        found = (root, key)
+    _repositories[folder] = (time.monotonic(), found)
+    return found
+
+
+def repository_project(projects: dict, folder: str, roots: list[tuple[str, str]] | None = None) -> str | None:
+    """The saved project of the git repository ``folder`` is in, for a folder in none of them.
+
+    A linked worktree is in the project its main work tree is in (Herdr's
+    worktrees live outside it). Another checkout is in the one saved
+    project whose checkout has the same ``origin`` remote; with two such
+    projects, in neither.
+    """
+    found = repository(folder)
+    if found is None:
+        return None
+    root, key = found
+    if root and (pid := folder_project(projects, root, roots)):
+        return pid
+    if not key:
+        return None
+    same = [pid for pid, p in projects.items()
+            if p.get("path") and (repository(p["path"]) or (None, None))[1] == key]
+    return same[0] if len(same) == 1 else None
+
+
+def workspace_projects(projects: dict, workspaces: list[dict], roots: list[tuple[str, str]] | None = None,
+                       repositories: bool = False) -> tuple[list[str], bool]:
     """(the saved projects a session's workspaces are in, in workspace order, each once;
     whether every workspace's folder was known)."""
     roots = project_roots(projects) if roots is None else roots
     found: list[str] = []
     for workspace in workspaces:
-        pid = workspace_project(projects, workspace, roots)
+        pid = workspace_project(projects, workspace, roots, repositories)
         if pid and pid not in found:
             found.append(pid)
     return found, all(w.get("folder") for w in workspaces)
@@ -2360,7 +2434,7 @@ def cmd_project_add_workspace(name: str | None) -> int:
     """Save the folder of the workspace this runs in as a project, and give it to the current task."""
     sessions = list_sessions()
     session, workspace = current_workspace(sessions)
-    project_id = workspace_project(Store().load()["projects"], workspace)
+    project_id = workspace_project(Store().load()["projects"], workspace, repositories=True)
     if project_id is None:
         check_workspace_folder(workspace["folder"])
         # A workspace the user named carries the name they want; an unnamed one is named after its folder.
@@ -2493,7 +2567,8 @@ def poll_once(
     # project's folder once per pass.
     projects = store.load()["projects"] if workspaces else {}
     roots = project_roots(projects)
-    open_projects = {name: workspace_projects(projects, found, roots) for name, found in workspaces.items()}
+    open_projects = {name: workspace_projects(projects, found, roots, repositories=True)
+                     for name, found in workspaces.items()}
     trusted = set(workspaces) if settled is None else set(workspaces) & settled
     if settled is not None:
         settled.clear()
