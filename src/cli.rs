@@ -260,12 +260,12 @@ pub fn run(cli: Cli, itm: Itm) -> Result<()> {
                 bail!("the daemon is not running, so waiting agents are unknown (start `itm daemon`)");
             }
             let target = tasks::longest_waiting(&itm.store().load()?, &status, now);
-            itm.switch_to(&target.ok_or_else(|| Error("no agent is waiting for you".into()))?)
+            itm.switch_to(&target.ok_or_else(|| Error::Other("no agent is waiting for you".into()))?)
         }
         Command::Last => {
             let current = if itm.inside_herdr() { itm.current_session(&itm.herdr.sessions()?) } else { None };
             let target = tasks::previous_task(&itm.store().load()?, current.as_deref());
-            itm.switch_to(&target.ok_or_else(|| Error("there is no other active task".into()))?)
+            itm.switch_to(&target.ok_or_else(|| Error::Other("there is no other active task".into()))?)
         }
         Command::Notes { task, path, append } => {
             let data = itm.store().load()?;
@@ -435,7 +435,7 @@ mod tests {
         assert_eq!(format_fields(STATUS_FORMAT.split(" ◔").next().unwrap(), &fields).unwrap(), "⚑ 1 ● 2");
         assert_eq!(format_fields("{waiting}/{active} {{x}}", &fields).unwrap(), "1/2 {x}");
         let err = format_fields("{nope}", &fields).unwrap_err();
-        assert_eq!(err.0, "bad --format: 'nope'; fields: waiting, active, snoozed, archived, daemon");
+        assert_eq!(err.to_string(), "bad --format: 'nope'; fields: waiting, active, snoozed, archived, daemon");
         assert!(format_fields("{waiting", &fields).is_err() && format_fields("}", &fields).is_err());
     }
 
@@ -487,6 +487,6 @@ mod tests {
         assert_eq!(split(None, &["old", "30m"]).unwrap(), ("task-old".into(), Some("30m".into())));
         assert_eq!(split(None, &["old"]).unwrap(), ("task-old".into(), None));
         assert_eq!(split(Some("old"), &["2h"]).unwrap(), ("task-old".into(), Some("2h".into())));
-        assert_eq!(split(None, &["1h", "30m"]).unwrap_err().0, "not inside a task; name the task");
+        assert_eq!(split(None, &["1h", "30m"]).unwrap_err().to_string(), "not inside a task; name the task");
     }
 }

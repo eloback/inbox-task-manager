@@ -683,10 +683,20 @@ The switcher and its dialogs follow these principles.
   not refused after a Herdr upgrade the way the CLI's protocol check is.
   Sessions are found as `herdr session list` finds them, from Herdr's
   sessions folder. Only `herdr session attach` and `herdr server` run the
-  `herdr` program.
+  `herdr` program. A connection gets 1 s and an answer 10 s; the connect is
+  non-blocking, because a blocking connect to a session that stopped
+  accepting (a deadlock, SIGSTOP) waits forever once its backlog is full,
+  which hung the daemon in the standoff. A session whose socket exists but
+  does not take a connection in time counts as running (stuck), so its
+  requests time out instead of it looking stopped, which would wake tasks
+  snoozed until an agent asks.
 - **Stopping a session** is a `server.stop` request, not a detached
   `/bin/sh herdr session stop`: Herdr answers before it shuts down, so the
   caller may run inside the session it stops (archiving the current task).
+- **Errors** are an enum (`error.rs`) whose messages are the Python itm's.
+  Its variants are the errors callers tell apart (which Herdr failure, a
+  missing task or project, a folder already saved versus a name taken,
+  R8.4 and R8.5); everything else is a sentence written where it happens.
 - **Dependencies**, each pinned exactly (`=x.y.z`, released at least two
   weeks before it was added):
   - clap: arguments and help, with subcommands, aliases and repeated
@@ -701,7 +711,8 @@ The switcher and its dialogs follow these principles.
     switcher's drawing and its line editing. ratatui has no forms or focus,
     so those are built in itm;
   - rustix: the safe system calls std lacks (`getuid`, `kill` with a
-    signal); `unsafe` code is denied in the crate;
+    signal, a non-blocking `connect` with `poll`); `unsafe` code is denied
+    in the crate;
   - tempfile: atomic writes and test folders;
   - unicode-normalization: `slugify` like Python's `unicodedata` (NFKD, then
     drop combining marks);

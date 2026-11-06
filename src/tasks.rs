@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use unicode_normalization::{UnicodeNormalization, char::canonical_combining_class};
 
-use crate::error::{Result, bail};
+use crate::error::{Error, Result, bail};
 use crate::snooze::{MAX_SNOOZE, Until};
 use crate::status::Status;
 use crate::store::{Data, State, Task};
@@ -102,17 +102,12 @@ pub fn resolve_task(data: &Data, query: &str) -> Result<String> {
         return Ok(prefixed);
     }
     let lowered = query.to_lowercase();
-    let matches: Vec<&String> =
-        data.tasks.iter().filter(|(_, t)| t.title.to_lowercase() == lowered).map(|(n, _)| n).collect();
-    match matches.as_slice() {
-        [one] => Ok((*one).clone()),
-        [] => bail!("no task named '{query}'"),
-        several => {
-            bail!(
-                "several tasks are titled '{query}': {}",
-                several.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
-            )
-        }
+    let mut matches: Vec<String> =
+        data.tasks.iter().filter(|(_, t)| t.title.to_lowercase() == lowered).map(|(n, _)| n.clone()).collect();
+    match matches.len() {
+        1 => Ok(matches.remove(0)),
+        0 => Err(Error::NoSuchTask(query.into())),
+        _ => Err(Error::AmbiguousTask { query: query.into(), sessions: matches }),
     }
 }
 
@@ -265,7 +260,8 @@ mod tests {
         assert_eq!(resolve_task(&data, "task-old").unwrap(), "task-old");
         assert_eq!(resolve_task(&data, "old").unwrap(), "task-old");
         assert_eq!(resolve_task(&data, "NEW").unwrap(), "task-new");
-        assert_eq!(resolve_task(&data, "missing").unwrap_err().0, "no task named 'missing'");
+        assert_eq!(resolve_task(&data, "missing").unwrap_err(), Error::NoSuchTask("missing".into()));
+        assert_eq!(resolve_task(&data, "missing").unwrap_err().to_string(), "no task named 'missing'");
     }
 
     #[test]

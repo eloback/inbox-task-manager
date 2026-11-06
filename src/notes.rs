@@ -107,7 +107,7 @@ impl Itm {
             Some(editor) => shlex::split(&editor).filter(|words| !words.is_empty()),
             None => ["nvim", "vim", "vi", "nano"].into_iter().find(|e| which(e).is_some()).map(|e| vec![e.to_string()]),
         }
-        .ok_or_else(|| crate::error::Error("no editor found; set $EDITOR".into()))?;
+        .ok_or_else(|| crate::error::Error::Other("no editor found; set $EDITOR".into()))?;
         let program = command.remove(0);
         std::process::Command::new(&program)
             .args(command)
@@ -167,7 +167,7 @@ mod tests {
             let stamp = itm.stamp(0);
             assert_eq!(fs::read_to_string(&path).unwrap(), format!("{before}{gap}## {stamp} · Note\n\ndone\n\n"));
         }
-        assert_eq!(itm.add_note(&session, " ", 0).unwrap_err().0, "the note is empty");
+        assert_eq!(itm.add_note(&session, " ", 0).unwrap_err().to_string(), "the note is empty");
     }
 
     #[test]

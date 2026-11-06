@@ -7,9 +7,14 @@
 //! way `herdr session list` finds them, by reading Herdr's sessions folder.
 //! Only `herdr session attach` (an interactive client) and `herdr server`
 //! (a server start) run the `herdr` program.
+//!
+//! Every connection and every answer has a deadline (DESIGN.md section 2):
+//! a session that stops accepting connections (a deadlock, a SIGSTOP) must
+//! not hang `itm list`, an archive or the daemon.
 
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, ErrorKind, Write};
+use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -17,14 +22,19 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 use std::{fs, io, thread};
 
+use rustix::event::{PollFd, PollFlags, Timespec, poll};
+use rustix::io::Errno;
+use rustix::net::{AddressFamily, SocketAddrUnix, SocketType};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::error::{Context, Error, Result, bail};
+use crate::error::{Context, Error, HerdrFailure, Result, bail};
 use crate::status::AgentState;
 
-/// Every query has a deadline (DESIGN.md section 2).
-const TIMEOUT: Duration = Duration::from_secs(10);
+/// How long a connection may take. A healthy session accepts at once.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
+/// How long Herdr may take to answer a request.
+const ANSWER_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long a headless server may take to answer after it was started.
 const SERVER_START: Duration = Duration::from_secs(5);
 
@@ -61,16 +71,21 @@ fn unknown() -> AgentState {
 pub struct Herdr {
     /// `$XDG_CONFIG_HOME/herdr`.
     config: PathBuf,
+    connect_timeout: Duration,
+    answer_timeout: Duration,
 }
 
 impl Herdr {
     pub fn new(config: PathBuf) -> Herdr {
-        Herdr { config }
+        Herdr { config, connect_timeout: CONNECT_TIMEOUT, answer_timeout: ANSWER_TIMEOUT }
     }
 
     /// Every session Herdr knows (running or stopped), like `herdr session
     /// list`: the default session, plus each folder under `sessions/` with a
-    /// valid name. A session runs when its socket accepts a connection.
+    /// valid name. A session runs when its socket takes a connection; one
+    /// that exists but does not take it in time runs too, stuck: its
+    /// requests then time out instead of the session looking stopped (which
+    /// would wake tasks snoozed until an agent asks).
     pub fn sessions(&self) -> Result<Sessions> {
         let mut found = vec![("default".to_string(), self.config.join("herdr.sock"))];
         let dir = self.config.join("sessions");
@@ -89,7 +104,10 @@ impl Herdr {
         Ok(found
             .into_iter()
             .map(|(name, socket)| {
-                let running = UnixStream::connect(&socket).is_ok();
+                let running = match connect(&socket, self.connect_timeout) {
+                    Ok(_) => true,
+                    Err(e) => e.kind() == ErrorKind::TimedOut,
+                };
                 (name.clone(), Session { name, running, socket })
             })
             .collect())
@@ -108,26 +126,27 @@ impl Herdr {
         struct AgentList {
             agents: Vec<Agent>,
         }
-        let list: AgentList = decode("agent.list", call(socket, "agent.list", json!({}))?)?;
+        let list: AgentList = decode("agent.list", self.call(socket, "agent.list", json!({}))?)?;
         Ok(list.agents)
     }
 
     /// A toast in the session's attached client; false when Herdr did not
     /// show it (toasts off, no client, rate limited).
     pub fn toast(&self, socket: &Path, title: &str, body: &str) -> Result<bool> {
-        let result = call(socket, "notification.show", json!({"title": title, "body": body, "sound": "request"}))?;
+        let result =
+            self.call(socket, "notification.show", json!({"title": title, "body": body, "sound": "request"}))?;
         Ok(result.get("shown").and_then(Value::as_bool).unwrap_or(false))
     }
 
     /// Ask a running session to stop. Herdr answers before it shuts down,
     /// so the caller may be a process inside that very session.
     pub fn stop(&self, socket: &Path) -> Result<()> {
-        call(socket, "server.stop", json!({})).map(drop)
+        self.call(socket, "server.stop", json!({})).map(drop)
     }
 
     /// How many workspaces a running session has.
     pub fn workspace_count(&self, socket: &Path) -> Result<usize> {
-        let result = call(socket, "workspace.list", json!({}))?;
+        let result = self.call(socket, "workspace.list", json!({}))?;
         Ok(result.get("workspaces").and_then(Value::as_array).map_or(0, Vec::len))
     }
 
@@ -136,7 +155,7 @@ impl Herdr {
     /// its name. A folder that does not exist would silently become `$HOME`,
     /// so callers check it first.
     pub fn create_workspace(&self, socket: &Path, folder: &Path, label: &str, focus: bool) -> Result<()> {
-        call(socket, "workspace.create", json!({"cwd": folder, "label": label, "focus": focus})).map(drop)
+        self.call(socket, "workspace.create", json!({"cwd": folder, "label": label, "focus": focus})).map(drop)
     }
 
     /// Start a session headless (`herdr server`) in `cwd`, and wait until it
@@ -153,7 +172,7 @@ impl Herdr {
             command.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().map_err(missing_herdr)?;
         let socket = self.socket(name);
         let deadline = Instant::now() + SERVER_START;
-        while UnixStream::connect(&socket).is_err() {
+        while connect(&socket, self.connect_timeout).is_err() {
             if let Ok(Some(status)) = server.try_wait()
                 && !status.success()
             {
@@ -190,48 +209,109 @@ fn valid_session_name(name: &str) -> bool {
 
 /// "herdr not found" for a missing program, the error itself otherwise.
 pub fn missing_herdr(e: io::Error) -> Error {
-    if e.kind() == ErrorKind::NotFound {
-        Error("herdr not found; install it or add it to PATH".into())
-    } else {
-        Error(format!("cannot run herdr: {e}"))
+    if e.kind() == ErrorKind::NotFound { Error::HerdrMissing } else { Error::Other(format!("cannot run herdr: {e}")) }
+}
+
+impl Herdr {
+    /// One request on its own connection: Herdr answers one line and closes.
+    fn call(&self, socket: &Path, method: &'static str, params: Value) -> Result<Value> {
+        let failed = |failure| Error::Herdr { method, failure };
+        let io_failed = |e: io::Error| {
+            failed(match e.kind() {
+                ErrorKind::NotFound | ErrorKind::ConnectionRefused => HerdrFailure::NotRunning,
+                ErrorKind::WouldBlock | ErrorKind::TimedOut => HerdrFailure::TimedOut,
+                _ => HerdrFailure::Io(e.to_string()),
+            })
+        };
+        let mut stream = connect(socket, self.connect_timeout).map_err(io_failed)?;
+        stream.set_read_timeout(Some(self.answer_timeout)).map_err(io_failed)?;
+        stream.set_write_timeout(Some(self.answer_timeout)).map_err(io_failed)?;
+        let request = json!({"id": "itm", "method": method, "params": params});
+        writeln!(stream, "{request}").map_err(io_failed)?;
+        let mut line = String::new();
+        BufReader::new(stream).read_line(&mut line).map_err(io_failed)?;
+
+        #[derive(Deserialize)]
+        struct Response {
+            result: Option<Value>,
+            error: Option<ApiError>,
+        }
+        #[derive(Deserialize)]
+        struct ApiError {
+            code: String,
+            #[serde(default)]
+            message: String,
+        }
+        match serde_json::from_str::<Response>(&line) {
+            Ok(Response { result: Some(result), .. }) => Ok(result),
+            Ok(Response { error: Some(ApiError { code, message }), .. }) => {
+                Err(failed(HerdrFailure::Refused { code, message }))
+            }
+            Ok(_) => Err(failed(HerdrFailure::BadAnswer("no result"))),
+            Err(_) => Err(failed(HerdrFailure::BadAnswer("invalid JSON"))),
+        }
     }
 }
 
-/// One request on its own connection: Herdr answers one line and closes.
-fn call(socket: &Path, method: &str, params: Value) -> Result<Value> {
-    let failed = |e: io::Error| match e.kind() {
-        ErrorKind::NotFound | ErrorKind::ConnectionRefused => Error(format!("herdr {method}: session not running")),
-        ErrorKind::WouldBlock | ErrorKind::TimedOut => Error(format!("herdr {method} timed out")),
-        _ => Error(format!("herdr {method}: {e}")),
-    };
-    let mut stream = UnixStream::connect(socket).map_err(failed)?;
-    stream.set_read_timeout(Some(TIMEOUT)).map_err(failed)?;
-    stream.set_write_timeout(Some(TIMEOUT)).map_err(failed)?;
-    let request = json!({"id": "itm", "method": method, "params": params});
-    writeln!(stream, "{request}").map_err(failed)?;
-    let mut line = String::new();
-    BufReader::new(stream).read_line(&mut line).map_err(failed)?;
-
-    #[derive(Deserialize)]
-    struct Response {
-        result: Option<Value>,
-        error: Option<ApiError>,
-    }
-    #[derive(Deserialize)]
-    struct ApiError {
-        code: String,
-        #[serde(default)]
-        message: String,
-    }
-    match serde_json::from_str::<Response>(&line).context(|| format!("herdr {method} returned invalid JSON"))? {
-        Response { result: Some(result), .. } => Ok(result),
-        Response { error: Some(e), .. } => bail!("herdr {method} failed: {} ({})", e.message, e.code),
-        _ => bail!("herdr {method} returned no result"),
+/// Connect to a session's socket within `timeout`. A blocking connect to a
+/// server that stopped accepting waits forever once its backlog is full,
+/// so the socket is non-blocking: Linux refuses a full backlog at once
+/// (EAGAIN; nothing is queued), which is tried again until the deadline,
+/// and other systems may answer EINPROGRESS, which is waited for.
+fn connect(socket: &Path, timeout: Duration) -> io::Result<UnixStream> {
+    let deadline = Instant::now() + timeout;
+    let address = SocketAddrUnix::new(socket)?;
+    loop {
+        let fd = nonblocking_socket()?;
+        let left = deadline.saturating_duration_since(Instant::now());
+        match rustix::net::connect(&fd, &address) {
+            Ok(()) => return blocking(fd),
+            Err(Errno::INPROGRESS) => {
+                let mut fds = [PollFd::new(&fd, PollFlags::OUT)];
+                let left = Timespec::try_from(left).map_err(|_| io::Error::from(ErrorKind::TimedOut))?;
+                if poll(&mut fds, Some(&left))? == 0 {
+                    return Err(ErrorKind::TimedOut.into());
+                }
+                rustix::net::sockopt::socket_error(&fd)??;
+                return blocking(fd);
+            }
+            Err(Errno::AGAIN) if !left.is_zero() => thread::sleep(left.min(Duration::from_millis(10))),
+            Err(Errno::AGAIN) => return Err(ErrorKind::TimedOut.into()),
+            Err(e) => return Err(e.into()),
+        }
     }
 }
 
-fn decode<T: for<'de> Deserialize<'de>>(method: &str, result: Value) -> Result<T> {
-    serde_json::from_value(result).context(|| format!("herdr {method} returned an unexpected answer"))
+#[cfg(not(target_vendor = "apple"))]
+fn nonblocking_socket() -> io::Result<OwnedFd> {
+    use rustix::net::SocketFlags;
+    Ok(rustix::net::socket_with(
+        AddressFamily::UNIX,
+        SocketType::STREAM,
+        SocketFlags::CLOEXEC | SocketFlags::NONBLOCK,
+        None,
+    )?)
+}
+
+/// macOS has no SOCK_CLOEXEC or SOCK_NONBLOCK: the flags are set right after.
+#[cfg(target_vendor = "apple")]
+fn nonblocking_socket() -> io::Result<OwnedFd> {
+    let fd = rustix::net::socket(AddressFamily::UNIX, SocketType::STREAM, None)?;
+    rustix::io::fcntl_setfd(&fd, rustix::io::FdFlags::CLOEXEC)?;
+    rustix::io::ioctl_fionbio(&fd, true)?;
+    Ok(fd)
+}
+
+/// The connected socket as a stream whose reads and writes block (with timeouts).
+fn blocking(fd: OwnedFd) -> io::Result<UnixStream> {
+    let stream = UnixStream::from(fd);
+    stream.set_nonblocking(false)?;
+    Ok(stream)
+}
+
+fn decode<T: for<'de> Deserialize<'de>>(method: &'static str, result: Value) -> Result<T> {
+    serde_json::from_value(result)
+        .map_err(|_| Error::Herdr { method, failure: HerdrFailure::BadAnswer("an unexpected answer") })
 }
 
 #[cfg(test)]
@@ -318,7 +398,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let herdr = Herdr::new(tmp.path().to_path_buf());
         let err = herdr.agents(&herdr.socket("task-gone")).unwrap_err();
-        assert_eq!(err.0, "herdr agent.list: session not running");
+        assert_eq!(err, Error::Herdr { method: "agent.list", failure: HerdrFailure::NotRunning });
+        assert_eq!(err.to_string(), "herdr agent.list: session not running");
 
         let socket = herdr.socket("task-x");
         fs::create_dir_all(socket.parent().unwrap()).unwrap();
@@ -332,6 +413,66 @@ mod tests {
             }
         });
         let err = herdr.toast(&socket, "", "").unwrap_err();
-        assert_eq!(err.0, "herdr notification.show failed: notification title is empty (invalid_params)");
+        assert_eq!(err.to_string(), "herdr notification.show failed: notification title is empty (invalid_params)");
+    }
+
+    /// A Herdr with short timeouts, so the tests of a stuck session are quick.
+    fn impatient(config: &Path) -> Herdr {
+        Herdr {
+            connect_timeout: Duration::from_millis(100),
+            answer_timeout: Duration::from_millis(200),
+            ..Herdr::new(config.into())
+        }
+    }
+
+    /// A session socket that never accepts: listening, with its backlog full.
+    /// Returns what must stay open for it to stay that way.
+    fn stuck_session(socket: &Path) -> (OwnedFd, Vec<OwnedFd>) {
+        fs::create_dir_all(socket.parent().unwrap()).unwrap();
+        let listener = rustix::net::socket(AddressFamily::UNIX, SocketType::STREAM, None).unwrap();
+        let address = SocketAddrUnix::new(socket).unwrap();
+        rustix::net::bind(&listener, &address).unwrap();
+        rustix::net::listen(&listener, 0).unwrap();
+        let mut queued = vec![];
+        loop {
+            let fd = nonblocking_socket().unwrap();
+            match rustix::net::connect(&fd, &address) {
+                Ok(()) | Err(Errno::INPROGRESS) => queued.push(fd),
+                Err(Errno::AGAIN) => break,
+                Err(e) => panic!("{e}"),
+            }
+            assert!(queued.len() < 1000, "the backlog never filled");
+        }
+        (listener, queued)
+    }
+
+    /// DESIGN.md section 2: every Herdr query has a timeout, the connection included.
+    #[test]
+    fn a_session_that_never_accepts_times_out_instead_of_hanging() {
+        let tmp = tempfile::tempdir().unwrap();
+        let herdr = impatient(tmp.path());
+        let socket = herdr.socket("task-stuck");
+        let _stuck = stuck_session(&socket);
+
+        let started = Instant::now();
+        let err = herdr.agents(&socket).unwrap_err();
+        assert_eq!(err, Error::Herdr { method: "agent.list", failure: HerdrFailure::TimedOut });
+        assert_eq!(herdr.stop(&socket).unwrap_err().to_string(), "herdr server.stop timed out");
+        let sessions = herdr.sessions().unwrap();
+        assert!(sessions["task-stuck"].running, "stuck, not stopped: tasks snoozed until an agent stay snoozed");
+        assert!(started.elapsed() < Duration::from_secs(2), "took {:?}", started.elapsed());
+    }
+
+    #[test]
+    fn a_session_that_never_answers_times_out() {
+        let tmp = tempfile::tempdir().unwrap();
+        let herdr = impatient(tmp.path());
+        let socket = herdr.socket("task-silent");
+        fs::create_dir_all(socket.parent().unwrap()).unwrap();
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let held = std::thread::spawn(move || listener.accept().map(|(stream, _)| stream));
+        let err = herdr.agents(&socket).unwrap_err();
+        assert_eq!(err, Error::Herdr { method: "agent.list", failure: HerdrFailure::TimedOut });
+        drop(held.join());
     }
 }

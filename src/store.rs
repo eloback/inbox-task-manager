@@ -269,7 +269,7 @@ mod tests {
     fn a_corrupt_file_is_an_error() {
         let (_tmp, store) = store();
         fs::write(&store.path, "{nope").unwrap();
-        assert!(store.load().unwrap_err().0.contains("is not valid JSON"));
+        assert!(store.load().unwrap_err().to_string().contains("is not valid JSON"));
     }
 
     #[test]

@@ -19,7 +19,7 @@ use ratatui::crossterm::event::{self, Event, KeyEvent, KeyEventKind};
 pub use app::View;
 use app::{Action, App, Job, Snapshot};
 
-use crate::error::{Context, Error, Result};
+use crate::error::{Context, Result};
 use crate::itm::Itm;
 use crate::times;
 
@@ -136,7 +136,7 @@ fn load(itm: &Itm) -> Result<Snapshot> {
         })?;
     }
     let (current, switch_problem) = match itm.inside_herdr() {
-        true => (itm.current_session(&sessions), itm.switchable_session(&sessions).err().map(|Error(e)| e)),
+        true => (itm.current_session(&sessions), itm.switchable_session(&sessions).err().map(|e| e.to_string())),
         false => (None, None),
     };
     Ok(Snapshot { data, sessions, status: itm.status(), current, switch_problem, listed })

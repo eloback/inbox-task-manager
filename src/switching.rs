@@ -383,9 +383,9 @@ pub mod tests {
         let (_tmp, mut itm, fake) = itm_with(FakeProcs::default());
         herdr::fake::serve(&itm.paths.herdr_config, "task-a", |_, _| json!({}));
         itm.client_socket = Some("/elsewhere.sock".into());
-        assert_eq!(itm.switch_to("task-b").unwrap_err().0, "cannot tell which Herdr session this is");
+        assert_eq!(itm.switch_to("task-b").unwrap_err().to_string(), "cannot tell which Herdr session this is");
         itm.client_socket = Some(itm.herdr.socket("task-a"));
-        assert!(itm.switch_to("task-b").unwrap_err().0.contains("not started by `itm attach`"));
+        assert!(itm.switch_to("task-b").unwrap_err().to_string().contains("not started by `itm attach`"));
 
         fake.add(10, 1, &["itm", "attach"]);
         fake.add(11, 10, &["herdr", "session", "attach", "task-a"]);

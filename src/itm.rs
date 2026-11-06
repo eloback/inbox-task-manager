@@ -186,7 +186,7 @@ impl Itm {
             Some(session) if session.running => self
                 .herdr
                 .stop(&session.socket)
-                .map_err(|e| Error(format!("{name} archived, but its session did not stop: {e}"))),
+                .map_err(|e| Error::Other(format!("{name} archived, but its session did not stop: {e}"))),
             _ => Ok(()),
         }
     }
@@ -227,7 +227,7 @@ impl Itm {
 
 /// The task named `name`, re-resolved inside a locked edit: it may have been deleted meanwhile.
 fn existing<'a>(data: &'a mut Data, name: &str) -> Result<&'a mut Task> {
-    data.tasks.get_mut(name).ok_or_else(|| Error(format!("task {name} no longer exists")))
+    data.tasks.get_mut(name).ok_or_else(|| Error::TaskGone(name.into()))
 }
 
 #[cfg(test)]
@@ -290,7 +290,7 @@ pub mod tests {
         let (_tmp, itm) = itm();
         assert!(itm.create_task("  ", None, &[], None).is_err());
         let err = itm.create_task("Asked", None, &[], Some(Until::Agent)).unwrap_err();
-        assert!(err.0.contains("new task has no agents"));
+        assert!(err.to_string().contains("new task has no agents"));
         assert!(itm.create_task("Late", None, &[], Some(Until::Time(times::now() - 5))).is_err());
         assert!(itm.store().load().unwrap().tasks.is_empty());
     }
@@ -300,11 +300,11 @@ pub mod tests {
         let (_tmp, itm) = itm();
         itm.create_task("Run", None, &[], None).unwrap();
         let err = itm.snooze_task("task-run", Until::Agent).unwrap_err();
-        assert!(err.0.contains("not running"), "{err}");
+        assert!(err.to_string().contains("not running"), "{err}");
 
         fake::serve(&itm.paths.herdr_config, "task-run", |_, _| json!({}));
         write_status(&itm, &[("task-run", 1)]);
-        assert!(itm.snooze_task("task-run", Until::Agent).unwrap_err().0.contains("already waiting"));
+        assert!(itm.snooze_task("task-run", Until::Agent).unwrap_err().to_string().contains("already waiting"));
 
         write_status(&itm, &[]);
         itm.snooze_task("task-run", Until::Agent).unwrap();
@@ -317,7 +317,7 @@ pub mod tests {
         let (_tmp, itm) = itm();
         itm.create_task("A", None, &[], Some(Until::Time(times::now() + 600))).unwrap();
         itm.wake_task("task-a").unwrap();
-        assert_eq!(itm.wake_task("task-a").unwrap_err().0, "task-a is not snoozed");
+        assert_eq!(itm.wake_task("task-a").unwrap_err().to_string(), "task-a is not snoozed");
 
         let stops = fake::serve(&itm.paths.herdr_config, "task-a", |_, _| json!({"type": "ok"}));
         itm.archive_task("task-a").unwrap();
@@ -327,7 +327,7 @@ pub mod tests {
 
         assert_eq!(itm.reopen_task("a").unwrap(), "task-a");
         assert_eq!(itm.store().load().unwrap().tasks["task-a"].state, State::Active);
-        assert_eq!(itm.archive_task("task-gone").unwrap_err().0, "task task-gone no longer exists");
+        assert_eq!(itm.archive_task("task-gone").unwrap_err(), Error::TaskGone("task-gone".into()));
     }
 
     #[test]
@@ -335,7 +335,7 @@ pub mod tests {
         let (_tmp, mut itm) = itm();
         itm.create_task("Here", None, &[], None).unwrap();
         let data = itm.store().load().unwrap();
-        assert_eq!(itm.target_or_current(&data, None).unwrap_err().0, "not inside a task; name the task");
+        assert_eq!(itm.target_or_current(&data, None).unwrap_err().to_string(), "not inside a task; name the task");
         fake::serve(&itm.paths.herdr_config, "task-here", |_, _| json!({}));
         itm.client_socket = Some(itm.herdr.socket("task-here"));
         assert_eq!(itm.target_or_current(&data, None).unwrap(), "task-here");

@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
-use crate::error::{Context, Result, bail};
+use crate::error::{Context, Error, Result, bail};
 use crate::itm::Itm;
 use crate::store::{Data, Project, flocked};
 use crate::times;
@@ -40,14 +40,16 @@ impl Itm {
             let same_folder =
                 |p: &&Project| p.path.as_ref().is_some_and(|path| fs::canonicalize(path).is_ok_and(|p| p == folder));
             if let Some(same) = data.projects.values().find(same_folder) {
-                bail!("project already exists: {}", same.name);
+                return Err(Error::ProjectExists { name: same.name.clone() });
             }
             if let Some(taken) = data.projects.values().find(|p| p.name.to_lowercase() == name.to_lowercase()) {
-                bail!(
-                    "project already exists: {} ({}); choose another name with --name",
-                    taken.name,
-                    self.paths.place(taken)
-                );
+                return Err(match taken.kind() {
+                    // A name waiting for its folder: give it this one rather than a second project.
+                    "name" => {
+                        Error::ProjectWithoutFolder { name: taken.name.clone(), folder: folder.display().to_string() }
+                    }
+                    _ => Error::ProjectNameTaken { name: taken.name.clone(), place: self.paths.place(taken) },
+                });
             }
             let project = Project {
                 name: name.clone(),
@@ -133,7 +135,7 @@ pub fn resolve_project(data: &Data, query: &str) -> Result<String> {
     match named.as_slice() {
         [id] => Ok((*id).clone()),
         _ if data.projects.contains_key(query) => Ok(query.into()),
-        _ => bail!("no project named '{query}'; add it with `itm project add`"),
+        _ => Err(Error::NoSuchProject(query.into())),
     }
 }
 
@@ -214,31 +216,57 @@ mod tests {
         let (_tmp, itm) = itm();
         let api = folder(&itm, "code/api");
         assert_eq!(itm.add_folder_project("~/code/api", None).unwrap(), "api");
+        // R8.4: the same folder is the same project; R8.5: a name is one project's, ignoring case.
         let err = itm.add_folder_project(api.to_str().unwrap(), Some("other")).unwrap_err();
-        assert_eq!(err.0, "project already exists: api");
+        assert_eq!(err, Error::ProjectExists { name: "api".into() });
+        assert_eq!(err.to_string(), "project already exists: api");
         folder(&itm, "work/api");
         let err = itm.add_folder_project("~/work/api", Some("API")).unwrap_err();
-        assert_eq!(err.0, "project already exists: api (~/code/api); choose another name with --name");
+        assert_eq!(err, Error::ProjectNameTaken { name: "api".into(), place: "~/code/api".into() });
         assert_eq!(itm.add_folder_project("~/work/api", Some(" work api ")).unwrap(), "work api");
 
         let data = itm.store().load().unwrap();
         let id = resolve_project(&data, "API").unwrap();
         assert_eq!(data.projects[&id].path, Some(api.canonicalize().unwrap().display().to_string()));
         assert_eq!(resolve_project(&data, &id).unwrap(), id);
-        assert!(resolve_project(&data, "web").unwrap_err().0.starts_with("no project named 'web'"));
+        assert_eq!(resolve_project(&data, "web").unwrap_err(), Error::NoSuchProject("web".into()));
+    }
+
+    /// R8.2: adding a folder under the name of a project without a folder says to `set` it instead.
+    #[test]
+    fn a_folder_named_like_a_name_only_project_is_offered_to_it() {
+        let (_tmp, itm) = itm();
+        itm.store()
+            .edit(|data| {
+                let project = Project {
+                    name: "Client X".into(),
+                    path: None,
+                    url: None,
+                    added_at: 1,
+                    last_used_at: 1,
+                    extra: Default::default(),
+                };
+                Ok(data.projects.insert("c0ffee00".into(), project))
+            })
+            .unwrap();
+        let x = folder(&itm, "client-x").canonicalize().unwrap();
+        let err = itm.add_folder_project("~/client-x", Some("client x")).unwrap_err();
+        assert_eq!(err, Error::ProjectWithoutFolder { name: "Client X".into(), folder: x.display().to_string() });
+        let hint = format!("give it this one with `itm project set 'Client X' --dir {}`", x.display());
+        assert!(err.to_string().ends_with(&hint), "{err}");
     }
 
     #[test]
     fn what_cannot_be_a_project() {
         let (_tmp, itm) = itm();
-        assert_eq!(itm.add_folder_project("~/nowhere", None).unwrap_err().0, "not a folder: ~/nowhere");
-        assert_eq!(itm.add_folder_project("  ", None).unwrap_err().0, "empty folder path");
+        assert_eq!(itm.add_folder_project("~/nowhere", None).unwrap_err().to_string(), "not a folder: ~/nowhere");
+        assert_eq!(itm.add_folder_project("  ", None).unwrap_err().to_string(), "empty folder path");
         folder(&itm, "x");
         assert!(itm.add_folder_project("~/x", Some("a\tb")).is_err());
         let clone = itm.paths.projects.join("github.com/acme/api");
         fs::create_dir_all(&clone).unwrap();
         let err = itm.add_folder_project(clone.to_str().unwrap(), None).unwrap_err();
-        assert!(err.0.contains("inside itm's projects folder"), "{err}");
+        assert!(err.to_string().contains("inside itm's projects folder"), "{err}");
     }
 
     #[test]
@@ -258,7 +286,7 @@ mod tests {
         assert_eq!(rows.iter().map(|r| (r.name, r.tasks)).collect::<Vec<_>>(), [("api", 1), ("web", 1)]);
 
         let unknown = itm.create_task("Nope", None, &["missing".to_string()], None).unwrap_err();
-        assert!(unknown.0.starts_with("no project named 'missing'"));
+        assert_eq!(unknown, Error::NoSuchProject("missing".into()));
         assert!(!itm.store().load().unwrap().tasks.contains_key("task-nope"));
     }
 

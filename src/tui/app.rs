@@ -125,7 +125,7 @@ impl Dialog {
                                 let SnoozeDialog { session, title, .. } = dialog;
                                 return (None, Action::Run(Job::Snooze { session, title, until }));
                             }
-                            Err(e) => dialog.error = Some(e.0), // free text keeps working; say why not
+                            Err(e) => dialog.error = Some(e.to_string()), // free text keeps working; say why not
                         }
                     }
                     _ => {
@@ -226,7 +226,7 @@ impl App {
                 self.snapshot = Some(snapshot);
                 self.rebuild();
             }
-            Err(e) => self.flash(e.0, true),
+            Err(e) => self.flash(e.to_string(), true),
         }
     }
 
@@ -384,7 +384,7 @@ impl App {
         let current = self.snapshot.as_ref().and_then(|s| s.current.clone());
         let problem = self.snapshot.as_ref().and_then(|s| s.switch_problem.clone());
         match (job, result) {
-            (_, Err(e)) => self.flash(e.0, true),
+            (_, Err(e)) => self.flash(e.to_string(), true),
             (Job::Wake { title, .. }, Ok(_)) => self.flash(format!("“{title}” is active."), false),
             (Job::Archive { session, title }, Ok(_)) => {
                 // Its clients moved to another task: this one included, so leave.
@@ -626,7 +626,7 @@ pub mod tests {
         app.on_key(key(KeyCode::Tab));
         let wake = Job::Wake { session: "task-later".into(), title: "Later".into() };
         assert_eq!(app.on_key(ctrl('u')), Action::Run(wake.clone()));
-        app.done(wake, Err(Error("task-later is not snoozed".into())));
+        app.done(wake, Err(Error::Other("task-later is not snoozed".into())));
         assert!(app.message.as_ref().is_some_and(|m| m.error && m.text == "task-later is not snoozed"));
     }
 }

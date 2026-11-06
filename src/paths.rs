@@ -122,7 +122,7 @@ fn runtime_dir(xdg_runtime: Option<PathBuf>) -> Result<PathBuf> {
         return Ok(run_user.join(APP));
     }
     private_dir(&PathBuf::from(format!("/tmp/{APP}-{uid}")))
-        .map_err(|e| Error(format!("no private runtime folder: {e}; set $XDG_RUNTIME_DIR")))
+        .map_err(|e| Error::Other(format!("no private runtime folder: {e}; set $XDG_RUNTIME_DIR")))
 }
 
 /// `path` created `0700`; refused when someone else owns it or it is a link

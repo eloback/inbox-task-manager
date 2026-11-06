@@ -97,7 +97,7 @@ fn when(text: &str, now: i64, tz: &TimeZone) -> Result<i64> {
     if spec.is_empty() {
         bail!("empty snooze time");
     }
-    let too_far = || Error(format!("snooze time is too far away: {text}"));
+    let too_far = || Error::Other(format!("snooze time is too far away: {text}"));
     let number =
         |digits: &str, unit: i64| digits.parse::<i64>().ok().and_then(|n| n.checked_mul(unit)).ok_or_else(too_far);
     if spec.bytes().all(|b| b.is_ascii_digit()) {
@@ -114,7 +114,7 @@ fn when(text: &str, now: i64, tz: &TimeZone) -> Result<i64> {
         }
         return Ok(total);
     }
-    day_and_clock(text, now, tz)?.ok_or_else(|| Error(format!("cannot understand snooze time: {text}")))
+    day_and_clock(text, now, tz)?.ok_or_else(|| Error::Other(format!("cannot understand snooze time: {text}")))
 }
 
 /// `14:30`, `5pm`, `tomorrow 9:00`, `friday 2pm`, `next mon`, `2026-12-01 14:30`,
@@ -129,8 +129,8 @@ fn day_and_clock(text: &str, now: i64, tz: &TimeZone) -> Result<Option<i64>> {
     if day.is_none() && m.name("hour").is_none() {
         return Ok(None);
     }
-    let invalid_date = || Error(format!("invalid date: {text}"));
-    let invalid_time = || Error(format!("invalid time: {text}"));
+    let invalid_date = || Error::Other(format!("invalid date: {text}"));
+    let invalid_time = || Error::Other(format!("invalid time: {text}"));
     let base = Timestamp::from_second(now).map_err(|_| invalid_date())?.to_zoned(tz.clone());
     let date = if let Some(iso) = m.name("date") {
         iso.as_str().parse::<civil::Date>().map_err(|_| invalid_date())?
