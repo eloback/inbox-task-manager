@@ -109,6 +109,13 @@ enum Command {
     Current,
     /// Poll agents, notify and wake snoozed tasks
     Daemon,
+    /// Leave this terminal's session, then run PROGRAM (first starts of headless servers)
+    #[command(hide = true)]
+    Setsid {
+        program: String,
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -311,6 +318,7 @@ pub fn run(cli: Cli, itm: Itm) -> Result<()> {
             Ok(())
         }
         Command::Daemon => Arc::new(itm).run_daemon(),
+        Command::Setsid { program, args } => Err(crate::system::setsid_exec(&program, &args)),
     }
 }
 

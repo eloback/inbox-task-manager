@@ -408,6 +408,7 @@ dependencies = [
  "serde",
  "serde_json",
  "shlex",
+ "signal-hook",
  "tempfile",
  "tui-input",
  "unicode-normalization",

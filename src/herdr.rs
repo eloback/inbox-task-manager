@@ -16,7 +16,6 @@ use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, ErrorKind, Write};
 use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream;
-use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -30,6 +29,7 @@ use serde_json::{Value, json};
 
 use crate::error::{Context, Error, HerdrFailure, Result, bail};
 use crate::status::AgentState;
+use crate::system::{in_new_session, which};
 
 /// How long a connection may take. A healthy session accepts at once.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
@@ -160,16 +160,23 @@ impl Herdr {
 
     /// Start a session headless (`herdr server`) in `cwd`, and wait until it
     /// answers. The server gets no `HERDR_*` variables from wherever itm runs
-    /// but `HERDR_SESSION`, and its own process group, so it outlives this
+    /// but `HERDR_SESSION`, and its own session (setsid), so it outlives this
     /// terminal. One that exits with an error is not waited for.
     pub fn start_server(&self, name: &str, cwd: &Path) -> Result<PathBuf> {
-        let mut command = Command::new("herdr");
+        if which("herdr").is_none() {
+            return Err(Error::HerdrMissing);
+        }
+        let mut command = in_new_session("herdr").context(|| "cannot start herdr in its own session".into())?;
         for (key, _) in std::env::vars_os().filter(|(key, _)| key.to_string_lossy().starts_with("HERDR_")) {
             command.env_remove(key);
         }
-        command.arg("server").env("HERDR_SESSION", name).current_dir(cwd).process_group(0);
-        let mut server =
-            command.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().map_err(missing_herdr)?;
+        command.arg("server").env("HERDR_SESSION", name).current_dir(cwd);
+        let mut server = command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .context(|| "cannot start herdr in its own session".into())?;
         let socket = self.socket(name);
         let deadline = Instant::now() + SERVER_START;
         while connect(&socket, self.connect_timeout).is_err() {
@@ -183,6 +190,9 @@ impl Herdr {
             }
             thread::sleep(Duration::from_millis(25));
         }
+        // Reaped whenever it stops, so a stopped session leaves no zombie behind
+        // a long-running attach loop.
+        thread::spawn(move || server.wait());
         Ok(socket)
     }
 

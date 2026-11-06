@@ -24,12 +24,19 @@ rustix = { version = "=1.1.5", features = ["event", "net", "process"] }
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.154"
 shlex = "=2.0.1"
+signal-hook = "=0.3.18"
 tempfile = "=3.27.0"
 tui-input = { version = "=0.15.5", default-features = false, features = ["crossterm"] }
 unicode-normalization = "=0.1.26"
 
 [dev-dependencies]
 insta = "=1.49.0"
+
+# The switching protocol with real processes: the test binary also plays
+# herdr (see its main), so it has its own harness.
+[[test]]
+name = "switching"
+harness = false
 
 [lints.rust]
 unsafe_code = "deny"

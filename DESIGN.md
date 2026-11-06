@@ -118,6 +118,10 @@ Verified against Herdr 0.9.3. Re-check them after a Herdr upgrade.
 - A switch writes `<pid>.next` first, then sends SIGTERM to the attach child.
   The loop reads `.next` after the child exits. Without `.next` the loop ends,
   which is a normal detach.
+- SIGHUP (the terminal closed), SIGTERM and SIGINT end the loop like a
+  detach (Rust): it detaches its attach child as a hand-off would, follows
+  no `.next`, and removes its markers, instead of leaving them until a
+  later check finds the pid stale.
 - The loop claims `.next` by renaming it before reading it, and never deletes
   `.next` before an attach: a hand-off written while the next attach starts
   must survive until that attach ends. A stale `.next` from a crashed loop
@@ -139,7 +143,9 @@ Verified against Herdr 0.9.3. Re-check them after a Herdr upgrade.
   `default`.
 - Stopping a session that may host the caller (archive, delete of the current
   task) happens after the hand-off, from a detached process
-  (`start_new_session=True`, `/bin/sh`).
+  (`start_new_session=True`, `/bin/sh`). The Rust itm sends `server.stop`
+  over the session's socket instead: Herdr answers before it stops (section
+  4, 2026-11-06).
 - A popup that moved its own client away exits right away. Otherwise it stays
   open in the old session (see the popup facts above) and is still there when
   you come back.
@@ -213,7 +219,11 @@ Verified against Herdr 0.9.3. Re-check them after a Herdr upgrade.
   turns out to have workspaces gets none. The server gets no `HERDR_*`
   variables but `HERDR_SESSION`; one that exits with an error is not waited
   for (`SESSION_START_TIMEOUT` bounds the wait). A failure is printed and the
-  attach goes on (Herdr then starts the session as usual). Projects can
+  attach goes on (Herdr then starts the session as usual). The server runs
+  in its own session (setsid), so closing the terminal does not hang it up;
+  std can only call setsid in an `unsafe` `pre_exec`, so the Rust itm runs
+  itself as the hidden `itm setsid herdr server`, which calls setsid and
+  becomes `herdr server`, and reaps it in a thread once it was started. Projects can
   still change at any time (`edit_task`): a session that never started will
   start with them, a running one gets a named workspace per added project
   (`herdr workspace create --cwd --label`, the first focused when it is the
@@ -711,8 +721,10 @@ The switcher and its dialogs follow these principles.
     switcher's drawing and its line editing. ratatui has no forms or focus,
     so those are built in itm;
   - rustix: the safe system calls std lacks (`getuid`, `kill` with a
-    signal, a non-blocking `connect` with `poll`); `unsafe` code is denied
-    in the crate;
+    signal, `setsid`, a non-blocking `connect` with `poll`); `unsafe` code
+    is denied in the crate;
+  - signal-hook: the attach loop's SIGHUP, SIGTERM and SIGINT, received on
+    a thread (already in the graph through crossterm);
   - tempfile: atomic writes and test folders;
   - unicode-normalization: `slugify` like Python's `unicodedata` (NFKD, then
     drop combining marks);
@@ -727,7 +739,8 @@ The switcher and its dialogs follow these principles.
   `system.rs` (what differs between operating systems), `paths.rs`,
   `times.rs`, `error.rs` and `tui/` (`app.rs` state and keys without I/O,
   `draw.rs` rendering, `mod.rs` the event loop and its workers). Tests sit
-  next to the code.
+  next to the code; `tests/switching.rs` runs the switching protocol with
+  real processes and signals.
 
 ## 5. Known gaps
 
@@ -812,6 +825,11 @@ The switcher and its dialogs follow these principles.
   (`INSTA_UPDATE=always cargo test` rewrites them after an intended change;
   review the diff). A test that pins a requirement names it (`R4.1` in its
   name or a comment).
+- `tests/switching.rs` checks the switching protocol with real processes
+  and signals: the built `itm`, and the test binary itself playing `herdr`
+  (symlinked under that name: an attached client that a signal detaches,
+  or a headless server answering on its socket). It has its own `main`
+  (`harness = false` in `Cargo.toml`); its tests run one after another.
 - End to end, against a real headless Herdr with tmux as the terminal:
   `scripts/smoke.sh` (fake agents report themselves blocked over the socket
   API, no real agent runs) and `scripts/measure.sh`, both run through

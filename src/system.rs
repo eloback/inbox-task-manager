@@ -7,6 +7,7 @@ use std::env;
 use std::fs;
 use std::io::{self, Read};
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::thread;
@@ -14,7 +15,7 @@ use std::time::{Duration, Instant};
 
 use rustix::process::{Pid, Signal, kill_process, test_kill_process};
 
-use crate::error::{Result, bail};
+use crate::error::{Error, Result, bail};
 
 /// The process table, behind a trait so the switching protocol's tests can
 /// describe processes (an `itm` loop, its attach child, a reused pid)
@@ -105,6 +106,29 @@ pub fn output_within(
     };
     let text = reader.join().unwrap_or_else(|_| Ok(String::new()))?;
     Ok(status.map(|status| (status, text)))
+}
+
+/// A command that runs `program` in a new session (setsid), away from this
+/// terminal: closing it hangs up nothing `program` runs. std calls setsid
+/// only in an `unsafe` `pre_exec`, so itm runs itself as `itm setsid
+/// <program>` (hidden), which calls setsid and then becomes `program`.
+pub fn in_new_session(program: &str) -> io::Result<Command> {
+    let mut command = Command::new(env::current_exe()?);
+    command.args(["setsid", program]);
+    Ok(command)
+}
+
+/// `itm setsid <program> [args…]`: leave this session, then become
+/// `program`. Returns only when that failed.
+pub fn setsid_exec(program: &str, args: &[String]) -> Error {
+    if let Err(e) = rustix::process::setsid() {
+        return Error::Other(format!("cannot start a session: {e}"));
+    }
+    let e = Command::new(program).args(args).exec();
+    match e.kind() {
+        io::ErrorKind::NotFound => Error::Other(format!("{program} not found; install it or add it to PATH")),
+        _ => Error::Other(format!("cannot run {program}: {e}")),
+    }
 }
 
 /// The first executable called `program` on `PATH`.

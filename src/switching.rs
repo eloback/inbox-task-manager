@@ -11,8 +11,12 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
+
+use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
+use signal_hook::iterator::Signals;
 
 use crate::error::{Context, Result, bail};
 use crate::herdr::Sessions;
@@ -133,12 +137,40 @@ impl Itm {
     }
 
     /// Run `attach` (a `herdr session attach`) in a loop, following hand-offs.
-    pub fn attach_loop(&self, target: &str, mut attach: impl FnMut(&str, Option<&Path>) -> Result<()>) -> Result<()> {
+    ///
+    /// A closed terminal (SIGHUP), `kill` (SIGTERM) or Ctrl+C between two
+    /// attaches (SIGINT) ends the loop like a detach: its attach child is
+    /// detached the way a hand-off detaches it, and its markers are removed
+    /// (left behind, they would only go once a later check found the pid stale).
+    pub fn attach_loop(&self, target: &str, attach: impl FnMut(&str, Option<&Path>) -> Result<()>) -> Result<()> {
+        let mut signals = Signals::new([SIGHUP, SIGTERM, SIGINT]).context(|| "cannot handle signals".into())?;
+        let closing = signals.handle();
+        let stop = AtomicBool::new(false);
+        thread::scope(|scope| {
+            scope.spawn(|| {
+                if signals.forever().next().is_some() {
+                    stop.store(true, Ordering::SeqCst);
+                    self.detach_own_children();
+                }
+            });
+            let result = self.follow_handoffs(target, attach, &stop);
+            closing.close(); // ends the signal thread
+            result
+        })
+    }
+
+    fn follow_handoffs(
+        &self,
+        target: &str,
+        mut attach: impl FnMut(&str, Option<&Path>) -> Result<()>,
+        stop: &AtomicBool,
+    ) -> Result<()> {
+        let stopped = || stop.load(Ordering::SeqCst);
         let marker = Marker::new(&self.paths.clients()?);
         // A hand-off left by an earlier loop that had this pid and crashed.
         let _ = fs::remove_file(&marker.next);
         let mut name = target.to_string();
-        while !name.is_empty() {
+        while !name.is_empty() && !stopped() {
             write_atomic(&marker.path, &format!("{name}\n")).context(|| "cannot register this client".into())?;
             // A task starts in its first project's folder; Herdr restores it after its first start.
             let cwd = match self.touch_task(&name)? {
@@ -148,7 +180,13 @@ impl Itm {
                 }
                 None => None,
             };
+            if stopped() {
+                break;
+            }
             attach(&name, cwd.as_deref())?;
+            if stopped() {
+                break; // a signal detached it: whatever a hand-off says, this loop ends
+            }
             // Claim the hand-off with a rename before reading it: one written
             // while the next attach starts must survive until that attach ends.
             name = match fs::rename(&marker.next, &marker.claimed) {
@@ -162,6 +200,19 @@ impl Itm {
             };
         }
         Ok(())
+    }
+
+    /// Detach this process's attach child, as a hand-off would; it may be
+    /// starting, so it is looked for as briefly as a hand-off looks.
+    fn detach_own_children(&self) {
+        let me = std::process::id();
+        for _ in 0..FIND_CHILD.0 {
+            let children = self.attach_children(me);
+            if !children.is_empty() {
+                return children.into_iter().for_each(|child| self.procs.terminate(child));
+            }
+            thread::sleep(FIND_CHILD.1);
+        }
     }
 }
 
