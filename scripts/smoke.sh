@@ -25,9 +25,13 @@ tmux_sock=$root/tmux.sock
 failed=0
 pids=()
 
-check() { # check <description> <command...>
+fails=0
+check() { # check <description> <command...>; a failure saves the terminal and the tasks
   local what=$1; shift
-  if "$@"; then echo "PASS $what"; else echo "FAIL $what"; failed=1; fi
+  if "$@"; then echo "PASS $what"; return; fi
+  fails=$((fails + 1)); failed=1
+  echo "FAIL $what (see $root/fail-$fails.txt)"
+  { tmux -S "$tmux_sock" capture-pane -p -t e2e 2>/dev/null; "$itm" list; } >"$root/fail-$fails.txt" 2>&1
 }
 contains() { grep -qF -- "$2" "$1" 2>/dev/null; }
 wait_for() { # wait_for <seconds> <command...>
@@ -57,17 +61,28 @@ marker_is() { test "$(marker)" = "$1"; }
 file_is() { test "$(cat "$1" 2>/dev/null)" = "$2"; }
 no_markers() { test -z "$(ls "$runtime/clients")"; }
 pane() { tmux -S "$tmux_sock" capture-pane -p -t e2e; }
-prompt() { pane | grep -qE '[$#] *$'; }
-type_in_pane() { # once the pane's shell shows its prompt: keys typed before it are lost
-  wait_for 5 prompt
-  tmux -S "$tmux_sock" send-keys -t e2e -l "$1"
-  tmux -S "$tmux_sock" send-keys -t e2e Enter
+shows() { pane | grep -qF -- "$1"; }
+gone() { ! shows "$1"; }
+keys() { tmux -S "$tmux_sock" send-keys -t e2e "$@"; }
+probes=0
+ready() { # a freshly (re)attached Herdr client drops the first keys: echo a new token until it shows
+  probes=$((probes + 1))
+  local token="itm-ready-$probes"
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    keys -l "echo $token"; keys Enter
+    wait_for 1 sh -c "tmux -S '$tmux_sock' capture-pane -p -t e2e | grep -qE '^[ │]*$token[ │]*\$'" && return 0
+  done
+  echo "FAIL the pane never echoed $token"; failed=1
 }
+# Only at a shell prompt: typed into the switcher, a probe would create a task. After
+# Escape closes the switcher, wait for it to go (ESC and a quick "e" arrive as Alt+e).
+type_in_pane() { ready; keys -l "$1"; keys Enter; }
 
 cleanup() {
   for pid in "${pids[@]}"; do kill "$pid" 2>/dev/null; done
   tmux -S "$tmux_sock" kill-server 2>/dev/null
-  for s in task-fix-login task-write-docs task-later task-old-idea task-two-repos; do herdr session stop "$s" >/dev/null 2>&1; done
+  # Every session in the sandbox is this run's, whatever made it.
+  for dir in "$sessions"/*/; do [ -d "$dir" ] && herdr session stop "$(basename "$dir")" >/dev/null 2>&1; done
 }
 trap cleanup EXIT
 
@@ -113,17 +128,16 @@ check "notified.json has Python's keys" contains "$XDG_STATE_HOME/inbox-task-man
 echo "== attach loop and switching in tmux"
 tmux -S "$tmux_sock" -f /dev/null new-session -d -s e2e -x 120 -y 40 "$itm attach task-write-docs; sleep 600"
 check "itm attach registers its marker" wait_for 5 marker_is task-write-docs
-# A freshly attached Herdr client drops the first typed lines: type a probe until its output shows.
-echoed() { pane | grep -qx ' *│*itm-ready *'; }
-for _ in 1 2 3 4 5 6 7 8 9 10; do type_in_pane "echo itm-ready"; wait_for 1 echoed && break; done
 type_in_pane "$itm current > $root/current.txt"
 check "itm current inside the session" wait_for 5 file_is "$root/current.txt" task-write-docs
 type_in_pane "$itm ui"
-check "the switcher shows the inbox inside Herdr" wait_for 5 sh -c "tmux -S '$tmux_sock' capture-pane -p -t e2e | grep -q 'NEEDS YOU'"
+check "the switcher shows the inbox inside Herdr" wait_for 5 shows 'NEEDS YOU'
 pane >"$root/switcher.txt"
-tmux -S "$tmux_sock" send-keys -t e2e Enter
+# Two tasks wait (Fix login, Later), in the order of their last use, which can share a second: search.
+keys -l "Fix login"
+wait_for 5 shows '› Fix login'
+keys Enter
 check "Enter in the switcher moves this client" wait_for 5 marker_is task-fix-login
-sleep 1
 type_in_pane "$itm snooze 1h"
 check "snoozing the current task moves its client to the waiting task (R4.7)" wait_for 5 marker_is task-later
 check "the snoozed task is snoozed" test "$("$itm" list --view snoozed | cut -f1)" = task-fix-login
@@ -137,23 +151,34 @@ type_in_pane "$itm attach old-idea"
 check "itm attach inside Herdr switches by title" wait_for 5 marker_is task-old-idea
 check "a new task's session starts in \$HOME" wait_for 5 sh -c "printf '%s\n' '{\"id\":\"p\",\"method\":\"pane.list\",\"params\":{}}' | socat -t 5 - UNIX-CONNECT:$sessions/task-old-idea/herdr.sock | grep -q '\"cwd\":\"$HOME\"'"
 
+# last_used_at counts seconds (the format the Python itm shares), and these steps take less:
+# let the clock move so that `itm last` below has one most recent task, not a tie.
+sleep 1.1
 type_in_pane "$itm attach two-repos"
 check "a first start through a hand-off" wait_for 10 marker_is task-two-repos
 workspaces() { call task-two-repos '{"id":"l","method":"workspace.list","params":{}}' | python3 -c 'import json,sys; print(" ".join(w["label"] for w in json.load(sys.stdin)["result"]["workspaces"]))'; }
-check "the session has one named workspace per project" test "$(workspaces)" = "api web"
+# The marker names the task before its session is built (DESIGN.md section 5): wait for the build.
+has_workspaces() { test "$(workspaces 2>/dev/null)" = "api web"; }
+check "the session has one named workspace per project" wait_for 10 has_workspaces
 check "the first project's workspace starts in its folder" sh -c "printf '%s\n' '{\"id\":\"p\",\"method\":\"pane.list\",\"params\":{}}' | socat -t 5 - UNIX-CONNECT:$sessions/task-two-repos/herdr.sock | grep -q '\"cwd\":\"$HOME/code/api\"'"
 
 type_in_pane "$itm ui"
-wait_for 5 sh -c "tmux -S '$tmux_sock' capture-pane -p -t e2e | grep -q 'NEEDS YOU'"
-tmux -S "$tmux_sock" send-keys -t e2e C-z
-check "Ctrl+Z opens the snooze dialog with presets" wait_for 5 sh -c "tmux -S '$tmux_sock' capture-pane -p -t e2e | grep -q '30 minutes'"
-tmux -S "$tmux_sock" send-keys -t e2e Enter
+wait_for 5 shows 'NEEDS YOU'
+keys C-z
+check "Ctrl+Z opens the snooze dialog with presets" wait_for 5 shows '30 minutes'
+keys Enter
 check "a preset snoozes the highlighted task" wait_for 5 sh -c "'$itm' list --view snoozed | grep -q task-fix-login"
-tmux -S "$tmux_sock" send-keys -t e2e Escape
+keys Escape
+check "Esc closes the switcher" wait_for 5 gone 'esc close'
 type_in_pane "$itm jump"
 check "itm jump opens the longest wait" wait_for 5 marker_is task-fix-login
 type_in_pane "$itm last"
 check "itm last goes back" wait_for 5 marker_is task-two-repos
+type_in_pane "$itm snooze"
+check "itm snooze without a time opens the snooze dialog (R4.1)" wait_for 5 shows 'Snooze “Two repos”'
+keys Enter
+check "its first preset snoozes the current task and moves its client (R4.7)" wait_for 5 marker_is task-fix-login
+check "the task is snoozed for 30 minutes" sh -c "'$itm' list --view snoozed | grep -q task-two-repos"
 
 echo "== notes"
 notes=$("$itm" notes old-idea --path)
