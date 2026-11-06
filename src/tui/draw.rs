@@ -49,6 +49,22 @@ fn key_hints(keys: &[(&str, &str)]) -> Line<'static> {
     Line::from(spans)
 }
 
+/// Key hints on as many lines as `width` needs, never cutting one (UX principle 5).
+fn wrapped_key_hints(keys: &[(&str, &str)], width: u16) -> Vec<Line<'static>> {
+    let mut lines: Vec<Vec<(&str, &str)>> = vec![vec![]];
+    let mut used = 0;
+    for &(key, what) in keys {
+        let hint = key.chars().count() + what.chars().count() + 3;
+        if used > 0 && used + hint > width as usize + 2 {
+            lines.push(vec![]);
+            used = 0;
+        }
+        lines.last_mut().expect("one line at least").push((key, what));
+        used += hint;
+    }
+    lines.iter().map(|line| key_hints(line)).collect()
+}
+
 /// At most `max` characters, with "…" when cut.
 fn cut(text: &str, max: usize) -> String {
     if text.chars().count() <= max { text.into() } else { text.chars().take(max - 1).chain(['…']).collect() }
@@ -56,6 +72,7 @@ fn cut(text: &str, max: usize) -> String {
 
 pub fn draw(frame: &mut Frame, app: &mut App, now: i64) {
     let area = frame.area().inner(Margin { horizontal: 1, vertical: 0 });
+    let hints = wrapped_key_hints(&KEYS, area.width);
     let [top, _, search, _, body, message, keys] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(1),
@@ -63,7 +80,7 @@ pub fn draw(frame: &mut Frame, app: &mut App, now: i64) {
         Constraint::Length(1),
         Constraint::Fill(1),
         Constraint::Length(1),
-        Constraint::Length(1),
+        Constraint::Length(hints.len() as u16),
     ])
     .areas(area);
 
@@ -75,7 +92,7 @@ pub fn draw(frame: &mut Frame, app: &mut App, now: i64) {
     if let Some(m) = &app.message {
         frame.render_widget(Paragraph::new(colored(m.text.clone(), if m.error { ERROR } else { SUCCESS })), message);
     }
-    frame.render_widget(Paragraph::new(key_hints(&KEYS)), keys);
+    frame.render_widget(Paragraph::new(hints), keys);
     if let Some(dialog) = &app.dialog {
         draw_dialog(frame, app, dialog, area, now);
     }
@@ -125,27 +142,70 @@ fn draw_search(frame: &mut Frame, app: &App, area: Rect) {
 
 fn draw_list(frame: &mut Frame, app: &mut App, area: Rect, now: i64) {
     let Some(snap) = &app.snapshot else { return };
-    let items: Vec<ListItem> = app
-        .rows
-        .iter()
+    let statuses: Vec<Option<Status>> = (app.rows.iter())
         .map(|row| match row {
-            Row::Header(header) => {
+            Row::Task(name) => Some(status(snap, name, &snap.data.tasks[name], now)),
+            _ => None,
+        })
+        .collect();
+    let widest = statuses.iter().flatten().map(Status::width).max().unwrap_or(0);
+    let columns = Columns::fitting(area.width as usize - 1, widest); // one column from the preview
+    let items: Vec<ListItem> = (app.rows.iter().zip(statuses))
+        .map(|(row, status)| match (row, status) {
+            (Row::Task(name), Some(status)) => ListItem::new(task_line(snap, &snap.data.tasks[name], status, columns)),
+            (Row::Header(header), _) => {
                 let color = if *header == "NEEDS YOU" { ERROR } else { MUTED };
                 ListItem::new(Span::styled(*header, Style::new().fg(color).bold()))
             }
-            Row::Task(name) => ListItem::new(task_line(snap, name, &snap.data.tasks[name], now)),
-            Row::Create => ListItem::new(Line::from(vec![
+            (Row::Create, _) => ListItem::new(Line::from(vec![
                 colored("+ ", ACCENT),
                 Span::raw(format!("Create task “{}”", app.search.value().trim())),
             ])),
+            (Row::Task(_), None) => unreachable!("every task row has a status"),
         })
         .collect();
     let list = List::new(items).highlight_style(Style::new().add_modifier(Modifier::BOLD | Modifier::REVERSED));
     frame.render_stateful_widget(list, area, &mut app.list);
 }
 
-/// Icon and title, the first project, and what the task is doing.
-fn task_line(snap: &Snapshot, name: &str, task: &Task, now: i64) -> Line<'static> {
+/// A row's icon and what the task is doing ("claude waiting · 4m", "wakes in 2h").
+struct Status {
+    icon: Span<'static>,
+    detail: Vec<Span<'static>>,
+}
+
+impl Status {
+    fn width(&self) -> usize {
+        self.detail.iter().map(Span::width).sum()
+    }
+}
+
+/// Where a row's parts go: the icon and title, then the first project, then
+/// the status. The status is never cut: in a narrow list the title gets
+/// shorter first, and the project goes last.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Columns {
+    /// Icon, title and the gap after them.
+    title: usize,
+    /// The first project and the gap after it; 0 when it does not fit.
+    project: usize,
+}
+
+impl Columns {
+    const WIDE: Columns = Columns { title: 31, project: 12 };
+    /// The narrowest title column kept next to a project.
+    const MIN_TITLE: usize = 12;
+
+    fn fitting(width: usize, status: usize) -> Columns {
+        let lead = width.saturating_sub(status).min(Columns::WIDE.title + Columns::WIDE.project);
+        match lead.checked_sub(Columns::WIDE.project) {
+            Some(title) if title >= Columns::MIN_TITLE => Columns { title, project: Columns::WIDE.project },
+            _ => Columns { title: lead, project: 0 },
+        }
+    }
+}
+
+fn status(snap: &Snapshot, name: &str, task: &Task, now: i64) -> Status {
     let session = snap.sessions.get(name);
     let longest_wait = snap.status.blocked(name).min_by_key(|a| a.since.unwrap_or(now));
     let (icon, detail) = match (task.state, longest_wait) {
@@ -168,24 +228,33 @@ fn task_line(snap: &Snapshot, name: &str, task: &Task, now: i64) -> Line<'static
         }
         _ => (colored("●", SUCCESS), muted("idle")),
     };
-    let title = format!(" {}", cut(&task.title, 28));
-    let mut spans = vec![icon, Span::raw(title)];
-    let used: usize = spans.iter().map(Span::width).sum();
-    spans.push(Span::raw(" ".repeat(31usize.saturating_sub(used).max(2))));
-    let projects = project_names(snap, task);
-    let badge = match projects.split_first() {
-        Some((first, rest)) => {
-            let more = if rest.is_empty() { String::new() } else { format!(" +{}", rest.len()) };
-            format!("◆ {}{more}", cut(first, 9usize.saturating_sub(more.len()).max(3)))
-        }
-        None => String::new(),
-    };
-    let pad = 12usize.saturating_sub(badge.chars().count()).max(1);
-    spans.push(colored(badge + &" ".repeat(pad), PROJECT));
-    spans.push(detail);
+    let mut detail = vec![detail];
     if snap.current.as_deref() == Some(name) {
-        spans.push(colored(" · here", ACCENT));
+        detail.push(colored(" · here", ACCENT));
     }
+    Status { icon, detail }
+}
+
+/// Icon and title, the first project, and what the task is doing.
+fn task_line(snap: &Snapshot, task: &Task, status: Status, columns: Columns) -> Line<'static> {
+    let room = columns.title.saturating_sub(3); // the icon, a space, and one gap after
+    let title = if room == 0 { String::new() } else { format!(" {}", cut(&task.title, room.min(28))) };
+    let mut spans = vec![status.icon, Span::raw(title)];
+    let used: usize = spans.iter().map(Span::width).sum();
+    spans.push(Span::raw(" ".repeat(columns.title.saturating_sub(used).max(1))));
+    if columns.project > 0 {
+        let projects = project_names(snap, task);
+        let badge = match projects.split_first() {
+            Some((first, rest)) => {
+                let more = if rest.is_empty() { String::new() } else { format!(" +{}", rest.len()) };
+                format!("◆ {}{more}", cut(first, 9usize.saturating_sub(more.len()).max(3)))
+            }
+            None => String::new(),
+        };
+        let pad = columns.project.saturating_sub(badge.chars().count()).max(1);
+        spans.push(colored(badge + &" ".repeat(pad), PROJECT));
+    }
+    spans.extend(status.detail);
     Line::from(spans)
 }
 
@@ -433,6 +502,33 @@ mod tests {
         snap.sessions.clear();
         let screen_text = screen(&mut app(snap));
         assert!(screen_text.contains("Herdr not answering · sessions unknown · daemon not running"), "{screen_text}");
+    }
+
+    /// A narrow pane (a small Herdr popup) shortens titles and drops the
+    /// project before it cuts what a task is doing, and wraps the keys.
+    #[test]
+    fn a_narrow_pane_keeps_each_status_and_every_key() {
+        let mut snap = snapshot();
+        snap.current = Some("task-write-docs".into());
+        let mut app = app(snap);
+        let mut terminal = Terminal::new(TestBackend::new(64, 20)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app, NOW)).unwrap();
+        let screen = format!("{}", terminal.backend());
+        for status in ["claude waiting · 4m", "working · here", "not started"] {
+            assert!(screen.contains(status), "{status} cut:\n{screen}");
+        }
+        for (key, what) in KEYS {
+            assert!(screen.contains(&format!("{key} {what}")), "{key} cut:\n{screen}");
+        }
+        insta::assert_snapshot!(screen);
+    }
+
+    #[test]
+    fn columns_give_way_title_first_then_project() {
+        assert_eq!(Columns::fitting(120, 19), Columns::WIDE);
+        assert_eq!(Columns::fitting(50, 19), Columns { title: 19, project: 12 });
+        assert_eq!(Columns::fitting(40, 19), Columns { title: 21, project: 0 });
+        assert_eq!(Columns::fitting(10, 19), Columns { title: 0, project: 0 });
     }
 
     #[test]
