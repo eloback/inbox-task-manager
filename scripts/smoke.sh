@@ -245,6 +245,80 @@ keys Enter
 check "the clone is deleted when chosen" wait_for 5 sh -c "! test -e '$clone' && ! test -e '$(dirname "$clone")'"
 check "the project is forgotten" sh -c "! '$itm' project list | grep -q tool"
 
+echo "== projects follow workspaces, add-workspace and settings (R10)"
+# The client is on task-fix-login; the daemon runs. Workspaces are opened over the socket.
+open_workspace() { # open_workspace <session> <folder> <label or ""> <focus>: prints its id
+  local label=""; [ -n "$3" ] && label=",\"label\":\"$3\""
+  call "$1" "{\"id\":\"w\",\"method\":\"workspace.create\",\"params\":{\"cwd\":\"$2\"$label,\"focus\":$4}}" \
+    | field "['result']['workspace']['workspace_id']"
+}
+close_workspace() { call "$1" "{\"id\":\"c\",\"method\":\"workspace.close\",\"params\":{\"workspace_id\":\"$2\"}}" >/dev/null; }
+task_projects() { # task_projects <session>: its projects' names, in order
+  "$itm" list --json | python3 -c 'import json,sys; print(" ".join(p["name"] for r in json.load(sys.stdin) if r["session"] == sys.argv[1] for p in r["projects"]))' "$1"
+}
+projects_are() { test "$(task_projects "$1")" = "$2"; }
+before=$(task_projects task-fix-login)
+web_ws=$(open_workspace task-fix-login "$HOME/code/web" "" false)
+check "a workspace in a project's folder adds the project to its task (R10.3)" wait_for 8 projects_are task-fix-login "${before:+$before }web"
+check "while it is open, an edit keeps it and says so (R5.4)" \
+  sh -c "'$itm' edit 'Fix login' --remove-project web | grep -qF 'could not remove web: it still has a workspace in this task'"
+check "the project stays" projects_are task-fix-login "${before:+$before }web"
+close_workspace task-fix-login "$web_ws"
+check "closing the workspace removes the project it brought (R10.3)" wait_for 8 projects_are task-fix-login "$before"
+
+mkdir -p "$HOME/code/new-thing" "$HOME/code/client-y"
+open_workspace task-fix-login "$HOME/code/new-thing" "" true >/dev/null
+type_in_pane "$itm project add-workspace"
+check "add-workspace in a terminal opens the add dialog with the workspace's folder (R10.5)" wait_for 5 shows 'Source  ~/code/new-thing'
+check "and its name" shows 'Name    new-thing'
+keys Enter
+check "Enter saves the folder" wait_for 5 sh -c "'$itm' project list | grep -q '^new-thing	dir	~/code/new-thing'"
+check "and gives it to the current task" wait_for 5 sh -c "'$itm' list --json | grep -q '\"name\": \"new-thing\"'"
+check "as found in its workspace (projects follow workspaces)" \
+  sh -c "python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); i=[k for k,p in d[\"projects\"].items() if p[\"name\"]==\"new-thing\"][0]; sys.exit(i not in d[\"tasks\"][\"task-fix-login\"].get(\"found_projects\",[]))' '$XDG_STATE_HOME/inbox-task-manager/tasks.json'"
+"$itm" project add name "Client Y" >/dev/null
+open_workspace task-fix-login "$HOME/code/client-y" "Client Y" true >/dev/null
+type_in_pane "$itm project add-workspace"
+check "a workspace named after a project without a folder asks first" wait_for 5 shows 'Give ~/code/client-y to Client Y?'
+keys y
+check "y gives it the folder" wait_for 5 sh -c "'$itm' project list | grep -q '^Client Y	dir	~/code/client-y'"
+check "no second project was saved" test "$("$itm" project list | grep -c '^Client Y')" = 1
+popup_ws=$(open_workspace task-fix-login "$HOME/code/docs" "" false)
+check "a popup's workspace is the one it was opened over, given by HERDR_ACTIVE_WORKSPACE_ID" \
+  test "$(HERDR_SOCKET_PATH="$sessions/task-fix-login/herdr.sock" HERDR_ACTIVE_WORKSPACE_ID="$popup_ws" "$itm" project add-workspace --name popup </dev/null)" \
+  = "project docs (~/code/docs); added to 'Fix login'"
+home_ws=$(open_workspace task-fix-login "$HOME" "" false)
+HERDR_SOCKET_PATH="$sessions/task-fix-login/herdr.sock" HERDR_ACTIVE_WORKSPACE_ID="$home_ws" "$itm" project add-workspace --name everything </dev/null >"$root/home.txt" 2>&1
+check "the home folder is refused" contains "$root/home.txt" "itm: ~ holds every workspace under it"
+
+config=$XDG_CONFIG_HOME/inbox-task-manager/config.toml
+type_in_pane "$itm ui"
+wait_for 5 shows 'esc close'
+keys C-s
+check "Ctrl+S opens the settings (R10.4)" wait_for 5 shows 'Herdr integration'
+keys Down
+keys Enter
+check "a toggle writes config.toml" wait_for 5 contains "$config" "remove_projects_without_workspace = false"
+keys Enter
+check "and toggles back" wait_for 5 contains "$config" "remove_projects_without_workspace = true"
+keys Escape
+wait_for 5 gone 'Herdr integration'
+keys Escape
+check "Esc closes the settings, then the switcher" wait_for 5 gone 'esc close'
+printf '# mine\n[herdr\n' >"$config"
+sleep 4.5
+check "a broken settings file is logged once by the daemon" test "$(grep -c 'settings ignored:' "$root/daemon.log")" = 1
+check "with what is wrong" contains "$root/daemon.log" "config.toml is not valid TOML: unclosed table, expected \`]\` (at line 2, column 7)"
+type_in_pane "$itm ui"
+wait_for 5 shows 'esc close'
+keys C-s
+check "the Settings screen shows the mistake" wait_for 5 shows 'valid TOML: unclosed table'
+keys Escape
+wait_for 5 gone 'Herdr integration'
+keys Escape
+wait_for 5 gone 'esc close'
+printf '# mine\n[herdr]\nprojects_from_workspaces = true  # keep\n' >"$config"
+
 echo "== the Python itm reads this state"
 if [ -x "$python_itm" ]; then
   check "python itm list agrees" test "$("$python_itm" list | cut -f1,2 | sort)" = "$("$itm" list | cut -f1,2 | sort)"
