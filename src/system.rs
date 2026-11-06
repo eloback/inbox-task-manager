@@ -1,7 +1,10 @@
-//! What itm needs from the operating system: the process table (to validate
-//! attach-loop markers and find their `herdr session attach` children),
-//! signals, programs on `PATH` and the desktop notification command.
-//! Linux only for now: the process table is read from `/proc`.
+//! What differs between operating systems, and what itm needs from them:
+//! the process table (to validate attach-loop markers and find their `herdr
+//! session attach` children), signals, programs on `PATH`, sessions of
+//! their own, and the desktop notification command. Linux reads the
+//! process table from `/proc`; macOS and the BSDs ask `ps` (DESIGN.md
+//! section 4, portability). Which one is a run-time choice, so both are
+//! built and tested everywhere.
 
 use std::env;
 use std::fs;
@@ -30,7 +33,12 @@ pub trait Processes: Send + Sync {
     fn terminate(&self, pid: u32);
 }
 
-/// The real process table, from `/proc`.
+/// This system's process table: `/proc` where there is one, else `ps`.
+pub fn process_table() -> Box<dyn Processes> {
+    if fs::metadata("/proc/self/cmdline").is_ok() { Box::new(Proc) } else { Box::new(Ps) }
+}
+
+/// The process table from `/proc` (Linux).
 pub struct Proc;
 
 impl Processes for Proc {
@@ -42,10 +50,7 @@ impl Processes for Proc {
     }
 
     fn alive(&self, pid: u32) -> bool {
-        match pid_of(pid) {
-            Some(pid) => !matches!(test_kill_process(pid), Err(rustix::io::Errno::SRCH)), // EPERM: someone else's
-            None => false,
-        }
+        alive(pid)
     }
 
     fn children(&self, parent: u32) -> Vec<(u32, Vec<String>)> {
@@ -59,9 +64,80 @@ impl Processes for Proc {
     }
 
     fn terminate(&self, pid: u32) {
-        if let Some(pid) = pid_of(pid) {
-            let _ = kill_process(pid, Signal::TERM);
+        terminate(pid)
+    }
+}
+
+/// The process table from `ps -ww` (macOS, the BSDs). `ps` joins a command
+/// line's arguments with spaces, so an argument containing a space comes
+/// back as several: a `herdr` whose path has a space is not recognized as
+/// an attach child there.
+pub struct Ps;
+
+/// How long `ps` may take.
+const PS_TIMEOUT: Duration = Duration::from_secs(5);
+
+impl Ps {
+    /// What `ps -ww <args>` printed, when it succeeded.
+    fn run(args: &[&str]) -> Option<String> {
+        match output_within(Command::new("ps").arg("-ww").args(args), PS_TIMEOUT) {
+            Ok(Some((status, text))) if status.success() => Some(text),
+            _ => None,
         }
+    }
+}
+
+impl Processes for Ps {
+    fn argv(&self, pid: u32) -> Option<Vec<String>> {
+        ps_command(&Ps::run(&["-o", "command=", "-p", &pid.to_string()])?)
+    }
+
+    fn alive(&self, pid: u32) -> bool {
+        alive(pid)
+    }
+
+    fn children(&self, parent: u32) -> Vec<(u32, Vec<String>)> {
+        // One -o per column: FreeBSD reads everything after the first "=" of a list as its header.
+        Ps::run(&["-A", "-o", "pid=", "-o", "ppid=", "-o", "command="])
+            .map_or(vec![], |table| ps_children(&table, parent))
+    }
+
+    fn terminate(&self, pid: u32) {
+        terminate(pid)
+    }
+}
+
+/// The command line `ps -o command= -p <pid>` printed; None for nothing.
+fn ps_command(output: &str) -> Option<Vec<String>> {
+    let argv: Vec<String> = output.split_whitespace().map(str::to_string).collect();
+    (!argv.is_empty()).then_some(argv)
+}
+
+/// (pid, command line) of each child of `parent` in `ps -A -o pid= -o ppid= -o command=` output.
+fn ps_children(table: &str, parent: u32) -> Vec<(u32, Vec<String>)> {
+    table
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let pid = fields.next()?.parse().ok()?;
+            let ppid: u32 = fields.next()?.parse().ok()?;
+            let argv: Vec<String> = fields.map(str::to_string).collect();
+            (ppid == parent && !argv.is_empty()).then_some((pid, argv))
+        })
+        .collect()
+}
+
+/// Whether `pid` runs; someone else's process counts (EPERM).
+fn alive(pid: u32) -> bool {
+    match pid_of(pid) {
+        Some(pid) => !matches!(test_kill_process(pid), Err(rustix::io::Errno::SRCH)),
+        None => false,
+    }
+}
+
+fn terminate(pid: u32) {
+    if let Some(pid) = pid_of(pid) {
+        let _ = kill_process(pid, Signal::TERM);
     }
 }
 
@@ -86,8 +162,8 @@ pub fn output_within(
     let mut child = command.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn()?;
     let mut stdout = child.stdout.take().expect("piped");
     let reader = thread::spawn(move || {
-        let mut text = String::new();
-        stdout.read_to_string(&mut text).map(|_| text)
+        let mut bytes = vec![];
+        stdout.read_to_end(&mut bytes).map(|_| String::from_utf8_lossy(&bytes).into_owned())
     });
     let deadline = Instant::now() + timeout;
     let mut nap = Duration::from_millis(5);
@@ -139,9 +215,11 @@ pub fn which(program: &str) -> Option<PathBuf> {
 }
 
 /// How to show a desktop notification: `$ITM_NOTIFY_COMMAND` (split like a
-/// shell would) with the title and body as arguments, else `notify-send`.
-/// `open` asks `notify-send` for an Open action; it then waits until the
-/// notification closes and prints `open` when it was chosen (R3.3).
+/// shell would) with the title and body as arguments, else `osascript` on
+/// macOS (the text goes in as arguments, never into the script), else
+/// `notify-send`. `open` asks `notify-send` for an Open action; it then
+/// waits until the notification closes and prints `open` when it was
+/// chosen (R3.3). None when this system has no way to notify.
 #[derive(Debug, PartialEq)]
 pub struct NotifyCommand {
     pub argv: Vec<String>,
@@ -149,43 +227,45 @@ pub struct NotifyCommand {
 }
 
 pub fn notify_command(custom: Option<&str>, title: &str, body: &str, open: bool) -> Result<Option<NotifyCommand>> {
-    if let Some(custom) = custom.map(str::trim).filter(|c| !c.is_empty()) {
-        let Some(mut argv) = shlex::split(custom) else { bail!("cannot read $ITM_NOTIFY_COMMAND: {custom}") };
-        argv.extend([title.into(), body.into()]);
-        return Ok(Some(NotifyCommand { argv, offers_open: false }));
+    let here = Notifiers { macos: env::consts::OS == "macos", have: &|program| which(program).is_some() };
+    here.command(custom, title, body, open)
+}
+
+/// What this system offers to notify with.
+struct Notifiers<'a> {
+    macos: bool,
+    have: &'a dyn Fn(&str) -> bool,
+}
+
+/// Shows its second argument as a notification titled with its first.
+const OSASCRIPT: &str = "on run argv\ndisplay notification (item 2 of argv) with title (item 1 of argv)\nend run";
+
+impl Notifiers<'_> {
+    fn command(&self, custom: Option<&str>, title: &str, body: &str, open: bool) -> Result<Option<NotifyCommand>> {
+        if let Some(custom) = custom.map(str::trim).filter(|c| !c.is_empty()) {
+            let Some(mut argv) = shlex::split(custom) else { bail!("cannot read $ITM_NOTIFY_COMMAND: {custom}") };
+            argv.extend([title.into(), body.into()]);
+            return Ok(Some(NotifyCommand { argv, offers_open: false }));
+        }
+        if self.macos {
+            let argv = ["osascript", "-e", OSASCRIPT, title, body].map(String::from).into();
+            return Ok((self.have)("osascript").then_some(NotifyCommand { argv, offers_open: false }));
+        }
+        if !(self.have)("notify-send") {
+            return Ok(None);
+        }
+        let mut argv = vec!["notify-send".into(), "--app-name=inbox-task-manager".into(), title.into(), body.into()];
+        if open {
+            argv.splice(1..1, ["--action=open=Open".into(), "--wait".into()]);
+        }
+        Ok(Some(NotifyCommand { argv, offers_open: open }))
     }
-    if which("notify-send").is_none() {
-        return Ok(None);
-    }
-    let mut argv = vec!["notify-send".into(), "--app-name=inbox-task-manager".into(), title.into(), body.into()];
-    if open {
-        argv.splice(1..1, ["--action=open=Open".into(), "--wait".into()]);
-    }
-    Ok(Some(NotifyCommand { argv, offers_open: open }))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::process::Command;
-
-    #[test]
-    fn reads_command_lines_and_children_from_proc() {
-        let mut child = Command::new("sleep").arg("30").spawn().unwrap();
-        let me = std::process::id();
-        // spawn returns while the kernel still sets up the new program's arguments.
-        let argv = (0..100).find_map(|_| {
-            std::thread::sleep(std::time::Duration::from_millis(10));
-            Proc.argv(child.id()).filter(|argv| !argv.is_empty())
-        });
-        assert_eq!(argv, Some(vec!["sleep".to_string(), "30".to_string()]));
-        assert!(Proc.children(me).iter().any(|(pid, argv)| *pid == child.id() && argv == &["sleep", "30"]));
-        assert!(Proc.alive(child.id()));
-        Proc.terminate(child.id());
-        child.wait().unwrap();
-        assert_eq!(Proc.argv(child.id()), None);
-        assert!(!Proc.alive(child.id()));
-    }
 
     #[test]
     fn a_command_runs_to_its_end_or_is_killed_at_the_timeout() {
@@ -209,5 +289,100 @@ mod tests {
         assert_eq!(command.argv, ["notify", "--urgent", "a b", "T", "B"]);
         assert!(!command.offers_open);
         assert!(notify_command(Some("notify 'open"), "T", "B", false).is_err());
+    }
+
+    /// R3.2, R3.3: osascript on macOS, with the text as arguments and no Open action;
+    /// notify-send elsewhere, offering Open; nothing when neither is there.
+    #[test]
+    fn each_system_notifies_with_its_own_program() {
+        let everything = |_: &str| true;
+        let mac = Notifiers { macos: true, have: &everything };
+        let command = mac.command(None, r#"say "hi""#, "B", true).unwrap().unwrap();
+        assert_eq!(command.argv[..2], ["osascript", "-e"]);
+        assert_eq!(command.argv[3..], [r#"say "hi""#, "B"], "arguments, never script text");
+        assert!(!command.offers_open);
+
+        let linux = Notifiers { macos: false, have: &everything };
+        let command = linux.command(Some("  \t"), "T", "B", true).unwrap().unwrap();
+        assert_eq!(
+            command.argv,
+            ["notify-send", "--action=open=Open", "--wait", "--app-name=inbox-task-manager", "T", "B"]
+        );
+        assert!(command.offers_open);
+        assert!(!linux.command(None, "T", "B", false).unwrap().unwrap().offers_open);
+
+        let nothing = |_: &str| false;
+        for macos in [true, false] {
+            assert_eq!(Notifiers { macos, have: &nothing }.command(None, "T", "B", true).unwrap(), None);
+        }
+    }
+
+    /// `ps -ww -A -o pid= -o ppid= -o command=` as macOS and FreeBSD print it.
+    const PS_TABLE: &str = "    1     0 /sbin/launchd
+  512     1 /usr/libexec/logd
+ 4242  4100 /Users/me/.nix-profile/bin/itm attach task-a
+ 4243  4242 herdr session attach task-a
+ 4250  4242 herdr session list
+ 4300  4242 /Applications/My Tools/herdr session attach task-b
+94512 94500 -zsh
+";
+
+    #[test]
+    fn ps_output_is_read_into_command_lines() {
+        let children = ps_children(PS_TABLE, 4242);
+        let argv = |words: &str| words.split(' ').map(str::to_string).collect::<Vec<_>>();
+        assert_eq!(
+            children,
+            [
+                (4243, argv("herdr session attach task-a")),
+                (4250, argv("herdr session list")),
+                // ps joins arguments with spaces: a path with one comes back split.
+                (4300, argv("/Applications/My Tools/herdr session attach task-b")),
+            ]
+        );
+        assert_eq!(ps_children(PS_TABLE, 7), []);
+        assert_eq!(ps_children("  PID  PPID COMMAND\n", 0), [], "a header is no process");
+        assert_eq!(
+            ps_command("/usr/bin/python3 /home/me/.local/bin/itm attach\n"),
+            Some(argv("/usr/bin/python3 /home/me/.local/bin/itm attach"))
+        );
+        assert_eq!(ps_command(""), None, "ps prints nothing for a process that is gone");
+    }
+
+    /// Both readers where they work: /proc, and ps when it takes BSD-style options.
+    fn tables() -> Vec<(&'static str, Box<dyn Processes>)> {
+        let mut tables: Vec<(&str, Box<dyn Processes>)> = vec![];
+        if fs::metadata("/proc/self/cmdline").is_ok() {
+            tables.push(("proc", Box::new(Proc)));
+        }
+        if Ps::run(&["-A", "-o", "pid="]).is_some() {
+            tables.push(("ps", Box::new(Ps)));
+        }
+        assert!(!tables.is_empty(), "no way to read the process table");
+        tables
+    }
+
+    #[test]
+    fn every_process_table_reads_command_lines_children_and_endings() {
+        // Not a faked argv[0]: coreutils built as one program picks the tool by it.
+        let mut child = Command::new("sleep").arg("30").spawn().unwrap();
+        let me = std::process::id();
+        let expected = ["sleep".to_string(), "30".to_string()];
+        for (name, table) in tables() {
+            // spawn returns while the kernel still sets up the new program's arguments.
+            let argv = (0..100).find_map(|_| {
+                std::thread::sleep(Duration::from_millis(10));
+                table.argv(child.id()).filter(|argv| argv[..] == expected)
+            });
+            assert_eq!(argv.as_deref(), Some(&expected[..]), "{name}");
+            assert!(table.children(me).iter().any(|(pid, argv)| *pid == child.id() && argv[..] == expected), "{name}");
+            assert!(table.alive(child.id()), "{name}");
+        }
+        terminate(child.id());
+        child.wait().unwrap();
+        for (name, table) in tables() {
+            assert_eq!(table.argv(child.id()), None, "{name}");
+            assert!(!table.alive(child.id()), "{name}");
+        }
     }
 }

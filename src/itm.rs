@@ -14,7 +14,7 @@ use crate::projects::resolve_project;
 use crate::snooze::Until;
 use crate::status::Status;
 use crate::store::{Data, State, Store, Task};
-use crate::system::{Proc, Processes};
+use crate::system::Processes;
 use crate::tasks;
 use crate::times;
 
@@ -35,7 +35,7 @@ impl Itm {
         Itm {
             herdr: Herdr::new(paths.herdr_config.clone()),
             paths,
-            procs: Box::new(Proc),
+            procs: crate::system::process_table(),
             client_socket: env::var_os("HERDR_SOCKET_PATH").filter(|v| !v.is_empty()).map(PathBuf::from),
             notify_command: env::var("ITM_NOTIFY_COMMAND").ok(),
             tz: TimeZone::system(),

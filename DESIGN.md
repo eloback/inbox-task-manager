@@ -752,6 +752,15 @@ The switcher and its dialogs follow these principles.
     clock.
   - `itm snooze` without a time (R4.1) runs the snooze screen alone; Esc
     is `cancelled` (exit 1, and no delay in a popup).
+- **Other systems.** `system.rs` keeps `system.py`'s split: the process
+  table from `/proc`, else `ps -ww` with one `-o` per column (bounded by a
+  5 s timeout), and notifications through `osascript` on macOS (title and
+  body as arguments, no Open action), else `notify-send`. Which one is
+  chosen at run time, not at compile time, so the `ps` reader and the
+  macOS notifier are built and tested on Linux too (captured macOS and
+  FreeBSD `ps` output, and Linux's own `ps`). The non-blocking socket
+  needs a macOS variant (no `SOCK_NONBLOCK` there); it was compiled on
+  Linux by swapping the `cfg`, but no Rust build has run on macOS yet.
 - **Layout.** One crate, binary `itm` (the process-name rule): `cli.rs`
   (arguments and output), `itm.rs` (the `Itm` context: folders, Herdr, the
   process table and the time zone of one run, and the task operations the
@@ -790,7 +799,7 @@ The switcher and its dialogs follow these principles.
   are assumed to arrive the same way.
 - **macOS and the BSDs.** The `ps` paths, `osascript` and the launchd agent
   are covered by unit tests and CI, not by end-to-end runs with Herdr. The
-  BSDs are untested.
+  BSDs are untested. The Rust itm has not been built on macOS at all.
 - **Open action on macOS.** `osascript` notifications cannot run an action,
   so the Open action exists only with `notify-send`.
 - **Socket path length on macOS.** Herdr puts a session's sockets in
