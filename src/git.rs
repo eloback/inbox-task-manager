@@ -5,7 +5,7 @@
 
 use std::ffi::OsString;
 use std::io::{self, ErrorKind};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::LazyLock;
 use std::thread;
@@ -14,10 +14,12 @@ use std::time::Duration;
 use regex_lite::Regex;
 
 use crate::error::{Error, Result};
-use crate::system::{ExitSignals, stop_child};
+use crate::system::{ExitSignals, output_within, stop_child};
 
 /// How long git may take to stop its helpers after SIGTERM.
 const STOP_PATIENCE: Duration = Duration::from_secs(10);
+/// How long git may take to say which repository a folder is in.
+const LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The `git` program. Tests run it with settings (`-c …`) or run a fake.
 pub struct Git {
@@ -120,6 +122,39 @@ impl Git {
             }
             thread::sleep(Duration::from_millis(20));
         }
+    }
+}
+
+/// The git repository a folder is in, as workspace matching needs it (R10.2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Repository {
+    /// Its main work tree: for a linked worktree, the checkout it was made
+    /// from. None for a bare repository.
+    pub root: Option<PathBuf>,
+    /// Its `origin` remote, normalized (R8.4); None without one.
+    pub origin: Option<String>,
+}
+
+impl Git {
+    /// The repository `folder` is in; None outside one, or without git.
+    /// Asked without the network (`ls-remote --get-url` only applies
+    /// `url.<base>.insteadOf`), stdin closed, each question within 5 s.
+    pub fn repository(&self, folder: &Path) -> Option<Repository> {
+        let ask = |args: &[&str]| {
+            let mut git = self.command();
+            git.arg("-C").arg(folder).args(args);
+            match output_within(&mut git, LOOKUP_TIMEOUT) {
+                Ok(Some((status, out))) if status.success() => Some(out.trim().to_string()),
+                _ => None,
+            }
+        };
+        let common = PathBuf::from(ask(&["rev-parse", "--path-format=absolute", "--git-common-dir"])?);
+        // A bare repository's common folder is the repository itself: it has no work tree.
+        let root =
+            (common.file_name() == Some(".git".as_ref())).then(|| common.parent().map(Path::to_path_buf)).flatten();
+        // Without such a remote, git prints the name back.
+        let url = ask(&["ls-remote", "--get-url", "origin"]).filter(|url| !url.is_empty() && url != "origin");
+        Some(Repository { root, origin: url.and_then(|url| normalize_git_url(&url).ok()) })
     }
 }
 

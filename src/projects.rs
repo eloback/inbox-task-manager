@@ -108,14 +108,14 @@ impl Itm {
         })
     }
 
-    fn projects_lock(&self) -> Result<File> {
+    pub(crate) fn projects_lock(&self) -> Result<File> {
         let lock = self.paths.state.join(".projects.lock");
         flocked(&lock).context(|| format!("cannot lock {}", lock.display()))
     }
 
     /// A folder as a project's folder is saved: resolved, and never inside
     /// itm's projects folder (R8.5: add its repository instead).
-    fn folder_spec(&self, source: &str) -> Result<PathBuf> {
+    pub(crate) fn folder_spec(&self, source: &str) -> Result<PathBuf> {
         if source.is_empty() {
             bail!("empty folder path");
         }
@@ -313,9 +313,10 @@ impl Itm {
                 .collect();
             Ok((old, name, kind, found_in))
         })?;
-        // "Remove a project when its workspace closes" is on by default; config.toml (R10.4) is not read yet.
-        let note = (kind == ProjectKind::Name && !found_in.is_empty() && old.to_lowercase() != name.to_lowercase())
-            .then(|| {
+        // Only while "remove a project when its workspace closes" is on (a broken settings file says nothing).
+        let removes = self.settings().map_or(true, |s| s.remove_projects_without_workspace);
+        let renamed = old.to_lowercase() != name.to_lowercase();
+        let note = (kind == ProjectKind::Name && !found_in.is_empty() && renamed && removes).then(|| {
                 format!(
                     "workspaces named {old} no longer count as it (it has no folder), so it may leave {} unless they are renamed {name}",
                     found_in.join(", ")
@@ -564,7 +565,7 @@ fn project_users(data: &Data, id: &str) -> Vec<String> {
 fn check_project_name(name: &str) -> Result<String> {
     let name = name.trim();
     if name.is_empty() || name.chars().count() > 60 || name.chars().any(char::is_control) {
-        bail!("a project name has 1 to 60 characters, without tabs or other control characters");
+        return Err(Error::ProjectName);
     }
     Ok(name.into())
 }
@@ -910,6 +911,13 @@ esac
         );
         assert!(!note.contains("Stopped"), "{note}");
         assert_eq!(itm.rename_project("Client Y", "client y").unwrap().2, None, "the same name, another case");
+        // R10.4: with "remove a project when its workspace closes" off, nothing is removed.
+        itm.change_setting(crate::config::Setting::RemoveProjectsWithoutWorkspace, false).unwrap();
+        assert_eq!(itm.rename_project("client y", "Client Z").unwrap().2, None);
+        // A broken settings file says nothing about it: the note is given.
+        fs::create_dir_all(&itm.paths.config).unwrap();
+        fs::write(itm.paths.config_file(), "[herdr\n").unwrap();
+        assert!(itm.rename_project("Client Z", "Client W").unwrap().2.is_some());
     }
 
     /// R8.2: `set` gives a project without a repository a folder, moves it or takes it; nothing on disk changes.

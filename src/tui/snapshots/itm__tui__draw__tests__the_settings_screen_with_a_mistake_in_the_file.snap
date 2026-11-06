@@ -1,0 +1,26 @@
+---
+source: src/tui/draw.rs
+expression: screen(&mut app)
+---
+  Inbox 3   Snoozed 1   Archived 1   All 5                                                      ⚑ 1 needs you
+
+ › Search tasks · or ty╭──────────────────────────────────────────────────────────────╮
+                       │ Settings                                                     │
+ NEEDS YOU             │                                                              │
+ ⚑ Fix login           │ Herdr integration                                            │
+ ACTIVE                │ ● Projects follow workspaces                                 │d out
+ ● Write docs          │   A running task's projects are the saved projects its       │
+ ○ Old idea            │ workspaces are in (the folder Herdr names a workspace        │
+                       │ after). Off: projects change only when you edit them.        │ng 4m
+                       │ ● Remove a project when its workspace closes                 │
+                       │   With the above: a project found in a workspace leaves the  │
+                       │ task once its workspace closed; projects you added yourself  │t · ctrl+o writes
+                       │ stay. Off: projects are only added.                          │
+                       │                                                              │
+                       │ ~/.config/inbox-task-manager/config.toml: unknown setting    │
+                       │ herdr.nope                                                   │
+                       │                                                              │
+                       │ enter / space toggle  esc close                              │
+                       ╰──────────────────────────────────────────────────────────────╯
+
+ enter open  tab view  alt+1…9 row  ^z snooze  ^u wake  ^a archive  esc close

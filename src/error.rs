@@ -41,6 +41,8 @@ pub enum Error {
         name: String,
         folder: String,
     },
+    /// Not a name a project can have.
+    ProjectName,
     /// The user closed a dialog without choosing.
     Cancelled,
     /// End with this exit status and say nothing: the user said no to a
@@ -96,6 +98,9 @@ impl fmt::Display for Error {
                 shell_quote(name),
                 shell_quote(folder)
             ),
+            Error::ProjectName => {
+                f.write_str("a project name has 1 to 60 characters, without tabs or other control characters")
+            }
             Error::Cancelled => f.write_str("cancelled"),
             Error::Exit(status) => write!(f, "exit status {status}"),
             Error::Other(message) => f.write_str(message),
@@ -104,6 +109,13 @@ impl fmt::Display for Error {
 }
 
 impl std::error::Error for Error {}
+
+impl Error {
+    /// Whether another name would do: the add dialog keeps the cursor on the name then (R8.5).
+    pub fn is_about_the_name(&self) -> bool {
+        matches!(self, Error::ProjectNameTaken { .. } | Error::ProjectWithoutFolder { .. } | Error::ProjectName)
+    }
+}
 
 /// `return Err(Error::Other(format!(...)))`.
 macro_rules! bail {

@@ -1,10 +1,12 @@
-//! `itm daemon` (R3, R4.3–R4.5, R7): every 2 s it reads the agents of every
-//! running task session, writes the status cache, notifies once per blocked
-//! agent and wakes snoozed tasks.
+//! `itm daemon` (R3, R4.3–R4.5, R7, R10.3): every 2 s it reads the agents
+//! and workspaces of every running task session, writes the status cache,
+//! notifies once per blocked agent, wakes snoozed tasks, and has running
+//! tasks' projects follow their workspaces.
 //!
-//! A pass is split in two: [`Itm::observe`] asks Herdr (one `agent.list`
-//! per running task session, over its socket), and [`Itm::poll_once`]
-//! decides and records, so tests can describe what Herdr shows.
+//! A pass is split in two: [`Itm::observe`] asks Herdr (one
+//! `session.snapshot` per running task session, over its socket), and
+//! [`Itm::poll_once`] decides and records, so tests can describe what Herdr
+//! shows.
 
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
@@ -16,14 +18,16 @@ use std::sync::{Arc, Once};
 use std::thread;
 use std::time::Duration;
 
+use crate::config::Settings;
 use crate::error::{Context, Error, Result};
-use crate::herdr::{Agent, Sessions};
+use crate::herdr::{Agent, Sessions, Workspace};
 use crate::itm::Itm;
 use crate::status::{AgentState, AgentStatus, Cache, SessionStatus};
 use crate::store::{State, python_json, write_atomic};
 use crate::system::{notify_command, output_within};
 use crate::tasks::{self, is_task_session};
 use crate::times;
+use crate::workspaces::project_roots;
 
 pub const POLL: Duration = Duration::from_secs(2);
 /// How long a desktop notification offering Open is waited for (Python's limit).
@@ -39,6 +43,10 @@ pub struct Observation {
     pub sessions: Sessions,
     /// The agents of each running task session; None when it did not answer.
     pub agents: BTreeMap<String, Option<Vec<Agent>>>,
+    /// The workspaces of each running task session, while projects follow
+    /// workspaces. A session that did not answer, or has no workspace yet
+    /// (it is starting or being restored), is not here.
+    pub workspaces: BTreeMap<String, Vec<Workspace>>,
     /// Sessions an `itm attach` client is attached to.
     pub attached: BTreeSet<String>,
 }
@@ -61,22 +69,40 @@ fn wait_key(session: &str, agent: &Agent) -> String {
 }
 
 impl Itm {
-    pub fn observe(&self) -> Result<Observation> {
+    /// What Herdr shows; the workspaces only when projects `follow` them.
+    pub fn observe(&self, follow: bool) -> Result<Observation> {
         let sessions = self.herdr.sessions()?;
-        let agents = sessions
-            .values()
-            .filter(|s| is_task_session(&s.name) && s.running)
-            .map(|s| (s.name.clone(), self.herdr.agents(&s.socket).ok()))
-            .collect();
+        let (mut agents, mut workspaces) = (BTreeMap::new(), BTreeMap::new());
+        for session in sessions.values().filter(|s| is_task_session(&s.name) && s.running) {
+            let view = self.herdr.snapshot(&session.socket).ok();
+            let open = view.as_ref().and_then(|v| v.workspaces.clone()).filter(|w| follow && !w.is_empty());
+            if let Some(open) = open {
+                workspaces.insert(session.name.clone(), open);
+            }
+            agents.insert(session.name.clone(), view.map(|v| v.agents));
+        }
         let attached = self.live_clients()?.into_values().collect();
-        Ok(Observation { sessions, agents, attached })
+        Ok(Observation { sessions, agents, workspaces, attached })
     }
 
     /// One pass over what Herdr showed; returns the notifications to deliver.
     /// A wait is marked notified only after the store update succeeded, is
     /// forgotten once its agent is no longer blocked, and is kept for
     /// sessions that could not be asked.
-    pub fn poll_once(&self, notified: &mut Notified, seen: &Observation, now: i64) -> Result<Vec<Notice>> {
+    ///
+    /// Running tasks' projects follow their workspaces (R10.3). `settled`,
+    /// the daemon's memory, holds the sessions whose workspaces it read on
+    /// the pass before: only those can lose a project, so a session just
+    /// started or restored, or first seen by a daemon that just started, is
+    /// never mistaken for one whose workspaces closed.
+    pub fn poll_once(
+        &self,
+        notified: &mut Notified,
+        seen: &Observation,
+        settings: &Settings,
+        settled: &mut BTreeSet<String>,
+        now: i64,
+    ) -> Result<Vec<Notice>> {
         let mut cache = BTreeMap::new();
         let mut blocked_now: BTreeMap<String, (&str, &Agent)> = BTreeMap::new();
         for (session, agents) in &seen.agents {
@@ -111,12 +137,34 @@ impl Itm {
         let waiting: BTreeSet<&str> = blocked_now.values().map(|(session, _)| *session).collect();
         let running = |name: &str| seen.sessions.get(name).is_some_and(|s| s.running);
 
+        // Folders are matched to projects outside the store lock (resolving them reads the disk; git may run).
+        let open: BTreeMap<&String, (Vec<String>, bool)> = match seen.workspaces.is_empty() {
+            true => BTreeMap::new(),
+            false => {
+                let projects = self.store().load()?.projects;
+                let roots = project_roots(&projects); // each project's folder resolved once per pass
+                let open_in = |found| self.workspace_projects(&projects, &roots, found);
+                seen.workspaces.iter().map(|(name, found)| (name, open_in(found))).collect()
+            }
+        };
+        let trusted: BTreeSet<&String> = seen.workspaces.keys().filter(|name| settled.contains(*name)).collect();
+        *settled = seen.workspaces.keys().cloned().collect();
+
         let notices = self.store().edit(|data| {
             tasks::adopt_sessions(data, seen.sessions.keys().map(String::as_str), now);
-            for task in data.tasks.values_mut() {
-                // This version does not follow workspaces (R10): as with that
-                // setting off, no record of open workspaces is kept.
-                task.workspace_projects.clear();
+            for (name, task) in data.tasks.iter_mut() {
+                // A stopped session has no open workspaces, and with sync off nothing keeps the record
+                // current: an old one must not keep a project or count as closed later.
+                if !settings.projects_from_workspaces || !running(name) {
+                    task.workspace_projects.clear();
+                }
+            }
+            for (name, (ids, complete)) in &open {
+                let Some(task) = data.tasks.get_mut(*name).filter(|t| t.state != State::Archived) else { continue };
+                // A project removed meanwhile is not added back.
+                let ids: Vec<String> = ids.iter().filter(|id| data.projects.contains_key(*id)).cloned().collect();
+                let trusted = *complete && trusted.contains(name);
+                task.sync_projects(&ids, settings.remove_projects_without_workspace, trusted);
             }
             let mut notices = vec![];
             let mut notice =
@@ -199,15 +247,37 @@ impl Itm {
         });
     }
 
+    /// The settings for one pass. A broken file never stops the daemon: it
+    /// is logged once while it stays the same, and the pass runs without
+    /// following workspaces (nothing is added or removed) until it is fixed.
+    fn pass_settings(&self, last_error: &mut Option<String>, mut log: impl FnMut(&str)) -> Settings {
+        match self.settings() {
+            Ok(settings) => {
+                *last_error = None;
+                settings
+            }
+            Err(e) => {
+                let e = e.to_string();
+                if last_error.as_ref() != Some(&e) {
+                    log(&format!("settings ignored: {e}"));
+                }
+                *last_error = Some(e);
+                Settings::broken()
+            }
+        }
+    }
+
     /// The daemon's loop: a pass every [`POLL`], forever.
     pub fn run_daemon(self: Arc<Self>) -> Result<()> {
         let mut notified: Notified = fs::read_to_string(self.paths.notified_file())
             .ok()
             .and_then(|t| serde_json::from_str(&t).ok())
             .unwrap_or_default();
+        let (mut settings_error, mut settled) = (None, BTreeSet::new());
         let pass = || {
-            let seen = self.observe()?;
-            for notice in self.poll_once(&mut notified, &seen, times::now())? {
+            let settings = self.pass_settings(&mut settings_error, |line| eprintln!("{line}"));
+            let seen = self.observe(settings.projects_from_workspaces)?;
+            for notice in self.poll_once(&mut notified, &seen, &settings, &mut settled, times::now())? {
                 self.deliver(&notice, &seen);
             }
             Ok(())
@@ -283,6 +353,7 @@ mod tests {
     use crate::status::Status;
     use crate::store::Task;
     use serde_json::json;
+    use std::process::Command;
 
     const NOW: i64 = 1_800_000_000;
 
@@ -320,9 +391,16 @@ mod tests {
                 ("task-c".into(), Some(vec![])),
             ]
             .into(),
+            workspaces: BTreeMap::new(),
             attached: BTreeSet::new(),
         };
         (tmp, itm, seen)
+    }
+
+    /// A pass with the default settings, every session read on the pass before.
+    fn pass(itm: &Itm, notified: &mut Notified, seen: &Observation, now: i64) -> Result<Vec<Notice>> {
+        let mut settled = seen.workspaces.keys().cloned().collect();
+        itm.poll_once(notified, seen, &Settings::default(), &mut settled, now)
     }
 
     fn titles(notices: &[Notice]) -> Vec<&str> {
@@ -339,7 +417,7 @@ mod tests {
     fn notifies_wakes_and_reports_a_wait_once() {
         let (_tmp, itm, seen) = world();
         let mut notified = Notified::new();
-        let notices = itm.poll_once(&mut notified, &seen, NOW).unwrap();
+        let notices = pass(&itm, &mut notified, &seen, NOW).unwrap();
         assert_eq!(titles(&notices), ["Needs input · A", "Task back · C", "Woke · Needs input · B"]);
         assert_eq!(notices.iter().find(|n| n.task == "task-a").unwrap().body, "claude: p1");
         assert!(states(&itm).iter().all(|(_, s)| *s == State::Active));
@@ -347,28 +425,28 @@ mod tests {
         assert_eq!((status.waiting("task-a"), status.waiting("default")), (1, 0));
         assert_eq!(notified.keys().collect::<Vec<_>>(), ["task-a|p1|7", "task-b|p3|1"]);
 
-        assert_eq!(itm.poll_once(&mut notified, &seen, NOW + 2).unwrap(), []);
+        assert_eq!(pass(&itm, &mut notified, &seen, NOW + 2).unwrap(), []);
     }
 
     #[test]
     fn a_wait_is_reported_again_after_the_agent_unblocked() {
         let (_tmp, itm, mut seen) = world();
         let mut notified = Notified::new();
-        itm.poll_once(&mut notified, &seen, NOW).unwrap();
+        pass(&itm, &mut notified, &seen, NOW).unwrap();
         let blocked = seen.agents.insert("task-a".into(), Some(vec![])).unwrap();
-        itm.poll_once(&mut notified, &seen, NOW + 2).unwrap();
+        pass(&itm, &mut notified, &seen, NOW + 2).unwrap();
         assert!(!notified.keys().any(|k| k.starts_with("task-a|")));
         seen.agents.insert("task-a".into(), blocked);
-        assert_eq!(titles(&itm.poll_once(&mut notified, &seen, NOW + 4).unwrap()), ["Needs input · A"]);
+        assert_eq!(titles(&pass(&itm, &mut notified, &seen, NOW + 4).unwrap()), ["Needs input · A"]);
     }
 
     #[test]
     fn a_session_that_did_not_answer_keeps_its_waits() {
         let (_tmp, itm, mut seen) = world();
         let mut notified = Notified::new();
-        itm.poll_once(&mut notified, &seen, NOW).unwrap();
+        pass(&itm, &mut notified, &seen, NOW).unwrap();
         seen.agents.insert("task-a".into(), None);
-        itm.poll_once(&mut notified, &seen, NOW + 2).unwrap();
+        pass(&itm, &mut notified, &seen, NOW + 2).unwrap();
         assert!(notified.contains_key("task-a|p1|7"));
     }
 
@@ -377,7 +455,7 @@ mod tests {
         let (_tmp, itm, seen) = world();
         fs::write(itm.paths.tasks_file(), "{broken").unwrap();
         let mut notified = Notified::new();
-        assert!(itm.poll_once(&mut notified, &seen, NOW).is_err());
+        assert!(pass(&itm, &mut notified, &seen, NOW).is_err());
         assert!(notified.is_empty());
     }
 
@@ -385,7 +463,7 @@ mod tests {
     fn an_attached_session_is_left_to_herdr() {
         let (_tmp, itm, mut seen) = world();
         seen.attached.insert("task-a".into());
-        let notices = itm.poll_once(&mut Notified::new(), &seen, NOW).unwrap();
+        let notices = pass(&itm, &mut Notified::new(), &seen, NOW).unwrap();
         assert!(!titles(&notices).contains(&"Needs input · A"));
     }
 
@@ -393,8 +471,8 @@ mod tests {
     fn the_status_records_when_a_wait_started() {
         let (_tmp, itm, seen) = world();
         let mut notified = Notified::new();
-        itm.poll_once(&mut notified, &seen, NOW).unwrap();
-        itm.poll_once(&mut notified, &seen, NOW + 300).unwrap();
+        pass(&itm, &mut notified, &seen, NOW).unwrap();
+        pass(&itm, &mut notified, &seen, NOW + 300).unwrap();
         let status = Status::read(&itm.paths.status_file().unwrap(), NOW + 300);
         assert_eq!(status.waiting_since("task-a", NOW + 300), Some(NOW));
         assert!(!Status::read(&itm.paths.status_file().unwrap(), NOW + 300 + 16).fresh);
@@ -412,13 +490,13 @@ mod tests {
             })
             .unwrap();
         let mut notified = Notified::new();
-        itm.poll_once(&mut notified, &seen, NOW).unwrap();
+        pass(&itm, &mut notified, &seen, NOW).unwrap();
         let tasks = itm.store().load().unwrap().tasks;
         assert_eq!((tasks["task-b"].state, tasks["task-c"].state), (State::Active, State::Snoozed));
 
         seen.sessions.get_mut("task-c").unwrap().running = false;
         seen.agents.remove("task-c");
-        let notices = itm.poll_once(&mut notified, &seen, NOW + 2).unwrap();
+        let notices = pass(&itm, &mut notified, &seen, NOW + 2).unwrap();
         assert_eq!(titles(&notices), ["Task back · C"]);
     }
 
@@ -426,9 +504,9 @@ mod tests {
     fn until_an_agent_wakes_on_a_wait_already_reported() {
         let (_tmp, itm, seen) = world();
         let mut notified = Notified::new();
-        itm.poll_once(&mut notified, &seen, NOW).unwrap(); // task-a's wait is now reported
+        pass(&itm, &mut notified, &seen, NOW).unwrap(); // task-a's wait is now reported
         itm.store().edit(|data| data.tasks.get_mut("task-a").unwrap().snooze(Until::Agent, NOW)).unwrap();
-        let notices = itm.poll_once(&mut notified, &seen, NOW + 2).unwrap();
+        let notices = pass(&itm, &mut notified, &seen, NOW + 2).unwrap();
         assert_eq!(titles(&notices), ["Woke · Needs input · A"]);
     }
 
@@ -443,7 +521,7 @@ mod tests {
             .unwrap();
         let session = Session { name: "task-new".into(), running: false, socket: "/s".into() };
         seen.sessions.insert("task-new".into(), session);
-        let notices = itm.poll_once(&mut Notified::new(), &seen, NOW).unwrap();
+        let notices = pass(&itm, &mut Notified::new(), &seen, NOW).unwrap();
         assert!(!titles(&notices).contains(&"Needs input · A"));
         assert_eq!(itm.store().load().unwrap().tasks["task-new"].title, "new");
     }
@@ -471,6 +549,225 @@ mod tests {
             logged[0].starts_with("poll failed: the pass panicked at src/daemon.rs:") && logged[0].ends_with("boom")
         );
         assert_eq!(logged[1], "poll failed: herdr not found");
+    }
+
+    // ------------------------------------------------------------ projects follow workspaces (R10.3)
+
+    use crate::config::Setting;
+    use crate::projects::tests::folder;
+    use crate::store::ProjectKind;
+    use std::path::Path;
+
+    /// Projects api (~/code/api) and web (~/code/web), and the task Run with
+    /// its session running and no projects; what Herdr shows of it has no
+    /// agents and no workspaces yet.
+    fn running() -> (tempfile::TempDir, Itm, [String; 2], Observation) {
+        let (tmp, itm) = itm();
+        let ids = ["api", "web"].map(|name| {
+            itm.add_project(ProjectKind::Dir, &folder(&itm, &format!("code/{name}")).to_string_lossy(), None).unwrap()
+        });
+        itm.create_task("Run", None, &[], None).unwrap();
+        let session = Session { name: "task-run".into(), running: true, socket: "/s".into() };
+        let seen = Observation {
+            sessions: [("task-run".to_string(), session)].into(),
+            agents: [("task-run".to_string(), Some(vec![]))].into(),
+            workspaces: BTreeMap::new(),
+            attached: BTreeSet::new(),
+        };
+        (tmp, itm, ids, seen)
+    }
+
+    /// Unnamed workspaces in these folders (None: Herdr does not report it), in order.
+    fn open_in(seen: &mut Observation, folders: &[Option<&Path>]) {
+        let workspace = |(i, folder): (usize, &Option<&Path>)| Workspace {
+            id: format!("w{i}"),
+            label: String::new(),
+            focused: i == 0,
+            folder: folder.map(Path::to_path_buf),
+        };
+        seen.workspaces.insert("task-run".into(), folders.iter().enumerate().map(workspace).collect());
+    }
+
+    fn projects_of(itm: &Itm) -> Vec<String> {
+        itm.store().load().unwrap().tasks["task-run"].projects.clone()
+    }
+
+    /// R10.3: the daemon adds the projects a running task's workspaces are
+    /// in, and removes them once their workspace closed; a session without
+    /// workspaces (starting) changes nothing; an archived task is left alone.
+    #[test]
+    fn r10_3_the_daemon_follows_workspaces() {
+        let (_tmp, itm, [api, web], mut seen) = running();
+        itm.edit_task("task-run", &crate::tasks::Edit { add: vec![api.clone()], ..Default::default() }).unwrap();
+        let (code_api, web_src) = (folder(&itm, "code/api"), folder(&itm, "code/web/src"));
+        let mut settled = BTreeSet::new();
+        let mut pass = |seen: &Observation, settings: &Settings| {
+            itm.poll_once(&mut Notified::new(), seen, settings, &mut settled, NOW).unwrap();
+        };
+        open_in(&mut seen, &[Some(&code_api), Some(&web_src)]);
+        pass(&seen, &Settings::default());
+        assert_eq!(projects_of(&itm), [api.clone(), web.clone()]);
+        let task = itm.store().load().unwrap().tasks["task-run"].clone();
+        assert_eq!((task.found_projects, task.workspace_projects), (vec![web.clone()], vec![api.clone(), web.clone()]));
+        seen.workspaces.clear(); // starting or restoring: nothing to follow yet
+        pass(&seen, &Settings::default());
+        assert_eq!(projects_of(&itm), [api.clone(), web.clone()]);
+        open_in(&mut seen, &[Some(&code_api)]);
+        pass(&seen, &Settings::default()); // the session was not read on the pass before: only adds
+        assert_eq!(projects_of(&itm), [api.clone(), web.clone()]);
+        pass(&seen, &Settings::default());
+        assert_eq!(projects_of(&itm), std::slice::from_ref(&api), "web's workspace closed");
+        // Off: nothing changes, and no record is kept.
+        open_in(&mut seen, &[Some(&folder(&itm, "code/web"))]);
+        let off = Settings { projects_from_workspaces: false, ..Settings::default() };
+        seen.workspaces.clear(); // observe reads none while off
+        pass(&seen, &off);
+        let task = itm.store().load().unwrap().tasks["task-run"].clone();
+        assert_eq!((task.projects, task.workspace_projects), (vec![api.clone()], vec![]));
+        // An archived task is left alone.
+        itm.store()
+            .edit(|data| {
+                data.tasks.get_mut("task-run").unwrap().archive(NOW);
+                Ok(())
+            })
+            .unwrap();
+        open_in(&mut seen, &[Some(&folder(&itm, "code/web"))]);
+        pass(&seen, &Settings::default());
+        pass(&seen, &Settings::default());
+        assert_eq!(projects_of(&itm), [api]);
+    }
+
+    /// R10.3: a workspace whose folder Herdr does not report, or a daemon
+    /// that just started, never removes anything on that pass.
+    #[test]
+    fn r10_3_untrusted_passes_only_add() {
+        let (_tmp, itm, [api, web], mut seen) = running();
+        let (code_api, code_web) = (folder(&itm, "code/api"), folder(&itm, "code/web"));
+        let mut settled = BTreeSet::new();
+        let pass = |seen: &Observation, settled: &mut BTreeSet<String>| {
+            itm.poll_once(&mut Notified::new(), seen, &Settings::default(), settled, NOW).unwrap();
+        };
+        open_in(&mut seen, &[Some(&code_api), Some(&code_web)]);
+        pass(&seen, &mut settled);
+        assert_eq!(settled, BTreeSet::from(["task-run".to_string()]));
+        open_in(&mut seen, &[Some(&code_api), None]); // web's folder unknown
+        pass(&seen, &mut settled);
+        assert_eq!(projects_of(&itm), [api.clone(), web.clone()]);
+        open_in(&mut seen, &[Some(&code_api)]);
+        pass(&seen, &mut BTreeSet::new()); // a daemon that just started has not read the session before
+        assert_eq!(projects_of(&itm), [api.clone(), web.clone()]);
+        pass(&seen, &mut settled);
+        assert_eq!(projects_of(&itm), [api]);
+    }
+
+    /// R10.3: the record of open workspaces holds only while the daemon
+    /// reads the session: a stopped session's goes, as does every one while
+    /// sync is off; archiving drops it at once.
+    #[test]
+    fn r10_3_the_record_of_open_workspaces_ends_with_the_session() {
+        let (_tmp, itm, [api, web], mut seen) = running();
+        itm.create_task("Other", None, &[], None).unwrap();
+        itm.store()
+            .edit(|data| {
+                for (name, id) in [("task-run", &api), ("task-other", &web)] {
+                    let task = data.tasks.get_mut(name).unwrap();
+                    (task.projects, task.workspace_projects) = (vec![id.clone()], vec![id.clone()]);
+                }
+                Ok(())
+            })
+            .unwrap();
+        seen.sessions.get_mut("task-run").unwrap().running = false;
+        seen.agents.clear();
+        pass(&itm, &mut Notified::new(), &seen, NOW).unwrap();
+        let tasks = itm.store().load().unwrap().tasks;
+        assert!(tasks["task-run"].workspace_projects.is_empty(), "stopped");
+        assert!(tasks["task-other"].workspace_projects.is_empty(), "never started");
+        assert_eq!(tasks["task-run"].projects, [api], "the projects stay");
+    }
+
+    /// R10.2: only saved projects are added; a removed project's folder is in none.
+    #[test]
+    fn r10_3_only_saved_projects_are_added() {
+        let (_tmp, itm, [api, _], mut seen) = running();
+        open_in(&mut seen, &[Some(&folder(&itm, "code/api"))]);
+        itm.remove_project(&api, crate::projects::CloneChoice::Keep).unwrap();
+        pass(&itm, &mut Notified::new(), &seen, NOW).unwrap();
+        assert!(projects_of(&itm).is_empty());
+    }
+
+    /// R10.2, R10.3: a linked worktree's workspace brings its checkout's project.
+    #[test]
+    fn r10_3_a_worktree_brings_its_checkouts_project() {
+        let (_tmp, itm, _, mut seen) = running();
+        let git = |dir: &Path, args: &[&str]| {
+            let ok = Command::new("git")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .args(["-c", "user.name=t", "-c", "user.email=t@t", "-C"])
+                .arg(dir)
+                .args(args)
+                .output()
+                .unwrap()
+                .status
+                .success();
+            assert!(ok, "git {args:?}");
+        };
+        let lib = folder(&itm, "src/lib");
+        git(&lib, &["init", "-q"]);
+        git(&lib, &["commit", "-q", "--allow-empty", "-m", "init"]);
+        let id = itm.add_project(ProjectKind::Dir, &lib.to_string_lossy(), None).unwrap();
+        let tree = itm.paths.home.join("worktrees/fix");
+        git(&lib, &["worktree", "add", "-q", &tree.to_string_lossy(), "-b", "fix"]);
+        open_in(&mut seen, &[Some(&tree)]);
+        pass(&itm, &mut Notified::new(), &seen, NOW).unwrap();
+        assert_eq!(projects_of(&itm), [id]);
+    }
+
+    /// R10.3: observe reads each running task session's workspaces only
+    /// while projects follow workspaces, and leaves out a session with none.
+    #[test]
+    fn r10_3_observe_reads_workspaces_while_following() {
+        let (_tmp, itm) = itm();
+        let layout = |label: &str| {
+            json!({"snapshot": {"agents": [{"agent": "claude", "agent_status": "working"}],
+                "workspaces": [{"workspace_id": "w1", "label": label, "focused": true}],
+                "tabs": [{"tab_id": "w1:t1", "workspace_id": "w1"}],
+                "layouts": [{"tab_id": "w1:t1", "panes": [{"pane_id": "w1:p1"}]}],
+                "panes": [{"pane_id": "w1:p1", "cwd": "/code/api"}]}})
+        };
+        let starting = json!({"snapshot": {"agents": [], "workspaces": [], "tabs": [], "layouts": [], "panes": []}});
+        crate::herdr::fake::serve(&itm.paths.herdr_config, "task-a", move |_, _| layout("api"));
+        crate::herdr::fake::serve(&itm.paths.herdr_config, "task-b", move |_, _| starting.clone());
+        crate::herdr::fake::serve(&itm.paths.herdr_config, "other", |_, _| json!({}));
+        let seen = itm.observe(true).unwrap();
+        assert_eq!(seen.workspaces.keys().collect::<Vec<_>>(), ["task-a"]);
+        assert_eq!(seen.workspaces["task-a"][0].folder.as_deref(), Some(Path::new("/code/api")));
+        assert_eq!(seen.agents["task-a"].as_ref().unwrap().len(), 1);
+        assert!(seen.agents.contains_key("task-b") && !seen.agents.contains_key("other"));
+        assert!(itm.observe(false).unwrap().workspaces.is_empty());
+    }
+
+    /// R10.4: a broken settings file never stops the daemon: it is logged
+    /// once while it stays the same, and the pass does not follow workspaces.
+    #[test]
+    fn r10_4_the_daemon_goes_on_with_a_broken_file() {
+        let (_tmp, itm) = itm();
+        fs::create_dir_all(&itm.paths.config).unwrap();
+        fs::write(itm.paths.config_file(), "[herdr\n").unwrap();
+        let (mut last, mut logged) = (None, vec![]);
+        for _ in 0..3 {
+            let settings = itm.pass_settings(&mut last, |line| logged.push(line.to_string()));
+            assert!(!settings.projects_from_workspaces);
+        }
+        assert_eq!(logged.len(), 1, "{logged:?}");
+        assert!(logged[0].starts_with("settings ignored: ") && logged[0].contains("is not valid TOML"), "{logged:?}");
+        itm.change_setting(Setting::RemoveProjectsWithoutWorkspace, false).unwrap_err(); // refused: broken
+        fs::write(itm.paths.config_file(), "[herdr]\nremove_projects_without_workspace = false\n").unwrap();
+        let fixed = itm.pass_settings(&mut last, |line| logged.push(line.to_string()));
+        assert!(fixed.projects_from_workspaces && !fixed.remove_projects_without_workspace);
+        fs::write(itm.paths.config_file(), "[herdr\n").unwrap();
+        itm.pass_settings(&mut last, |line| logged.push(line.to_string()));
+        assert_eq!(logged.len(), 2, "broken again: said again");
     }
 
     #[test]

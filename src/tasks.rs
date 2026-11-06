@@ -84,6 +84,39 @@ impl Task {
     }
 }
 
+impl Task {
+    /// Workspace sync (R10.3): add the projects the running session's
+    /// workspaces are in (`open`), and (`remove`) drop the ones whose
+    /// workspace closed. Only a project this sync added (`found_projects`)
+    /// is removed, and only once its workspace was open on an earlier pass
+    /// (`workspace_projects`) and is gone now: one being opened is not
+    /// removed. A pass that cannot be trusted (a session just started or
+    /// restored, a daemon just started, a workspace whose folder is unknown)
+    /// only adds, and keeps the record of what was open, so a workspace
+    /// that closed meanwhile is noticed on the next trusted pass.
+    pub fn sync_projects(&mut self, open: &[String], remove: bool, trusted: bool) {
+        let closed = |id: &String| {
+            remove
+                && trusted
+                && self.found_projects.contains(id)
+                && self.workspace_projects.contains(id)
+                && !open.contains(id)
+        };
+        let kept: Vec<String> = self.projects.iter().filter(|id| !closed(id)).cloned().collect();
+        let new: Vec<String> = open.iter().filter(|id| !kept.contains(id)).cloned().collect();
+        let found = kept.iter().filter(|id| self.found_projects.contains(id)).chain(&new).cloned().collect();
+        let mut record = open.to_vec();
+        if !trusted {
+            record.extend(self.workspace_projects.iter().filter(|id| !open.contains(id)).cloned());
+        }
+        self.set_projects(kept.into_iter().chain(new).collect(), Some(found));
+        record.retain(|id| self.projects.contains(id));
+        let mut seen = BTreeSet::new();
+        record.retain(|id| seen.insert(id.clone()));
+        self.workspace_projects = record;
+    }
+}
+
 /// A change to a task by hand (R5.4): `itm edit`, and later the form.
 #[derive(Debug, Clone, Default)]
 pub struct Edit {
@@ -97,6 +130,12 @@ pub struct Edit {
     pub remove: Vec<String>,
     /// Ids to put first, in this order (the form keeps the order of its projects).
     pub order: Vec<String>,
+    /// The projects added are found in a workspace (R10.1): the workspace
+    /// hotkey while projects follow workspaces; closing it removes them.
+    pub found: bool,
+    /// The project has a workspace in the session already (the workspace
+    /// hotkey): none is opened for it.
+    pub has_workspace: bool,
 }
 
 /// What an edit changed.
@@ -186,7 +225,9 @@ pub fn edit_task(data: &mut Data, session: &str, edit: &Edit, keep_open: bool, n
     }
     let added: Vec<String> = wanted.iter().filter(|id| !current.contains(id)).cloned().collect();
     let removed: Vec<String> = current.iter().filter(|id| !wanted.contains(id)).cloned().collect();
-    let found = task.found_projects.iter().filter(|id| !claimed.contains(id)).cloned().collect();
+    // Projects named here are the user's, unless they are found in a workspace.
+    let previously = task.found_projects.iter().filter(|id| edit.found || !claimed.contains(id));
+    let found = previously.chain(added.iter().filter(|_| edit.found)).cloned().collect();
     task.set_projects(wanted, Some(found));
     let label =
         |projects: &BTreeMap<String, Project>, id: &String| projects.get(id).map_or(id.clone(), |p| p.name.clone());
@@ -337,6 +378,52 @@ pub fn inbox_order(status: &Status, name: &str, task: &Task) -> (bool, u8, i64) 
 mod tests {
     use super::*;
     use crate::status::{AgentState, AgentStatus, SessionStatus};
+
+    fn ids(names: &[&str]) -> Vec<String> {
+        names.iter().map(|n| n.to_string()).collect()
+    }
+
+    /// R10.1, R10.3: projects found in workspaces come and go with them; one added by hand stays.
+    #[test]
+    fn r10_3_found_projects_come_and_go_with_their_workspaces() {
+        let mut task = Task::new("T", 1);
+        task.projects = ids(&["api"]); // by hand
+        task.sync_projects(&ids(&["api", "web"]), true, true);
+        assert_eq!((&task.projects, &task.found_projects), (&ids(&["api", "web"]), &ids(&["web"])));
+        assert_eq!(task.workspace_projects, ids(&["api", "web"]));
+        task.sync_projects(&ids(&["api"]), true, true); // web's workspace closed
+        assert_eq!((&task.projects, &task.found_projects), (&ids(&["api"]), &vec![]));
+        task.sync_projects(&[], true, true); // api was added by hand: it stays
+        assert_eq!((&task.projects, &task.workspace_projects), (&ids(&["api"]), &vec![]));
+    }
+
+    /// R10.3: with "remove a project when its workspace closes" off, projects are only added.
+    #[test]
+    fn r10_3_without_removal_projects_are_only_added() {
+        let mut task = Task::new("T", 1);
+        task.sync_projects(&ids(&["web"]), false, true);
+        task.sync_projects(&[], false, true);
+        assert_eq!(task.projects, ids(&["web"]));
+    }
+
+    /// R10.3: a project never seen open (a daemon restarted with the session
+    /// rebuilt) is not removed, and an untrusted pass only adds, keeping the record.
+    #[test]
+    fn r10_3_untrusted_and_unseen_never_remove() {
+        let mut task = Task::new("T", 1);
+        task.sync_projects(&ids(&["web"]), true, true);
+        task.workspace_projects.clear();
+        task.sync_projects(&[], true, true);
+        assert_eq!(task.projects, ids(&["web"]), "never seen closing: kept");
+
+        let mut task = Task::new("T", 1);
+        task.sync_projects(&ids(&["api", "web"]), true, true);
+        task.sync_projects(&ids(&["api"]), true, false);
+        assert_eq!(task.projects, ids(&["api", "web"]), "an untrusted pass only adds");
+        assert_eq!(task.workspace_projects, ids(&["api", "web"]), "and keeps what was open");
+        task.sync_projects(&ids(&["api"]), true, true);
+        assert_eq!(task.projects, ids(&["api"]), "the next trusted pass notices");
+    }
 
     fn data() -> Data {
         let mut data = Data::default();

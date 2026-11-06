@@ -304,7 +304,12 @@ Verified against Herdr 0.9.3. Re-check them after a Herdr upgrade.
   An untrusted pass only adds and keeps the record, so a workspace that
   closed meanwhile is noticed on the next trusted pass. A session with no
   workspaces at all is skipped. Archived tasks are left alone. The sync
-  writes no notes (the daemon never does).
+  writes no notes (the daemon never does). The Rust daemon asks each
+  running task session once per pass, `session.snapshot`, which has the
+  agents and the workspaces' tabs, layouts and panes (`observe`); the
+  matching runs before the store lock is taken, with the projects' folders
+  resolved once per pass (`project_roots`), and `Task::sync_projects` is
+  `sync_task_projects`.
 - `workspace_projects` is only true while the daemon reads the session: the
   daemon drops it for a task whose session is not running, and for every
   task while sync is off; archiving drops it at once. Unnamed workspaces
@@ -424,6 +429,16 @@ Verified against Herdr 0.9.3. Re-check them after a Herdr upgrade.
   keeps everything else, and checks that the result parses with the new
   value before writing (atomically). A file it cannot follow (dotted keys,
   inline tables) is refused with "edit it by hand" and left unchanged.
+  The Rust itm (`config.rs`, `change_setting`) edits the TOML document
+  instead (toml_edit): comments stay, the one after the changed value too
+  (its decor is copied onto the new value), a new key goes after the last
+  one of its table, and a missing `[herdr]` table goes after the file's
+  comments and one blank line, as the Python itm writes it. It follows
+  quoted keys, dotted keys and inline tables, which Python refuses. It
+  still checks that the result reads back with the new value, and refuses
+  with "edit it by hand" otherwise (a file with a mistake in it, a key that
+  is a table). A TOML syntax error is said on one line ("… is not valid
+  TOML: <what> (at line L, column C)").
 - A broken file (also one that is not UTF-8) never stops the daemon: it
   logs it once and runs without workspace sync (the safe choice: nothing is
   added or removed) until the file is fixed. Everything else treats it as
@@ -743,6 +758,12 @@ The switcher and its dialogs follow these principles.
   - unicode-normalization: `slugify` like Python's `unicodedata` (NFKD, then
     drop combining marks);
   - shlex: `$ITM_NOTIFY_COMMAND` and `$EDITOR` split like `shlex.split`;
+  - toml_edit (`parse` and `display` only): `config.toml` (R10.4), read and
+    changed as a document, so a toggle keeps the user's comments and
+    layout; one front end for both, where serde with `toml` would read and
+    still need toml_edit to write. Its own dependencies are pinned in
+    `Cargo.lock` to releases at least two weeks old (winnow 1.0.4,
+    toml_writer 1.1.3, toml_datetime 1.1.2), not the newest;
   - insta (tests only): screen snapshots on ratatui's `TestBackend`.
 - **The switcher in Rust** keeps the Textual rules' intent in its own terms:
   - The app (`tui/app.rs`) holds state and turns keys into actions with no
@@ -769,8 +790,21 @@ The switcher and its dialogs follow these principles.
     clock.
   - `itm snooze` without a time (R4.1) runs the snooze screen alone; Esc
     is `cancelled` (exit 1, and no delay in a popup). So do `itm delete`'s
-    question (no is exit 1 and says nothing, like the Python itm) and `itm
-    project remove`'s clone dialog.
+    question (no is exit 1 and says nothing, like the Python itm), `itm
+    project remove`'s clone dialog, and `itm project add-workspace`'s add
+    dialog and folder question (R10.5).
+  - A screen that has work done and stays open (the Settings screen saving
+    a toggle, the add dialog saving a project) returns `Outcome::Act`; the
+    result comes back to it in `Screen::done`. In the switcher the work
+    runs in a worker like any job; a screen run alone has it done right
+    there, since nothing else is on the screen. The add dialog checks what
+    was typed when Enter is pressed (Python checks while typing), and a
+    problem with the name puts the cursor on the name (`Error::
+    is_about_the_name`, R8.5).
+  - The Settings screen (Ctrl+S, R10.4) shows the settings each refresh
+    read (`Snapshot.settings`, so a file fixed meanwhile shows), saves one
+    toggle at a time in a worker, and shows a file with a mistake, with
+    nothing to toggle, or why a save failed.
   - The editor for notes (Ctrl+O) is the one blocking call on the loop's
     thread: the terminal is given back first (`Events::suspended`: raw mode
     off, main screen), taken back after, and drawn again in full; nothing
@@ -793,7 +827,9 @@ The switcher and its dialogs follow these principles.
   `poll_once` decides and records), `status.rs`, `projects.rs`, `notes.rs`,
   `system.rs` (what differs between operating systems), `paths.rs`,
   `times.rs`, `error.rs`, `git.rs` (URL normalization, `insteadOf`, checkouts,
-  local work, the clone) and `tui/` (`app.rs` state and keys without I/O,
+  local work, the clone, the repository a folder is in), `config.rs` (the
+  settings), `workspaces.rs` (which project a workspace is in, and `itm
+  project add-workspace`) and `tui/` (`app.rs` state and keys without I/O,
   `screen.rs` the screens over the list, `draw.rs` rendering, `mod.rs` the
   event loop and its workers). Tests sit
   next to the code; `tests/switching.rs` runs the switching protocol with

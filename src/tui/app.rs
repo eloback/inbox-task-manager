@@ -14,7 +14,8 @@ use ratatui::widgets::ListState;
 use tui_input::Input;
 use tui_input::backend::crossterm::EventHandler;
 
-use super::screen::{Context, Outcome, Screen, SnoozeDialog};
+use super::screen::{Context, Outcome, Screen, SettingsScreen, SnoozeDialog};
+use crate::config::{Setting, Settings};
 use crate::error::Error;
 use crate::herdr::Sessions;
 use crate::itm::Itm;
@@ -22,7 +23,7 @@ use crate::paths::Paths;
 use crate::projects::CloneChoice;
 use crate::snooze::{self, Until};
 use crate::status::Status;
-use crate::store::{Data, State, Task};
+use crate::store::{Data, ProjectKind, State, Task};
 use crate::tasks::inbox_order;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -56,7 +57,7 @@ impl View {
 }
 
 /// Everything the switcher shows, loaded in one go by a worker.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct Snapshot {
     pub data: Data,
     pub sessions: Sessions,
@@ -72,6 +73,24 @@ pub struct Snapshot {
     pub missing: BTreeSet<String>,
     /// The end of each task's notes (R9.5), by session.
     pub notes: BTreeMap<String, NotesTail>,
+    /// The settings (R10.4), or why `config.toml` could not be read.
+    pub settings: Result<Settings, String>,
+}
+
+impl Default for Snapshot {
+    fn default() -> Snapshot {
+        Snapshot {
+            data: Data::default(),
+            sessions: Sessions::default(),
+            status: Status::default(),
+            current: None,
+            switch_problem: None,
+            listed: false,
+            missing: BTreeSet::new(),
+            notes: BTreeMap::new(),
+            settings: Ok(Settings::default()),
+        }
+    }
 }
 
 /// When a task's notes last changed (epoch second) and their last lines.
@@ -106,12 +125,42 @@ impl Moment {
 /// Blocking work for a worker thread (Herdr calls, the store lock, hand-offs).
 #[derive(Debug, Clone, PartialEq)]
 pub enum Job {
-    Wake { session: String, title: String },
-    Archive { session: String, title: String },
-    Delete { session: String, title: String },
-    Create { title: String },
-    Snooze { session: String, title: String, until: Until },
-    RemoveProject { id: String, name: String, choice: CloneChoice },
+    Wake {
+        session: String,
+        title: String,
+    },
+    Archive {
+        session: String,
+        title: String,
+    },
+    Delete {
+        session: String,
+        title: String,
+    },
+    Create {
+        title: String,
+    },
+    Snooze {
+        session: String,
+        title: String,
+        until: Until,
+    },
+    RemoveProject {
+        id: String,
+        name: String,
+        choice: CloneChoice,
+    },
+    /// Save a project; done, it is the project's id.
+    AddProject {
+        kind: ProjectKind,
+        source: String,
+        name: Option<String>,
+    },
+    /// Change a setting in `config.toml` (R10.4).
+    Setting {
+        setting: Setting,
+        on: bool,
+    },
 }
 
 #[derive(Debug, PartialEq)]
@@ -123,6 +172,10 @@ pub enum Action {
     Run(Job),
     /// Open this task's notes in the editor, which gets the terminal meanwhile (R9.4).
     Notes(String),
+    /// A question asked alone was answered yes or no.
+    Answer(bool),
+    /// A project was saved (its id); what opened the add dialog takes it.
+    ProjectAdded(String),
 }
 
 pub struct Message {
@@ -195,6 +248,11 @@ impl App {
     pub fn loaded(&mut self, snapshot: Result<Snapshot, Error>) {
         match snapshot {
             Ok(snapshot) => {
+                for screen in &mut self.screens {
+                    if let Screen::Settings(settings) = screen {
+                        settings.reread(&snapshot.settings);
+                    }
+                }
                 self.snapshot = Some(snapshot);
                 self.rebuild();
             }
@@ -248,6 +306,7 @@ impl App {
                     self.screens.pop();
                     return action;
                 }
+                Outcome::Act(action) => return action,
             }
             return Action::None;
         }
@@ -268,6 +327,7 @@ impl App {
             KeyCode::Char('u') if ctrl => return self.wake(),
             KeyCode::Char('a') if ctrl => return self.archive(),
             KeyCode::Char('d') if ctrl => self.delete(),
+            KeyCode::Char('s') if ctrl => self.open_settings(),
             KeyCode::Char('o') if ctrl => {
                 return self.highlighted_task().map_or(Action::None, |(s, _)| Action::Notes(s));
             }
@@ -363,11 +423,30 @@ impl App {
         }
     }
 
+    /// Ctrl+S: the settings (R10.4), as the last refresh read them.
+    fn open_settings(&mut self) {
+        let settings = self.snapshot.as_ref().map_or(Ok(Settings::default()), |s| s.settings.clone());
+        let file = self.paths.display(&self.paths.config_file());
+        self.screens.push(Screen::Settings(SettingsScreen::new(settings, file)));
+    }
+
     /// A job finished in its worker.
     pub fn done(&mut self, job: Job, result: Result<String, Error>) -> Action {
         let current = self.snapshot.as_ref().and_then(|s| s.current.clone());
         let problem = self.snapshot.as_ref().and_then(|s| s.switch_problem.clone());
         match (job, result) {
+            // The screen that asked for it says how it went.
+            (job @ (Job::AddProject { .. } | Job::Setting { .. }), result) => {
+                let Some(top) = self.screens.last_mut() else { return Action::None };
+                match top.done(&job, result) {
+                    Outcome::Stay | Outcome::Act(_) => {}
+                    Outcome::Close => drop(self.screens.pop()),
+                    Outcome::CloseAnd(action) => {
+                        self.screens.pop();
+                        return action;
+                    }
+                }
+            }
             (_, Err(e)) => self.flash(e.to_string(), true),
             (Job::Wake { title, .. }, Ok(_)) => self.flash(format!("“{title}” is active."), false),
             (Job::Archive { session, title }, Ok(_)) => {
@@ -673,6 +752,47 @@ pub mod tests {
         assert_eq!(app.message.as_ref().map(|m| m.text.as_str()), Some("Deleted “Fix login”."));
         let here = Job::Delete { session: "task-write-docs".into(), title: "Write docs".into() };
         assert_eq!(app.done(here, Ok(String::new())), Action::Quit);
+    }
+
+    /// R10.4: Ctrl+S opens the settings; a toggle saves one at a time, and
+    /// says when it was not saved. A file with a mistake toggles nothing.
+    #[test]
+    fn r10_4_ctrl_s_toggles_the_settings_one_at_a_time() {
+        use crate::config::Setting::{ProjectsFromWorkspaces, RemoveProjectsWithoutWorkspace};
+        use crate::tui::screen::SettingsScreen;
+        let mut app = app(snapshot());
+        assert_eq!(app.on_key(ctrl('s')), Action::None);
+        let shown = |app: &App| match &app.screens[..] {
+            [Screen::Settings(screen)] => screen.clone(),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(shown(&app).file, "/r/config/inbox-task-manager/config.toml");
+        app.on_key(key(KeyCode::Down));
+        let off = Job::Setting { setting: RemoveProjectsWithoutWorkspace, on: false };
+        assert_eq!(app.on_key(key(KeyCode::Char(' '))), Action::Run(off.clone()));
+        assert_eq!(app.on_key(key(KeyCode::Enter)), Action::None, "one save at a time");
+        app.loaded(Ok(snapshot())); // a refresh while saving keeps what is being saved
+        assert!(shown(&app).saving);
+        assert_eq!(app.done(off, Ok(String::new())), Action::None);
+        let screen: SettingsScreen = shown(&app);
+        assert_eq!((screen.saving, screen.settings.unwrap().remove_projects_without_workspace), (false, false));
+        let on = Job::Setting { setting: RemoveProjectsWithoutWorkspace, on: true };
+        assert_eq!(app.on_key(key(KeyCode::Enter)), Action::Run(on.clone()));
+        app.done(on, Err(Error::Other("cannot write ~/c.toml: Permission denied".into())));
+        assert_eq!(shown(&app).failed.as_deref(), Some("cannot write ~/c.toml: Permission denied"));
+        app.on_key(ctrl('k'));
+        let first = Job::Setting { setting: ProjectsFromWorkspaces, on: false };
+        assert_eq!(app.on_key(key(KeyCode::Enter)), Action::Run(first));
+
+        let mut broken = snapshot();
+        broken.settings = Err("~/c.toml: unknown setting herdr.nope".into());
+        let mut app = super::tests::app(broken.clone());
+        app.on_key(ctrl('s'));
+        assert_eq!(app.on_key(key(KeyCode::Enter)), Action::None, "nothing toggles until the file is fixed");
+        app.loaded(Ok(snapshot())); // fixed meanwhile
+        assert!(matches!(app.on_key(key(KeyCode::Enter)), Action::Run(Job::Setting { .. })));
+        assert_eq!(app.on_key(key(KeyCode::Esc)), Action::None);
+        assert!(app.screens.is_empty(), "Esc closes it, also while it saves");
     }
 
     /// R9.4: Ctrl+O opens the highlighted task's notes, in any view.

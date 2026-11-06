@@ -1,6 +1,7 @@
 //! The switcher (`itm`, `itm ui`): a terminal UI over ratatui, and the
 //! dialogs the CLI opens alone: snooze without a time, the delete question,
-//! what to do with a removed project's clone.
+//! what to do with a removed project's clone, and the workspace hotkey's
+//! add dialog and folder question.
 //!
 //! The event loop waits for a key, a worker's result or a deadline (the
 //! 2 s refresh, a message expiring). Anything that can block (Herdr calls,
@@ -28,7 +29,7 @@ use ratatui::crossterm::event::{self, Event, KeyEvent, KeyEventKind};
 
 pub use app::View;
 use app::{Action, App, Job, Moment, NotesTail, Snapshot};
-use screen::{Context as ScreenContext, Outcome, RemoveDialog, Screen, SnoozeDialog};
+use screen::{AddDialog, Context as ScreenContext, Outcome, RemoveDialog, Screen, SnoozeDialog};
 
 use crate::error::{Context, Error, Result};
 use crate::itm::Itm;
@@ -143,7 +144,9 @@ impl Work for Itm {
                 Some((name.clone(), NotesTail { modified, lines }))
             })
             .collect();
-        Ok(Snapshot { data, sessions, status: self.status(), current, switch_problem, listed, missing, notes })
+        let settings = self.settings().map_err(|e| e.to_string());
+        let status = self.status();
+        Ok(Snapshot { data, sessions, status, current, switch_problem, listed, missing, notes, settings })
     }
 
     fn perform(&self, job: &Job) -> Result<String> {
@@ -160,6 +163,8 @@ impl Work for Itm {
                 });
                 Ok(lines.collect::<Vec<_>>().join("; "))
             }
+            Job::AddProject { kind, source, name } => self.add_project(*kind, source, name.as_deref()),
+            Job::Setting { setting, on } => self.change_setting(*setting, *on).map(|()| String::new()),
         }
     }
 
@@ -186,7 +191,7 @@ pub fn run(itm: &Arc<Itm>, view: View) -> Result<Option<String>> {
 pub fn snooze_dialog(session: &str, title: &str, agent: bool, tz: &TimeZone) -> Result<Option<Until>> {
     let presets = snooze::presets(crate::times::now(), tz, agent);
     let screen = Screen::Snooze(SnoozeDialog::new(session.into(), title.into(), presets));
-    let chosen = in_terminal(|terminal| alone(terminal, screen, tz, &TerminalEvents))?;
+    let chosen = in_terminal(|terminal| alone(terminal, screen, tz, &TerminalEvents, None))?;
     Ok(match chosen {
         Some(Action::Run(Job::Snooze { until, .. })) => Some(until),
         _ => None,
@@ -196,15 +201,37 @@ pub fn snooze_dialog(session: &str, title: &str, agent: bool, tz: &TimeZone) -> 
 /// The delete question alone (`itm delete`, R5.3): whether the user said yes.
 pub fn confirm_delete(session: &str, title: &str) -> Result<bool> {
     let screen = Screen::ConfirmDelete { session: session.into(), title: title.into() };
-    let chosen = in_terminal(|terminal| alone(terminal, screen, &TimeZone::UTC, &TerminalEvents))?;
+    let chosen = in_terminal(|terminal| alone(terminal, screen, &TimeZone::UTC, &TerminalEvents, None))?;
     Ok(matches!(chosen, Some(Action::Run(Job::Delete { .. }))))
+}
+
+/// The workspace hotkey's question (R10.5): whether `project`, which has no
+/// folder, gets `folder`; None when it was closed (nothing changes then).
+pub fn confirm_folder(project: &str, folder: &str) -> Result<Option<bool>> {
+    let screen = Screen::ConfirmFolder { project: project.into(), folder: folder.into() };
+    let chosen = in_terminal(|terminal| alone(terminal, screen, &TimeZone::UTC, &TerminalEvents, None))?;
+    Ok(match chosen {
+        Some(Action::Answer(give)) => Some(give),
+        _ => None,
+    })
+}
+
+/// The add dialog alone, filled with a workspace's folder and name (R10.5):
+/// the id of the project it saved, or None when it was closed.
+pub fn add_folder_dialog(itm: &Itm, folder: &str, name: &str) -> Result<Option<String>> {
+    let screen = Screen::AddProject(AddDialog::folder(folder, name));
+    let chosen = in_terminal(|terminal| alone(terminal, screen, &itm.tz, &TerminalEvents, Some(itm)))?;
+    Ok(match chosen {
+        Some(Action::ProjectAdded(id)) => Some(id),
+        _ => None,
+    })
 }
 
 /// The remove dialog alone (`itm project remove`, R8.7): what to do with
 /// the clone, or None when it was closed (nothing changes then).
 pub fn remove_project_dialog(plan: &RemovalPlan, paths: &crate::paths::Paths) -> Result<Option<CloneChoice>> {
     let screen = Screen::RemoveProject(RemoveDialog::new(plan, paths));
-    let chosen = in_terminal(|terminal| alone(terminal, screen, &TimeZone::UTC, &TerminalEvents))?;
+    let chosen = in_terminal(|terminal| alone(terminal, screen, &TimeZone::UTC, &TerminalEvents, None))?;
     Ok(match chosen {
         Some(Action::Run(Job::RemoveProject { choice, .. })) => Some(choice),
         _ => None,
@@ -282,7 +309,8 @@ fn event_loop<B: Backend>(
             }
         };
         match action {
-            Action::None => {}
+            Action::None | Action::Answer(_) => {}
+            Action::ProjectAdded(_) => reload = true,
             Action::Quit => return Ok(None),
             Action::Switch(session) => return Ok(Some(session)),
             Action::Notes(session) => {
@@ -302,12 +330,15 @@ fn event_loop<B: Backend>(
     }
 }
 
-/// A screen with nothing behind it, until it closes; what it decided.
+/// A screen with nothing behind it, until it closes; what it decided. Work
+/// it asks for while open is done right here, by `work`: nothing else is
+/// on the screen to keep drawing.
 fn alone<B: Backend>(
     terminal: &mut Terminal<B>,
     mut screen: Screen,
     tz: &TimeZone,
     events: &impl Events,
+    work: Option<&dyn Work>,
 ) -> Result<Option<Action>> {
     let (_none, results) = mpsc::channel(); // no workers here
     loop {
@@ -318,8 +349,13 @@ fn alone<B: Backend>(
             Some(Input::Failed(e)) => return Err(e),
             _ => continue,
         };
-        match screen.on_key(key, &ScreenContext { tz, now: events.now().epoch }) {
-            Outcome::Stay => {}
+        let mut outcome = screen.on_key(key, &ScreenContext { tz, now: events.now().epoch });
+        if let Outcome::Act(Action::Run(job)) = &outcome {
+            let result = work.map_or_else(|| Err(unexpected()), |work| work.perform(job));
+            outcome = screen.done(job, result);
+        }
+        match outcome {
+            Outcome::Stay | Outcome::Act(_) => {}
             Outcome::Close => return Ok(None),
             Outcome::CloseAnd(action) => return Ok(Some(action)),
         }
@@ -539,6 +575,70 @@ mod tests {
         assert!(snapshot.data.deleted.is_empty());
     }
 
+    /// R10.5: the folder question alone: y gives it, n keeps it without one, Esc cancels.
+    #[test]
+    fn r10_5_the_folder_question_alone() {
+        let answer = |code: KeyCode| {
+            let mut terminal = Terminal::new(TestBackend::new(70, 18)).unwrap();
+            let screen = Screen::ConfirmFolder { project: "X".into(), folder: "~/x".into() };
+            match alone(&mut terminal, screen, &TimeZone::UTC, &Script::new([press(KeyCode::Enter), press(code)]), None)
+            {
+                Ok(Some(Action::Answer(give))) => Some(give),
+                Ok(None) => None,
+                other => panic!("{other:?}"),
+            }
+        };
+        assert_eq!(answer(KeyCode::Char('y')), Some(true));
+        assert_eq!(answer(KeyCode::Char('n')), Some(false));
+        assert_eq!(answer(KeyCode::Esc), None);
+    }
+
+    /// R10.5, R8.5: the add dialog alone saves the folder under the name
+    /// given; a name taken keeps the cursor on the name, with why.
+    #[test]
+    fn r10_5_the_add_dialog_alone_saves_the_folder() {
+        use crate::store::ProjectKind;
+        let (_tmp, itm) = crate::itm::tests::itm();
+        let code = crate::projects::tests::folder(&itm, "code/new-thing");
+        itm.add_project(ProjectKind::Name, "My Thing", None).unwrap();
+        let run = |steps: Vec<Step>| {
+            let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
+            let screen = Screen::AddProject(AddDialog::folder("~/code/new-thing", "My Thing"));
+            let chosen = alone(&mut terminal, screen, &TimeZone::UTC, &Script::new(steps), Some(&itm)).unwrap();
+            (chosen, format!("{}", terminal.backend()))
+        };
+        let (chosen, shown) = run(vec![press(KeyCode::Enter), press(KeyCode::Esc)]);
+        assert_eq!(chosen, None);
+        assert!(shown.contains("project My Thing has no folder yet"), "{shown}");
+        let mut steps = vec![press(KeyCode::Enter)];
+        steps.extend((0..4).map(|_| press(KeyCode::Backspace))); // the cursor went to the name: "My Thing" → "My T"
+        steps.extend("ool".chars().map(|c| press(KeyCode::Char(c))));
+        steps.push(press(KeyCode::Enter));
+        let (chosen, _) = run(steps);
+        let Some(Action::ProjectAdded(id)) = chosen else { panic!("{chosen:?}") };
+        let project = itm.store().load().unwrap().projects[&id].clone();
+        assert_eq!((project.name.as_str(), project.path), ("My Tool", Some(code.display().to_string())));
+    }
+
+    /// R10.4: in the switcher, Ctrl+S then Enter saves the first setting in a worker.
+    #[test]
+    fn r10_4_settings_are_saved_by_a_worker() {
+        let work = Arc::new(FakeWork::default());
+        let steps = vec![
+            secs(1),
+            Step::Key(ctrl('s')),
+            press(KeyCode::Enter),
+            secs(1),
+            press(KeyCode::Esc),
+            press(KeyCode::Esc),
+        ];
+        let (result, shown) = switcher(steps, &work, false);
+        assert_eq!(result.unwrap(), None);
+        let setting = Job::Setting { setting: crate::config::Setting::ProjectsFromWorkspaces, on: false };
+        assert_eq!(*work.jobs.lock().unwrap(), [setting]);
+        assert!(!shown.contains("Herdr integration"), "closed");
+    }
+
     /// R4.1: `itm snooze` without a time opens the dialog alone; it returns the choice, or None on Esc.
     #[test]
     fn the_snooze_dialog_alone_returns_the_choice() {
@@ -546,7 +646,7 @@ mod tests {
         let dialog = || Screen::Snooze(SnoozeDialog::new("task-a".into(), "A".into(), presets.clone()));
         let chosen = |steps: Vec<Step>| {
             let mut terminal = Terminal::new(TestBackend::new(70, 18)).unwrap();
-            match alone(&mut terminal, dialog(), &TimeZone::UTC, &Script::new(steps)).unwrap() {
+            match alone(&mut terminal, dialog(), &TimeZone::UTC, &Script::new(steps), None).unwrap() {
                 Some(Action::Run(Job::Snooze { session, until, .. })) => Some((session, until)),
                 None => None,
                 other => panic!("{other:?}"),

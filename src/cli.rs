@@ -2,6 +2,7 @@
 
 use std::io::IsTerminal;
 use std::sync::Arc;
+use std::time::Duration;
 
 use clap::{ArgGroup, Parser, Subcommand, ValueEnum};
 use serde::Serialize;
@@ -15,6 +16,7 @@ use crate::status::Status;
 use crate::store::{Data, ProjectKind, State, python_json};
 use crate::system::which;
 use crate::tasks::{self, Edit, counts, inbox_order, is_task_session};
+use crate::workspaces::Ask;
 use crate::{times, tui};
 
 const STATUS_FORMAT: &str = "⚑ {waiting} ● {active} ◔ {snoozed}";
@@ -152,6 +154,12 @@ enum ProjectCommand {
         /// Git URL, folder path, or (name) the project's name
         source: String,
         /// Defaults to the repository or folder name
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// Save the folder of the Herdr workspace you are in, for the current task
+    AddWorkspace {
+        /// Defaults to the workspace's name; without it, a terminal gets the add dialog
         #[arg(long)]
         name: Option<String>,
     },
@@ -392,6 +400,22 @@ pub fn run(cli: Cli, itm: Itm) -> Result<()> {
             println!("{}", itm.store().load()?.projects[&id].name);
             Ok(())
         }
+        Command::Project(ProjectCommand::AddWorkspace { name }) => {
+            // A popup's workspace is the one it was opened over (R10.5).
+            let active = std::env::var("HERDR_ACTIVE_WORKSPACE_ID").ok();
+            let dialogs = Dialogs(&itm);
+            let ask = terminal().then_some(&dialogs as &dyn Ask);
+            let added = itm.add_workspace(name.as_deref(), active.as_deref(), ask)?;
+            let said: String = added.said.iter().map(|line| format!("; {line}")).collect();
+            println!("project {} ({}){said}", added.project.name, itm.paths.place(&added.project));
+            // A popup closes as soon as the command exits: keep what went wrong on screen, as errors are.
+            let warnings: Vec<&String> = added.warnings().collect();
+            if !warnings.is_empty() && popup() {
+                warnings.iter().for_each(|line| eprintln!("itm: {line}"));
+                std::thread::sleep(POPUP_PAUSE);
+            }
+            Ok(())
+        }
         Command::Project(ProjectCommand::Set { name, dir, .. }) => {
             println!("{}", itm.set_project_folder(&name, dir.as_deref())?.join("; "));
             Ok(())
@@ -435,6 +459,27 @@ pub fn run(cli: Cli, itm: Itm) -> Result<()> {
         }
         Command::Daemon => Arc::new(itm).run_daemon(),
         Command::Setsid { program, args } => Err(crate::system::setsid_exec(&program, &args)),
+    }
+}
+
+/// How long a popup keeps what went wrong on screen before it closes.
+pub const POPUP_PAUSE: Duration = Duration::from_millis(2500);
+
+/// Whether this runs in a Herdr popup (`ITM_POPUP`), which closes as soon as it exits.
+pub fn popup() -> bool {
+    std::env::var_os("ITM_POPUP").is_some_and(|v| !v.is_empty())
+}
+
+/// `add-workspace`'s questions, asked in this terminal.
+struct Dialogs<'a>(&'a Itm);
+
+impl Ask for Dialogs<'_> {
+    fn add_folder(&self, folder: &std::path::Path, name: &str) -> Result<Option<String>> {
+        tui::add_folder_dialog(self.0, &self.0.paths.display(folder), name)
+    }
+
+    fn give_folder(&self, project: &str, folder: &str) -> Result<Option<bool>> {
+        tui::confirm_folder(project, folder)
     }
 }
 

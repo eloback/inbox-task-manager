@@ -18,6 +18,8 @@ pub struct Paths {
     pub state: PathBuf,
     /// `$XDG_DATA_HOME/inbox-task-manager`: task notes.
     pub data: PathBuf,
+    /// `$XDG_CONFIG_HOME/inbox-task-manager`: settings (`config.toml`).
+    pub config: PathBuf,
     /// `$XDG_CONFIG_HOME/herdr`: where Herdr keeps each session's sockets.
     pub herdr_config: PathBuf,
     /// Where a task's session starts (`ITM_TASK_DIR`, else the home folder).
@@ -46,6 +48,7 @@ impl Paths {
             projects: std::path::absolute(&projects).unwrap_or(projects),
             task_dir: var("ITM_TASK_DIR").unwrap_or_else(|| home.clone()),
             data,
+            config: xdg("XDG_CONFIG_HOME", ".config").join(APP),
             herdr_config: xdg("XDG_CONFIG_HOME", ".config").join("herdr"),
             runtime: runtime_dir(var("XDG_RUNTIME_DIR")),
             home,
@@ -59,6 +62,7 @@ impl Paths {
             home: root.join("home"),
             state: root.join("state").join(APP),
             data: root.join("data").join(APP),
+            config: root.join("config").join(APP),
             herdr_config: root.join("config/herdr"),
             task_dir: root.join("home"),
             projects: root.join("data").join(APP).join("projects"),
@@ -68,6 +72,11 @@ impl Paths {
 
     pub fn tasks_file(&self) -> PathBuf {
         self.state.join("tasks.json")
+    }
+
+    /// The settings (R10.4).
+    pub fn config_file(&self) -> PathBuf {
+        self.config.join("config.toml")
     }
 
     pub fn notified_file(&self) -> PathBuf {

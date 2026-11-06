@@ -47,7 +47,7 @@ pub struct Session {
 
 pub type Sessions = BTreeMap<String, Session>;
 
-/// An agent in a session (`agent.list`). Decoded tolerantly: Herdr adds
+/// An agent in a session (`session.snapshot`, as `agent.list` lists them). Decoded tolerantly: Herdr adds
 /// fields often, and only these matter to itm.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Agent {
@@ -66,6 +66,98 @@ pub struct Agent {
 
 fn unknown() -> AgentState {
     AgentState::Unknown
+}
+
+/// A workspace of a running session, in the session's order.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Workspace {
+    pub id: String,
+    /// What Herdr shows: its name, or for an unnamed one a label Herdr made
+    /// up from its folder (DESIGN.md section 1).
+    pub label: String,
+    pub focused: bool,
+    /// The folder Herdr names an unnamed workspace after: the working folder
+    /// of the first pane (in layout order) of its first tab (in tab order).
+    /// None when Herdr does not report it.
+    pub folder: Option<PathBuf>,
+}
+
+/// What one `session.snapshot` shows of a session.
+#[derive(Debug, Clone)]
+pub struct SessionView {
+    pub agents: Vec<Agent>,
+    /// None when the snapshot's workspaces, tabs, layouts or panes are not
+    /// what itm reads (the agents are still read).
+    pub workspaces: Option<Vec<Workspace>>,
+}
+
+/// The parts of a snapshot a workspace's folder is read from. No call
+/// reports the folder Herdr names a workspace after, so it is found here.
+#[derive(Deserialize)]
+struct Layout {
+    workspaces: Vec<LayoutWorkspace>,
+    tabs: Vec<LayoutTab>,
+    layouts: Vec<TabLayout>,
+    panes: Vec<LayoutPane>,
+}
+
+#[derive(Deserialize)]
+struct LayoutWorkspace {
+    workspace_id: String,
+    #[serde(default)]
+    label: Option<String>,
+    #[serde(default)]
+    focused: Option<bool>,
+}
+
+#[derive(Deserialize)]
+struct LayoutTab {
+    tab_id: String,
+    workspace_id: String,
+}
+
+#[derive(Deserialize)]
+struct TabLayout {
+    tab_id: String,
+    panes: Vec<PaneRef>,
+}
+
+#[derive(Deserialize)]
+struct PaneRef {
+    pane_id: String,
+}
+
+#[derive(Deserialize)]
+struct LayoutPane {
+    pane_id: String,
+    #[serde(default)]
+    cwd: Option<String>,
+}
+
+impl Layout {
+    fn workspaces(self) -> Vec<Workspace> {
+        let mut first_tab: BTreeMap<&str, &str> = BTreeMap::new();
+        for tab in &self.tabs {
+            first_tab.entry(&tab.workspace_id).or_insert(&tab.tab_id);
+        }
+        let first_pane: BTreeMap<&str, &str> = (self.layouts.iter())
+            .filter_map(|layout| Some((layout.tab_id.as_str(), layout.panes.first()?.pane_id.as_str())))
+            .collect();
+        let cwd: BTreeMap<&str, &str> =
+            self.panes.iter().filter_map(|pane| Some((pane.pane_id.as_str(), pane.cwd.as_deref()?))).collect();
+        (self.workspaces.iter())
+            .map(|w| {
+                let tab = first_tab.get(w.workspace_id.as_str());
+                let folder = tab.and_then(|tab| first_pane.get(tab)).and_then(|pane| cwd.get(pane));
+                Workspace {
+                    id: w.workspace_id.clone(),
+                    label: w.label.clone().unwrap_or_default(),
+                    focused: w.focused.unwrap_or(false),
+                    folder: folder.filter(|f| !f.is_empty()).map(PathBuf::from),
+                }
+            })
+            .collect()
+    }
 }
 
 pub struct Herdr {
@@ -121,13 +213,27 @@ impl Herdr {
         }
     }
 
-    pub fn agents(&self, socket: &Path) -> Result<Vec<Agent>> {
+    /// A session's agents and workspaces, in one request.
+    pub fn snapshot(&self, socket: &Path) -> Result<SessionView> {
+        const METHOD: &str = "session.snapshot";
         #[derive(Deserialize)]
-        struct AgentList {
+        struct Answer {
+            snapshot: Value,
+        }
+        #[derive(Deserialize)]
+        struct Agents {
             agents: Vec<Agent>,
         }
-        let list: AgentList = decode("agent.list", self.call(socket, "agent.list", json!({}))?)?;
-        Ok(list.agents)
+        let Answer { snapshot } = decode(METHOD, self.call(socket, METHOD, json!({}))?)?;
+        let Agents { agents } = decode(METHOD, &snapshot)?;
+        let workspaces = Layout::deserialize(&snapshot).ok().map(Layout::workspaces);
+        Ok(SessionView { agents, workspaces })
+    }
+
+    /// Name a workspace. A named workspace keeps its name when its folder
+    /// changes; Herdr takes a label starting with "-" as it is.
+    pub fn rename_workspace(&self, socket: &Path, id: &str, label: &str) -> Result<()> {
+        self.call(socket, "workspace.rename", json!({"workspace_id": id, "label": label})).map(drop)
     }
 
     /// A toast in the session's attached client; false when Herdr did not
@@ -344,8 +450,8 @@ fn blocking(fd: OwnedFd) -> io::Result<UnixStream> {
     Ok(stream)
 }
 
-fn decode<T: for<'de> Deserialize<'de>>(method: &'static str, result: Value) -> Result<T> {
-    serde_json::from_value(result)
+fn decode<'de, T: Deserialize<'de>>(method: &'static str, result: impl serde::Deserializer<'de>) -> Result<T> {
+    T::deserialize(result)
         .map_err(|_| Error::Herdr { method, failure: HerdrFailure::BadAnswer("an unexpected answer") })
 }
 
@@ -417,24 +523,67 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let herdr = Herdr::new(tmp.path().to_path_buf());
         fake::serve(tmp.path(), "task-a", |_, _| {
-            json!({"type": "agent_list", "agents": [
+            json!({"type": "session_snapshot", "snapshot": {"agents": [
                 {"agent": "claude", "agent_status": "blocked", "pane_id": "w1:p1", "state_change_seq": 5,
                  "terminal_title_stripped": "Fix it", "new_field": [1]},
-                {"agent_status": "pondering"}]})
+                {"agent_status": "pondering"}]}})
         });
-        let agents = herdr.agents(&herdr.socket("task-a")).unwrap();
+        let view = herdr.snapshot(&herdr.socket("task-a")).unwrap();
+        let agents = view.agents;
         assert_eq!(agents[0].agent_status, AgentState::Blocked);
         assert_eq!(agents[0].state_change_seq, Some(json!(5)));
         assert_eq!((agents[1].agent_status, agents[1].pane_id.as_deref()), (AgentState::Unknown, None));
+        assert_eq!(view.workspaces, None, "no workspaces in it: they are unknown, the agents are still read");
+    }
+
+    /// R10.2: a workspace's folder is the working folder of the first pane
+    /// (in layout order) of its first tab (in tab order).
+    #[test]
+    fn a_workspaces_folder_is_its_first_tabs_first_pane() {
+        let tmp = tempfile::tempdir().unwrap();
+        let herdr = Herdr::new(tmp.path().to_path_buf());
+        let calls = fake::serve(tmp.path(), "task-a", |_, _| {
+            json!({"type": "session_snapshot", "snapshot": {
+                "workspaces": [{"workspace_id": "w1", "label": "api", "focused": false},
+                               {"workspace_id": "w2", "label": "web", "focused": true},
+                               {"workspace_id": "w3", "label": "empty"}],
+                // Tab order, not numbers: w1's second tab was moved to the front.
+                "tabs": [{"tab_id": "w1:t3", "workspace_id": "w1"}, {"tab_id": "w1:t1", "workspace_id": "w1"},
+                         {"tab_id": "w2:t1", "workspace_id": "w2"}],
+                "layouts": [{"tab_id": "w1:t1", "panes": [{"pane_id": "w1:p1"}]},
+                            {"tab_id": "w1:t3", "panes": [{"pane_id": "w1:p5"}, {"pane_id": "w1:p2"}]},
+                            {"tab_id": "w2:t1", "panes": [{"pane_id": "w2:p1"}]}],
+                "panes": [{"pane_id": "w1:p1", "cwd": "/a"}, {"pane_id": "w1:p5", "cwd": "/b"},
+                          {"pane_id": "w1:p2", "cwd": "/c"}, {"pane_id": "w2:p1", "cwd": "/d"}],
+                "agents": []}})
+        });
+        let view = herdr.snapshot(&herdr.socket("task-a")).unwrap();
+        let workspace = |id: &str, label: &str, focused, folder: Option<&str>| Workspace {
+            id: id.into(),
+            label: label.into(),
+            focused,
+            folder: folder.map(PathBuf::from),
+        };
+        assert_eq!(
+            view.workspaces.unwrap(),
+            [
+                workspace("w1", "api", false, Some("/b")),
+                workspace("w2", "web", true, Some("/d")),
+                workspace("w3", "empty", false, None)
+            ]
+        );
+        assert_eq!(calls.lock().unwrap()[0].0, "session.snapshot");
+        let err = herdr.snapshot(&herdr.socket("task-gone")).unwrap_err();
+        assert_eq!(err.to_string(), "herdr session.snapshot: session not running");
     }
 
     #[test]
     fn errors_name_the_method() {
         let tmp = tempfile::tempdir().unwrap();
         let herdr = Herdr::new(tmp.path().to_path_buf());
-        let err = herdr.agents(&herdr.socket("task-gone")).unwrap_err();
-        assert_eq!(err, Error::Herdr { method: "agent.list", failure: HerdrFailure::NotRunning });
-        assert_eq!(err.to_string(), "herdr agent.list: session not running");
+        let err = herdr.snapshot(&herdr.socket("task-gone")).unwrap_err();
+        assert_eq!(err, Error::Herdr { method: "session.snapshot", failure: HerdrFailure::NotRunning });
+        assert_eq!(err.to_string(), "herdr session.snapshot: session not running");
 
         let socket = herdr.socket("task-x");
         fs::create_dir_all(socket.parent().unwrap()).unwrap();
@@ -490,8 +639,8 @@ mod tests {
         let _stuck = stuck_session(&socket);
 
         let started = Instant::now();
-        let err = herdr.agents(&socket).unwrap_err();
-        assert_eq!(err, Error::Herdr { method: "agent.list", failure: HerdrFailure::TimedOut });
+        let err = herdr.snapshot(&socket).unwrap_err();
+        assert_eq!(err, Error::Herdr { method: "session.snapshot", failure: HerdrFailure::TimedOut });
         assert_eq!(herdr.stop(&socket).unwrap_err().to_string(), "herdr server.stop timed out");
         let sessions = herdr.sessions().unwrap();
         assert!(sessions["task-stuck"].running, "stuck, not stopped: tasks snoozed until an agent stay snoozed");
@@ -506,8 +655,8 @@ mod tests {
         fs::create_dir_all(socket.parent().unwrap()).unwrap();
         let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
         let held = std::thread::spawn(move || listener.accept().map(|(stream, _)| stream));
-        let err = herdr.agents(&socket).unwrap_err();
-        assert_eq!(err, Error::Herdr { method: "agent.list", failure: HerdrFailure::TimedOut });
+        let err = herdr.snapshot(&socket).unwrap_err();
+        assert_eq!(err, Error::Herdr { method: "session.snapshot", failure: HerdrFailure::TimedOut });
         drop(held.join());
     }
 }

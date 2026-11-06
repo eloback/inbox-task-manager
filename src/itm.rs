@@ -18,11 +18,14 @@ use crate::store::{Data, State, Store, Task};
 use crate::system::Processes;
 use crate::tasks::{self, Edit};
 use crate::times;
+use crate::workspaces::Repositories;
 
 pub struct Itm {
     pub paths: Paths,
     pub herdr: Herdr,
     pub git: Git,
+    /// The git repositories of workspace folders, remembered (R10.2).
+    pub repositories: Repositories,
     pub procs: Box<dyn Processes>,
     /// This program, for the children it starts (a TUI's clone): `ITM_SELF`
     /// when set (a wrapper that sets up `PATH`), else this binary.
@@ -41,6 +44,7 @@ impl Itm {
         Itm {
             herdr: Herdr::new(paths.herdr_config.clone()),
             git: Git::default(),
+            repositories: Repositories::default(),
             paths,
             procs: crate::system::process_table(),
             program: program.or_else(|| env::current_exe().ok()).unwrap_or_else(|| "itm".into()),
@@ -57,6 +61,7 @@ impl Itm {
         Itm {
             herdr: Herdr::new(paths.herdr_config.clone()),
             git: Git::default(),
+            repositories: Repositories::default(),
             paths,
             procs: Box::new(procs),
             program: "itm".into(),
@@ -148,12 +153,6 @@ impl Itm {
             })
     }
 
-    /// Whether projects follow workspaces (R10.3, on by default). config.toml
-    /// (R10.4) is not read yet, so this is its default.
-    pub fn follows_workspaces(&self) -> bool {
-        true
-    }
-
     /// Change a task's title, description or projects by hand (R5.4); returns
     /// what that did besides. The edit is saved first: what follows only
     /// writes the notes (R9.3), reports, or opens a workspace per added
@@ -179,7 +178,7 @@ impl Itm {
                 .err()
                 .map(|e| format!("could not update its notes: {e}")),
         };
-        let mut said = match edited.added.is_empty() {
+        let mut said = match edited.added.is_empty() || edit.has_workspace {
             true => vec![],
             false => self.project_change_messages(session, &edited.added),
         };
@@ -661,6 +660,38 @@ pub mod tests {
         fs::remove_file(itm.paths.status_file().unwrap()).unwrap();
         assert_eq!(edit(&itm, "task-run", |e| e.remove = strings(&["api"])).unwrap(), Vec::<String>::new());
         assert!(task(&itm, "task-run").projects.is_empty());
+
+        // R10.4: with "projects follow workspaces" off, or a broken settings file, nothing keeps it.
+        let open = |itm: &Itm| {
+            change(itm, |data| {
+                let run = data.tasks.get_mut("task-run").unwrap();
+                (run.projects, run.workspace_projects) = (vec![api.clone()], vec![api.clone()]);
+            })
+        };
+        write_status(&itm, &[]);
+        itm.change_setting(crate::config::Setting::ProjectsFromWorkspaces, false).unwrap();
+        for settings in ["[herdr]\nprojects_from_workspaces = false\n", "[herdr\n"] {
+            fs::write(itm.paths.config_file(), settings).unwrap();
+            open(&itm);
+            assert_eq!(edit(&itm, "task-run", |e| e.remove = strings(&["api"])).unwrap(), Vec::<String>::new());
+            assert!(task(&itm, "task-run").projects.is_empty(), "{settings}");
+        }
+    }
+
+    /// R10.5: the workspace hotkey's edit adds the project as found in the
+    /// workspace, and opens none (the workspace is there).
+    #[test]
+    fn r10_5_an_edit_can_add_a_project_found_in_its_workspace() {
+        let (_tmp, itm) = itm();
+        let [api] = projects(&itm, ["api"]);
+        itm.create_task("Run", None, &[], None).unwrap();
+        let calls = fake::serve(&itm.paths.herdr_config, "task-run", |_, _| json!({}));
+        let said = edit(&itm, "task-run", |e| (e.add, e.found, e.has_workspace) = (vec![api.clone()], true, true));
+        assert_eq!(said.unwrap(), Vec::<String>::new());
+        assert!(calls.lock().unwrap().is_empty(), "Herdr is not asked");
+        let edited = task(&itm, "task-run");
+        assert_eq!((edited.projects, edited.found_projects), (vec![api.clone()], vec![api]));
+        assert!(notes(&itm, "task-run").contains("Project added\n\napi (~/code/api)\n"));
     }
 
     /// The order puts the projects it names first; ids of projects gone from

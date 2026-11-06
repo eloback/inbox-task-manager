@@ -10,7 +10,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, List, ListItem, Paragraph, Wrap};
 
 use super::app::{App, Row, Snapshot, View};
-use super::screen::{RemoveDialog, Screen, SnoozeDialog};
+use super::screen::{AddDialog, Field, RemoveDialog, Screen, SettingsScreen, SnoozeDialog};
+use crate::config::Setting;
 use crate::projects::{CloneChoice, CloneState};
 use crate::snooze::Until;
 use crate::status::AgentState;
@@ -301,11 +302,15 @@ fn preview(app: &App, now: i64) -> (Vec<Line<'static>>, Option<&'static str>) {
         _ => return (vec![], None),
     };
     let mut lines = vec![Line::from(Span::styled(task.title.clone(), Style::new().bold()))];
+    // The daemon's record of open workspaces holds only while the session runs (R10.3).
+    let running = snap.sessions.get(name).is_some_and(|s| s.running);
     for (id, project) in task.projects.iter().filter_map(|id| Some((id, snap.data.projects.get(id)?))) {
-        lines.push(Line::from(vec![
-            colored(format!("◆ {}", project.name), PROJECT),
-            muted(format!("  {}", project.kind().name())),
-        ]));
+        let mut head =
+            vec![colored(format!("◆ {}", project.name), PROJECT), muted(format!("  {}", project.kind().name()))];
+        if running && task.workspace_projects.contains(id) {
+            head.push(colored("  workspace open", SUCCESS));
+        }
+        lines.push(Line::from(head));
         lines.push(Line::from(muted(format!("  {}", app.paths.place(project)))));
         if snap.missing.contains(id) {
             lines.push(Line::from(colored("  Its folder is missing, so it gets no workspace.", ERROR)));
@@ -426,7 +431,108 @@ fn draw_screen(frame: &mut Frame, screen: &Screen, area: Rect, tz: &TimeZone, no
         Screen::ConfirmDelete { title, .. } => draw_delete(frame, title, area),
         Screen::Snooze(snooze) => draw_snooze(frame, snooze, area, tz, now),
         Screen::RemoveProject(dialog) => draw_remove(frame, dialog, area),
+        Screen::ConfirmFolder { project, folder } => draw_confirm_folder(frame, project, folder, area),
+        Screen::AddProject(dialog) => draw_add(frame, dialog, area),
+        Screen::Settings(screen) => draw_settings(frame, screen, area),
     }
+}
+
+/// Lines in a dialog box as tall as they wrap to (64 columns, less border and margin).
+fn wrapped_dialog(frame: &mut Frame, area: Rect, lines: Vec<Line<'static>>) -> Rect {
+    let rows: usize = lines.iter().map(|line| line.width().max(1).div_ceil(60)).sum();
+    let inside = dialog_box(frame, area, rows as u16 + 2);
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inside);
+    inside
+}
+
+/// Giving a folder changes which workspaces count as the project in every
+/// task, so the question says so (R10.5, UX principle 10).
+fn draw_confirm_folder(frame: &mut Frame, project: &str, folder: &str, area: Rect) {
+    let lines = vec![
+        Line::from(Span::styled(format!("Give {folder} to {project}?"), Style::new().bold())),
+        Line::default(),
+        Line::from(muted(format!(
+            "{project} has no folder. With this one, workspaces in it count as {project} in every task, and new tasks with {project} start there."
+        ))),
+        Line::default(),
+        key_hints(&[("y", "give it"), ("n", "keep it without a folder"), ("esc", "cancel")]),
+    ];
+    wrapped_dialog(frame, area, lines);
+}
+
+/// The add dialog: the source and the name, the focused one marked, and
+/// what saving does or why it did not (R10.5, R8.5).
+fn draw_add(frame: &mut Frame, dialog: &AddDialog, area: Rect) {
+    let kind = match dialog.kind {
+        ProjectKind::Git => "Git repository",
+        ProjectKind::Dir => "Local folder",
+        ProjectKind::Name => "Name only",
+    };
+    let field = |label: &str, input: &tui_input::Input, which: Field, hint: &str| {
+        let style = if dialog.focus == which { Style::new().fg(ACCENT).bold() } else { Style::new().fg(MUTED) };
+        let value = match input.value() {
+            "" => muted(hint.to_string()),
+            value => Span::raw(value.to_string()),
+        };
+        Line::from(vec![Span::styled(format!("{label:<8}"), style), value])
+    };
+    let status = match &dialog.error {
+        Some(e) => colored(e.clone(), ERROR),
+        None => muted("Saves the folder; nothing is copied."),
+    };
+    let lines = vec![
+        Line::from(vec![Span::styled("Add project", Style::new().bold()), muted(format!("  {kind}"))]),
+        Line::default(),
+        field("Source", &dialog.source, Field::Source, "~/code/project"),
+        field("Name", &dialog.name, Field::Name, "defaults to the folder name"),
+        Line::default(),
+        Line::from(status),
+        Line::default(),
+        key_hints(&[("enter", "add"), ("tab", "next field"), ("esc", "cancel")]),
+    ];
+    let inside = wrapped_dialog(frame, area, lines);
+    let (row, input) = match dialog.focus {
+        Field::Source => (2, &dialog.source),
+        Field::Name => (3, &dialog.name),
+    };
+    let x = (inside.x + 8 + input.visual_cursor() as u16).min(inside.right().saturating_sub(1));
+    frame.set_cursor_position((x, inside.y + row));
+}
+
+/// The settings, each with what it does; a file with a mistake is shown
+/// instead of toggles that would not save (R10.4).
+fn draw_settings(frame: &mut Frame, screen: &SettingsScreen, area: Rect) {
+    let mut lines = vec![
+        Line::from(Span::styled("Settings", Style::new().bold())),
+        Line::default(),
+        Line::from(Span::styled("Herdr integration", Style::new().bold())),
+    ];
+    // A file with a mistake: the defaults are shown, and nothing can be toggled.
+    let shown = screen.settings.clone().unwrap_or_default();
+    for (i, setting) in Setting::ALL.into_iter().enumerate() {
+        let mark = match shown.get(setting) {
+            true if screen.settings.is_ok() => colored("● ", SUCCESS),
+            true => muted("● "),
+            false => muted("○ "),
+        };
+        let style = match screen.settings {
+            Ok(_) if i == screen.selected => Style::new().add_modifier(Modifier::REVERSED),
+            Ok(_) => Style::new(),
+            Err(_) => Style::new().fg(MUTED),
+        };
+        lines.push(Line::from(vec![mark, Span::styled(setting.label(), style)]));
+        lines.push(Line::from(muted(format!("  {}", setting.help()))));
+    }
+    lines.push(Line::default());
+    lines.push(Line::from(match (&screen.settings, &screen.failed) {
+        (Err(e), _) => colored(e.clone(), ERROR),
+        (_, Some(e)) => colored(format!("Not saved: {e}"), ERROR),
+        _ if screen.saving => muted("Saving…"),
+        _ => muted(format!("Saved in {}; the daemon reads it on every pass.", screen.file)),
+    }));
+    lines.push(Line::default());
+    lines.push(key_hints(&[("enter / space", "toggle"), ("esc", "close")]));
+    wrapped_dialog(frame, area, lines);
 }
 
 /// Deleting cannot be undone, and the question says what goes (UX principle 10).
@@ -618,6 +724,64 @@ mod tests {
         let mut app = app(snapshot());
         app.on_key(ctrl('d'));
         insta::assert_snapshot!(screen(&mut app));
+    }
+
+    /// R10.4: the settings, each with what it does, and where they are saved.
+    #[test]
+    fn the_settings_screen() {
+        let mut app = app(snapshot());
+        app.on_key(ctrl('s'));
+        insta::assert_snapshot!(screen(&mut app));
+    }
+
+    /// R10.4: a file with a mistake is shown, with the defaults and nothing to toggle.
+    #[test]
+    fn the_settings_screen_with_a_mistake_in_the_file() {
+        let mut snap = snapshot();
+        snap.settings = Err("~/.config/inbox-task-manager/config.toml: unknown setting herdr.nope".into());
+        let mut app = app(snap);
+        app.on_key(ctrl('s'));
+        insta::assert_snapshot!(screen(&mut app));
+    }
+
+    /// R10.5: the add dialog, filled with the workspace's folder and name.
+    #[test]
+    fn the_add_dialog() {
+        use crate::tui::screen::AddDialog;
+        let mut app = app(snapshot());
+        let mut dialog = AddDialog::folder("~/code/new-thing", "My Thing");
+        dialog.error = Some("project already exists: My Thing (no folder); choose another name".into());
+        app.screens.push(Screen::AddProject(dialog));
+        insta::assert_snapshot!(screen(&mut app));
+    }
+
+    /// R10.5: the folder question says what giving the folder changes.
+    #[test]
+    fn the_folder_question() {
+        let mut app = app(snapshot());
+        app.screens.push(Screen::ConfirmFolder { project: "Client X".into(), folder: "~/code/client-x".into() });
+        insta::assert_snapshot!(screen(&mut app));
+    }
+
+    /// R2.3, R10.3: a running task's preview says which projects have their workspace open.
+    #[test]
+    fn the_preview_says_which_workspaces_are_open() {
+        use crate::store::Project;
+        let mut snap = snapshot();
+        for (id, name) in [("p1", "api"), ("p2", "web")] {
+            let path = Some(format!("/r/home/code/{name}"));
+            let project =
+                Project { name: name.into(), path, url: None, added_at: 1, last_used_at: 1, extra: <_>::default() };
+            snap.data.projects.insert(id.into(), project);
+        }
+        let task = snap.data.tasks.get_mut("task-fix-login").unwrap();
+        (task.projects, task.workspace_projects) = (vec!["p1".into(), "p2".into()], vec!["p2".into()]);
+        let text = screen(&mut app(snap.clone()));
+        assert!(text.contains("◆ web  dir  workspace open"), "{text}");
+        assert!(text.contains("◆ api  dir\n") || text.contains("◆ api  dir "), "{text}");
+        assert!(!text.contains("◆ api  dir  workspace open"), "{text}");
+        snap.sessions.get_mut("task-fix-login").unwrap().running = false;
+        assert!(!screen(&mut app(snap)).contains("workspace open"), "a stopped session has none open");
     }
 
     /// R8.7: a clean clone is offered for deleting, keeping it first.

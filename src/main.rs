@@ -3,6 +3,7 @@
 //! version is from the Python one it replaces.
 
 mod cli;
+mod config;
 mod daemon;
 mod error;
 mod git;
@@ -19,9 +20,9 @@ mod system;
 mod tasks;
 mod times;
 mod tui;
+mod workspaces;
 
 use std::process::ExitCode;
-use std::time::Duration;
 
 use clap::Parser;
 
@@ -34,8 +35,8 @@ fn main() -> ExitCode {
             eprintln!("itm: {e}");
             // A Herdr popup closes when its command exits: keep the error readable
             // (a dialog closed on purpose needs no reading).
-            if e != error::Error::Cancelled && std::env::var_os("ITM_POPUP").is_some() {
-                std::thread::sleep(Duration::from_millis(2500));
+            if e != error::Error::Cancelled && cli::popup() {
+                std::thread::sleep(cli::POPUP_PAUSE);
             }
             ExitCode::FAILURE
         }
