@@ -128,6 +128,10 @@ both new "Fix login" --no-switch
 both new "  " --no-switch
 both new "Asked" --snooze agent
 both new "Late" --snooze 0m
+# Phrases itm does not read itself go to GNU date (R4.1).
+both new "Next week" --snooze "next week"
+both snooze task-next-week "+3 days"
+both new "Monkey" --snooze monkey
 both snooze fix-login 1h
 both snooze task-later --until-agent
 both wake fix-login
@@ -152,6 +156,8 @@ EOF
 }
 check "py: new --snooze 2h wakes 2 h after it was made" snoozed py task-later 7200
 check "rs: new --snooze 2h wakes 2 h after it was made" snoozed rs task-later 7200
+check "py: snooze +3 days (GNU date) wakes 3 days after it was made" snoozed py task-next-week 259200
+check "rs: snooze +3 days (GNU date) wakes 3 days after it was made" snoozed rs task-next-week 259200
 
 echo "== notes"
 both notes fix-login --append "first finding"

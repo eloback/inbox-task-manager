@@ -65,6 +65,9 @@ sandbox_pids() { # sandbox_pids <command line>: the processes with exactly it, o
   done
 }
 file_is() { test "$(cat "$1" 2>/dev/null)" = "$2"; }
+snoozed_for() { # snoozed_for <session> <seconds>: its snooze ends that far from now, give or take 15 s
+  "$itm" list --json --view all | python3 -c 'import json,sys,time; r=[r for r in json.load(sys.stdin) if r["session"]==sys.argv[1]]; sys.exit(not (r and r[0]["snoozed_until"] and abs(r[0]["snoozed_until"] - time.time() - int(sys.argv[2])) < 15))' "$1" "$2"
+}
 no_markers() { test -z "$(ls "$runtime/clients")"; }
 pane() { tmux -S "$tmux_sock" capture-pane -p -t e2e; }
 shows() { pane | grep -qF -- "$1"; }
@@ -198,6 +201,12 @@ check "itm snooze without a time opens the snooze dialog (R4.1)" wait_for 5 show
 keys Enter
 check "its first preset snoozes the current task and moves its client (R4.7)" wait_for 5 marker_is task-fix-login
 check "the task is snoozed for 30 minutes" sh -c "'$itm' list --view snoozed | grep -q task-two-repos"
+type_in_pane "$itm snooze old-idea"
+check "itm snooze <task> without a time opens the dialog for that task" wait_for 5 shows 'Snooze “Old idea”'
+keys -l "next week"
+keys Enter
+check "a phrase only GNU date reads, typed in the dialog, snoozes it (R4.1)" wait_for 5 snoozed_for task-old-idea 604800
+"$itm" wake old-idea >/dev/null
 
 echo "== notes"
 notes=$("$itm" notes old-idea --path)
@@ -408,6 +417,23 @@ type_in_pane "$itm new"
 check "itm new without a title opens the form" wait_for 5 shows 'enter create'
 keys Escape
 check "Esc closes it when nothing was typed" wait_for 5 gone 'enter create'
+type_in_pane "$itm new"
+wait_for 5 shows 'enter create'
+keys -l "Week task"
+keys Tab Tab Tab
+keys -l "+3 days"
+keys C-s
+check "the form's time typed is read by GNU date when itm does not read it (R4.1)" wait_for 5 snoozed_for task-week-task 259200
+check "and a snoozed task is not switched to" marker_is task-form-task
+# R1.4: a terminal whose Herdr client itm attach did not start (here: the
+# socket of a session no itm client is on) cannot be switched.
+type_in_pane "HERDR_SOCKET_PATH=$sessions/task-fix-login/herdr.sock $itm new 2>$root/plain.txt"
+check "there the form says it saves without switching (R1.4)" wait_for 5 shows 'Saved without switching: this Herdr client'
+keys -l "Plain task"
+keys Enter
+check "Enter saves the task" wait_for 5 sh -c "'$itm' list | grep -q task-plain-task"
+check "then says why it did not switch" wait_for 5 contains "$root/plain.txt" "task-plain-task saved without switching: this Herdr client was not started by \`itm attach\`"
+check "and no client moved" marker_is task-form-task
 
 echo "== every contrib/herdr-keys.toml command in a Herdr popup"
 keys C-b S

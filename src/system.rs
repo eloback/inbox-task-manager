@@ -1,7 +1,8 @@
 //! What differs between operating systems, and what itm needs from them:
 //! the process table (to validate attach-loop markers and find their `herdr
 //! session attach` children), signals, programs on `PATH`, sessions of
-//! their own, and the desktop notification command. Linux reads the
+//! their own, the desktop notification command, and a `date` that reads
+//! snooze phrases. Linux reads the
 //! process table from `/proc`; macOS and the BSDs ask `ps` (DESIGN.md
 //! section 4, portability). Which one is a run-time choice, so both are
 //! built and tested everywhere.
@@ -12,7 +13,7 @@ use std::fs;
 use std::io::{self, Read};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -290,6 +291,29 @@ pub fn which(program: &str) -> Option<PathBuf> {
         .find(|path| fs::metadata(path).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0))
 }
 
+/// The epoch second `date -d` reads `phrase` as (`next week`, `+3 days`;
+/// R4.1), with a `date` that reads relative phrases: GNU's (`gdate` on
+/// macOS, where `date` is BSD's) or uutils'. None when there is no such
+/// `date`, or it does not read `phrase`.
+pub fn date_reads(phrase: &str) -> Option<i64> {
+    let date = ["gdate", "date"].into_iter().filter_map(which).find(|date| reads_relative(date))?;
+    date_epoch(&date, &["-d", phrase, "+%s"])
+}
+
+/// Whether `date` reads a relative phrase. Asked, not told by its version
+/// text: BusyBox `date` reads `-d` too, but only absolute times.
+fn reads_relative(date: &Path) -> bool {
+    date_epoch(date, &["-u", "-d", "1970-01-01 +1 day", "+%s"]) == Some(86400)
+}
+
+/// The epoch second `date <args>` printed.
+fn date_epoch(date: &Path, args: &[&str]) -> Option<i64> {
+    match output_within(Command::new(date).args(args), PS_TIMEOUT) {
+        Ok(Some((status, text))) if status.success() => text.trim().parse().ok(),
+        _ => None,
+    }
+}
+
 /// How to show a desktop notification: `$ITM_NOTIFY_COMMAND` (split like a
 /// shell would) with the title and body as arguments, else `osascript` on
 /// macOS (the text goes in as arguments, never into the script), else
@@ -390,6 +414,23 @@ mod tests {
         let status = stop_child(&mut stubborn, Duration::from_millis(200)).unwrap();
         assert_eq!(std::os::unix::process::ExitStatusExt::signal(&status), Some(9));
         assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    /// R4.1: other phrases go to a `date` that reads relative phrases, when there is one.
+    #[test]
+    fn r4_1_a_date_that_reads_relative_phrases() {
+        if let Some(fails) = which("false") {
+            assert!(!reads_relative(&fails));
+        }
+        assert!(!reads_relative(Path::new("/nonexistent/date")));
+        let Some(date) = ["gdate", "date"].into_iter().filter_map(which).find(|d| reads_relative(d)) else {
+            return; // no GNU date here (macOS without coreutils): itm's own phrases only
+        };
+        let now = crate::times::now();
+        let week = date_reads("next week").expect("GNU date reads next week");
+        assert!((now + 7 * 86400 - 5..=now + 7 * 86400 + 5).contains(&week), "{week} is a week after {now}");
+        assert_eq!(date_reads("monkey"), None);
+        assert!(date_epoch(&date, &["-d", "@86400", "+%s"]) == Some(86400));
     }
 
     #[test]

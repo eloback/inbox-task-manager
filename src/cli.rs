@@ -14,7 +14,7 @@ use crate::projects::{CloneChoice, CloneState, RemovalNote, project_rows, resolv
 use crate::snooze::Until;
 use crate::status::Status;
 use crate::store::{Data, ProjectKind, State, python_json};
-use crate::system::which;
+use crate::system::{date_reads, which};
 use crate::tasks::{self, Edit, counts, inbox_order, is_task_session};
 use crate::workspaces::Ask;
 use crate::{times, tui};
@@ -221,7 +221,7 @@ pub fn run(cli: Cli, itm: Itm) -> Result<()> {
         }
         Command::New { title, description, projects, snooze, no_switch, interactive } => {
             // What was given is checked before the form asks for the rest.
-            let until = snooze.map(|text| Until::parse(&text, now, &itm.tz)).transpose()?;
+            let until = snooze.map(|text| Until::parse(&text, now, &itm.tz, date_reads)).transpose()?;
             if until == Some(Until::Agent) {
                 bail!("a new task has no agents yet, so none could wake it; snooze it until a time");
             }
@@ -286,7 +286,7 @@ pub fn run(cli: Cli, itm: Itm) -> Result<()> {
             let (name, when) = split_snooze_args(&itm, &data, task.as_deref(), &words)?;
             let until = match (until_agent, when) {
                 (true, _) => Until::Agent,
-                (false, Some(when)) => Until::parse(&when, now, &itm.tz)?,
+                (false, Some(when)) => Until::parse(&when, now, &itm.tz, date_reads)?,
                 // R4.1: without a time, the snooze dialog.
                 (false, None) => {
                     needs_terminal()?;

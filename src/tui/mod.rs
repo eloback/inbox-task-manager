@@ -210,6 +210,9 @@ impl Work for Itm {
                 self.edit_task(session, &edit).map(Reply::Said)
             }
             Job::Snooze { session, until, .. } => done(self.snooze_task(session, *until)),
+            Job::SnoozeTime { text } => {
+                Until::parse(text, crate::times::now(), &self.tz, crate::system::date_reads).map(Reply::Until)
+            }
             Job::RemovalPlan { id } => self.removal_plan(id).map(Reply::Plan),
             Job::RemoveProject { id, choice, .. } => self.remove_project(id, *choice).map(Reply::Removed),
             Job::RenameProject { id, name } => {
@@ -275,10 +278,11 @@ fn alone(screen: Screen, paths: &Paths, tz: &TimeZone, work: Arc<dyn Work>) -> R
 /// The snooze dialog alone (`itm snooze` without a time, R4.1): the chosen
 /// snooze, or None when it was closed. "Until an agent needs me" is offered
 /// only when `agent` (an agent could ever wake the task).
-pub fn snooze_dialog(session: &str, title: &str, agent: bool, itm: &Itm) -> Result<Option<Until>> {
+pub fn snooze_dialog(session: &str, title: &str, agent: bool, itm: &Arc<Itm>) -> Result<Option<Until>> {
     let presets = snooze::presets(crate::times::now(), &itm.tz, agent);
     let screen = Screen::Snooze(SnoozeDialog::new(session.into(), title.into(), presets));
-    Ok(match alone(screen, &itm.paths, &itm.tz, Arc::new(NoWork))? {
+    // Its work: a time typed that only GNU `date` reads.
+    Ok(match alone(screen, &itm.paths, &itm.tz, Arc::clone(itm) as Arc<dyn Work>)? {
         Some(Action::Run(Job::Snooze { until, .. })) => Some(until),
         _ => None,
     })
@@ -648,6 +652,8 @@ mod tests {
             }
             match job {
                 Job::Create { .. } => Ok(Reply::Created("task-new".into())),
+                Job::SnoozeTime { text } if text == "next week" => Ok(Reply::Until(Until::Time(NOW + 7 * 86400))),
+                Job::SnoozeTime { text } => Err(Error::Other(format!("cannot understand snooze time: {text}"))),
                 Job::AddProject { kind: ProjectKind::Dir, source, .. } => {
                     Ok(Reply::Added("p-new".into(), new_project("alpha", Some(source))))
                 }
@@ -898,6 +904,18 @@ mod tests {
         assert_eq!(chosen(vec![press(KeyCode::Esc)]), None);
         let typed = typing("2h").into_iter().chain([press(KeyCode::Enter)]).collect();
         assert_eq!(chosen(typed), Some(("task-a".into(), Until::Time(NOW + 7200))));
+        // R4.1: a phrase only GNU date reads is read by its worker; the dialog closes with it.
+        let work = Arc::new(FakeWork::default());
+        let steps = typing("next week").into_iter().chain([press(KeyCode::Enter)]).collect();
+        let paths = Paths::under("/r".as_ref());
+        let (chosen, _) = alone_screen(dialog(), steps, Arc::clone(&work) as Arc<dyn Work>, paths.clone());
+        let Some(Action::Run(Job::Snooze { until, .. })) = chosen else { panic!("{chosen:?}") };
+        assert_eq!(until, Until::Time(NOW + 7 * 86400));
+        assert_eq!(jobs(&work), [Job::SnoozeTime { text: "next week".into() }]);
+        let steps = typing("monkey").into_iter().chain([press(KeyCode::Enter), press(KeyCode::Esc)]).collect();
+        let (chosen, shown) = alone_screen(dialog(), steps, work, paths);
+        assert_eq!(chosen, None);
+        assert!(shown.contains("cannot understand snooze time: monkey"), "{shown}");
     }
 
     /// R1.1: Ctrl+N, a title, Tab to the description, Ctrl+S: the task is

@@ -804,7 +804,14 @@ The switcher and its dialogs follow these principles.
   - Screens do no I/O: what they need read they say in `Screen::needs` (a
     folder listing, the add dialog's check of what was typed) and when
     (`Screen::due`, a check once typing pauses for 250 ms), and the loop
-    reads it after each event and hands it back.
+    reads it after each event and hands it back. A time typed that only
+    GNU `date` reads (`next week`, R4.1), in the snooze dialog or the
+    form's "Other time…", is a job (`Job::SnoozeTime`): `Until::read`
+    reads itm's own phrases in the screen and leaves the others, a worker
+    runs `date` (`Until::parse` with `system::date_reads`), and its answer
+    comes back to the screen that asked, which then snoozes or saves, or
+    says why not with what was typed still there. Keys wait meanwhile (a
+    few milliseconds; `date` gets 5 s).
   - The loop waits for a key, a worker's result (over a channel) or a
     deadline (the 2 s refresh, a message's expiry, a screen's check).
     Idle, it blocks on the terminal until the deadline; while a worker runs
@@ -913,8 +920,10 @@ The switcher and its dialogs follow these principles.
     snapshot, so drawing stays pure.
 - **Other systems.** `system.rs` keeps `system.py`'s split: the process
   table from `/proc`, else `ps -ww` with one `-o` per column (bounded by a
-  5 s timeout), and notifications through `osascript` on macOS (title and
-  body as arguments, no Open action), else `notify-send`. Which one is
+  5 s timeout), notifications through `osascript` on macOS (title and
+  body as arguments, no Open action), else `notify-send`, and the snooze
+  phrases itm does not read itself through `gdate`, else `date`, whichever
+  reads a relative phrase (`date_reads`, as `gnu_date` probes). Which one is
   chosen at run time, not at compile time, so the `ps` reader and the
   macOS notifier are built and tested on Linux too (captured macOS and
   FreeBSD `ps` output, and Linux's own `ps`). The non-blocking socket

@@ -21,13 +21,14 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
 
-use super::app::{Action, Job, Snapshot};
+use super::app::{Action, Job, Reply, Snapshot};
 use super::draw::{
     ACCENT, MUTED, Tone, WIDE, bold, colored, dialog_box, field_line, muted, name_badge, project_line,
     wrapped_key_hints, wrapped_rows,
 };
 use super::finder::{Finder, Saved};
 use super::screen::{Context, Outcome, Screen};
+use crate::error::Error;
 use crate::herdr::Session;
 use crate::paths::Paths;
 use crate::snooze::Until;
@@ -50,6 +51,23 @@ enum Has {
     Folder,
     Missing,
     Nothing,
+}
+
+/// A new task's snooze as the form holds it.
+#[derive(Debug, Clone, PartialEq)]
+enum Chosen {
+    /// Read already; None: not snoozed.
+    Read(Option<Until>),
+    /// A time typed that only GNU `date` reads (`next week`): a worker reads it on save (R4.1).
+    ForDate(String),
+}
+
+/// A snooze for a new task, which has no agents yet, so none could wake it.
+fn new_snooze(until: Option<Until>) -> Result<Option<Until>, String> {
+    match until {
+        Some(Until::Agent) => Err("a new task has no agents yet, so none could wake it; pick a time".into()),
+        until => Ok(until),
+    }
 }
 
 /// What adding a project does to a task's session (R5.4).
@@ -131,6 +149,9 @@ pub struct TaskForm {
     pub other: Input,
     pub focus: Part,
     pub error: Option<String>,
+    /// A time typed that only GNU `date` reads is being read by a worker
+    /// (R4.1): saving waits for it, and keys wait too.
+    pub reading: bool,
     /// Why saving cannot switch to the task (a plain Herdr client, R1.4).
     pub cannot_switch: Option<String>,
     /// Where a task without a project folder starts, as shown.
@@ -159,6 +180,7 @@ impl TaskForm {
             other: Input::default(),
             focus: Part::Title,
             error: None,
+            reading: false,
             cannot_switch: None,
             task_dir: paths.display(&paths.task_dir),
         }
@@ -180,6 +202,7 @@ impl TaskForm {
             other: Input::default(),
             focus: Part::Title,
             error: None,
+            reading: false,
             cannot_switch: None,
             task_dir: String::new(),
         }
@@ -236,6 +259,9 @@ impl TaskForm {
     pub fn on_key(&mut self, key: KeyEvent, cx: &Context) -> Outcome {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
+        if self.reading {
+            return Outcome::Stay; // for the few milliseconds `date` takes
+        }
         match key.code {
             KeyCode::Esc if self.typed() => return Outcome::Open(Box::new(Screen::ConfirmDiscard)),
             KeyCode::Esc => return Outcome::Close,
@@ -299,19 +325,34 @@ impl TaskForm {
     }
 
     /// The snooze chosen; Err for a time typed that does not read.
-    fn snooze_value(&self, now: i64, tz: &TimeZone) -> Result<Option<Until>, String> {
+    fn snooze_value(&self, now: i64, tz: &TimeZone) -> Result<Chosen, String> {
         match self.snooze {
-            0 => Ok(None),
-            n if n <= self.presets.len() => Ok(Some(self.presets[n - 1].1)),
+            0 => Ok(Chosen::Read(None)),
+            n if n <= self.presets.len() => Ok(Chosen::Read(Some(self.presets[n - 1].1))),
             _ => match self.other.value().trim() {
-                "" => Ok(None),
+                "" => Ok(Chosen::Read(None)),
                 // Refused here, while what was typed is still on screen.
-                text => match Until::parse(text, now, tz) {
-                    Ok(Until::Agent) => Err("a new task has no agents yet, so none could wake it; pick a time".into()),
-                    Ok(until) => Ok(Some(until)),
+                text => match Until::read(text, now, tz) {
+                    Ok(None) => Ok(Chosen::ForDate(text.into())),
+                    Ok(until) => new_snooze(until).map(Chosen::Read),
                     Err(e) => Err(e.to_string()),
                 },
             },
+        }
+    }
+
+    /// The time typed was read by a worker (R4.1): save with it, or say why not.
+    pub fn read(&mut self, result: Result<Reply, Error>) -> Outcome {
+        self.reading = false;
+        match result.map_err(|e| e.to_string()).and_then(|reply| match reply {
+            Reply::Until(until) => new_snooze(Some(until)),
+            _ => Err("the time was not read".into()),
+        }) {
+            Ok(until) => self.create(until),
+            Err(e) => {
+                (self.error, self.focus) = (Some(e), Part::Other);
+                Outcome::Stay
+            }
         }
     }
 
@@ -357,15 +398,25 @@ impl TaskForm {
                     self.error = Some(e);
                     return Outcome::Stay;
                 }
-                Ok(until) => Job::Create {
-                    title,
-                    description: Some(description).filter(|d| !d.is_empty()),
-                    projects: self.projects.clone(),
-                    until,
-                },
+                Ok(Chosen::ForDate(text)) => {
+                    (self.reading, self.error) = (true, None);
+                    return Outcome::Act(Action::Run(Job::SnoozeTime { text }));
+                }
+                Ok(Chosen::Read(until)) => return self.create(until),
             },
         };
         Outcome::CloseAnd(Action::Run(job))
+    }
+
+    /// Save the new task, snoozed `until` (its title was checked).
+    fn create(&self, until: Option<Until>) -> Outcome {
+        let description = self.description_text().trim().to_string();
+        Outcome::CloseAnd(Action::Run(Job::Create {
+            title: self.title.value().trim().to_string(),
+            description: Some(description).filter(|d| !d.is_empty()),
+            projects: self.projects.clone(),
+            until,
+        }))
     }
 
     fn project(&self, id: &str) -> Option<&Project> {
@@ -413,7 +464,9 @@ impl TaskForm {
             let slug = if title.trim().is_empty() { "…".into() } else { slugify(title) };
             lines.push(("Session  ", format!("task-{slug}"), Tone::Muted));
             let then = match (self.snooze_value(now, tz), &self.cannot_switch) {
-                (Ok(Some(_)) | Err(_), _) => "Saved snoozed; the session starts when you open it".into(),
+                (Ok(Chosen::Read(Some(_)) | Chosen::ForDate(_)) | Err(_), _) => {
+                    "Saved snoozed; the session starts when you open it".into()
+                }
                 (_, Some(problem)) => format!("Saved without switching: {problem}"),
                 _ => "Then switches you to it".into(),
             };
@@ -478,6 +531,8 @@ impl TaskForm {
         }
         if let Some(e) = &self.error {
             tail.push(Line::from(Tone::Error.span(e.clone())));
+        } else if self.reading {
+            tail.push(Line::from(muted("Reading the time…")));
         }
         tail.push(Line::default());
         tail.extend(wrapped_key_hints(keys, width as u16));
@@ -739,10 +794,10 @@ mod tests {
         let mut form = new_form(&[]);
         press(&mut form, &typed("Soon"));
         press(&mut form, &[key(KeyCode::Tab), key(KeyCode::Tab), key(KeyCode::Tab)]);
-        press(&mut form, &typed("soonish")); // typing on the snooze is typing a time
-        assert_eq!((form.focus, form.other.value()), (Part::Other, "soonish"));
+        press(&mut form, &typed("25:00")); // typing on the snooze is typing a time
+        assert_eq!((form.focus, form.other.value()), (Part::Other, "25:00"));
         assert!(matches!(press(&mut form, &[key(KeyCode::Enter)]), Outcome::Stay));
-        assert_eq!(form.error.as_deref(), Some("cannot understand snooze time: soonish"));
+        assert_eq!(form.error.as_deref(), Some("invalid time: 25:00"));
         form.other = Input::new("agent".into());
         assert!(matches!(press(&mut form, &[key(KeyCode::Enter)]), Outcome::Stay));
         assert_eq!(form.error.as_deref(), Some("a new task has no agents yet, so none could wake it; pick a time"));
@@ -751,6 +806,41 @@ mod tests {
         let job = saved_job(press(&mut form, &[key(KeyCode::Enter)]));
         assert!(matches!(job, Job::Create { until: Some(Until::Time(t)), .. } if t == NOW + 7200));
         assert!(form.presets.iter().all(|p| p.1 != Until::Agent));
+    }
+
+    /// R4.1: a time only GNU `date` reads (`next week`) is read by a worker
+    /// before saving; keys wait meanwhile, and what it says stays on screen.
+    #[test]
+    fn r4_1_a_time_only_gnu_date_reads_is_read_before_saving() {
+        let mut form = new_form(&[]);
+        press(&mut form, &typed("Later"));
+        press(&mut form, &[key(KeyCode::Tab), key(KeyCode::Tab), key(KeyCode::Tab)]);
+        press(&mut form, &typed("next week"));
+        assert!(effects(&form).contains(&"Saved snoozed; the session starts when you open it".to_string()));
+        let outcome = press(&mut form, &[ctrl('s')]);
+        let Outcome::Act(Action::Run(job)) = outcome else { panic!("not read first: {outcome:?}") };
+        assert_eq!(job, Job::SnoozeTime { text: "next week".into() });
+        assert!(form.reading);
+        press(&mut form, &[key(KeyCode::Char('!')), key(KeyCode::Esc)]);
+        assert_eq!((form.other.value(), form.reading), ("next week", true), "keys wait for the time");
+        let week = NOW + 7 * 86400;
+        let job = saved_job(form.read(Ok(Reply::Until(Until::Time(week)))));
+        assert_eq!(
+            job,
+            Job::Create { title: "Later".into(), description: None, projects: vec![], until: Some(Until::Time(week)) }
+        );
+
+        let mut form = new_form(&[]);
+        press(&mut form, &typed("Later"));
+        press(&mut form, &[key(KeyCode::Tab), key(KeyCode::Tab), key(KeyCode::Tab)]);
+        press(&mut form, &typed("monkey"));
+        press(&mut form, &[key(KeyCode::Tab), ctrl('s')]); // saved from another field
+        let failed = form.read(Err(Error::Other("cannot understand snooze time: monkey".into())));
+        assert!(matches!(failed, Outcome::Stay));
+        assert_eq!((form.error.as_deref(), form.focus), (Some("cannot understand snooze time: monkey"), Part::Other));
+        assert!(!form.reading);
+        press(&mut form, &[key(KeyCode::Backspace)]);
+        assert_eq!(form.other.value(), "monke", "typing goes on");
     }
 
     /// R1.6: on the projects field Enter or Space opens the finder empty, a

@@ -1,8 +1,9 @@
 //! Snooze times as people type them (R4.1): `30m`, `2h`, `1h30m`, `2d`, `45`
 //! (minutes), `14:30`, `5pm`, `today 17:00`, `tomorrow 9:00`, `friday 2pm`,
-//! `next mon`, `2026-12-01 14:30`. A port of the Python `_when` and
-//! `_day_and_clock`, read in local wall-clock time; the GNU `date` fallback
-//! for other phrases is left out.
+//! `next mon`, `2026-12-01 14:30`, read by itm itself in local wall-clock
+//! time (a port of the Python `_when` and `_day_and_clock`), and any other
+//! phrase (`next week`, `+3 days`) as GNU `date -d` reads it, when there is
+//! one ([`crate::system::date_reads`]).
 
 use std::sync::LazyLock;
 
@@ -24,11 +25,23 @@ pub enum Until {
 }
 
 impl Until {
-    /// A snooze as typed: a time [`parse_when`] reads, or "agent".
-    pub fn parse(text: &str, now: i64, tz: &TimeZone) -> Result<Until> {
+    /// A snooze as typed: "agent", a time itm reads itself, else what `date`
+    /// reads the phrase as (an epoch second; GNU `date -d` in itm,
+    /// [`crate::system::date_reads`]).
+    pub fn parse(text: &str, now: i64, tz: &TimeZone, date: impl FnOnce(&str) -> Option<i64>) -> Result<Until> {
+        match Until::read(text, now, tz)? {
+            Some(until) => Ok(until),
+            None => checked(text, date(text.trim()).ok_or_else(|| unreadable(text))?, now).map(Until::Time),
+        }
+    }
+
+    /// A snooze as typed, without running anything: "agent" or a time itm
+    /// reads itself. None for a phrase only GNU `date` reads (`next week`):
+    /// a screen has it read by a worker ([`Until::parse`]).
+    pub fn read(text: &str, now: i64, tz: &TimeZone) -> Result<Option<Until>> {
         match text.trim().to_lowercase().as_str() {
-            "agent" | "until an agent needs me" => Ok(Until::Agent),
-            _ => parse_when(text, now, tz).map(Until::Time),
+            "agent" | "until an agent needs me" => Ok(Some(Until::Agent)),
+            _ => Ok(parse_when(text, now, tz)?.map(Until::Time)),
         }
     }
 
@@ -67,9 +80,14 @@ pub fn presets(now: i64, tz: &TimeZone, agent: bool) -> Vec<(&'static str, Until
     presets
 }
 
-/// The epoch second a snooze typed as `text` ends: in the future, at most 10 years away.
-pub fn parse_when(text: &str, now: i64, tz: &TimeZone) -> Result<i64> {
-    let when = when(text, now, tz)?;
+/// The epoch second a snooze typed as `text` ends, read by itm itself: in
+/// the future, at most 10 years away. None for a phrase only GNU `date` reads.
+fn parse_when(text: &str, now: i64, tz: &TimeZone) -> Result<Option<i64>> {
+    when(text, now, tz)?.map(|when| checked(text, when, now)).transpose()
+}
+
+/// `when`, the end of a snooze typed as `text`, if it is in the future and at most 10 years away.
+fn checked(text: &str, when: i64, now: i64) -> Result<i64> {
     if when <= now {
         bail!("snooze time must be in the future: {text}");
     }
@@ -92,7 +110,12 @@ static DAY_AND_CLOCK: LazyLock<Regex> = LazyLock::new(|| {
 
 const WEEKDAYS: [&str; 7] = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"];
 
-fn when(text: &str, now: i64, tz: &TimeZone) -> Result<i64> {
+fn unreadable(text: &str) -> Error {
+    Error::Other(format!("cannot understand snooze time: {text}"))
+}
+
+/// What itm reads itself; None for any other phrase.
+fn when(text: &str, now: i64, tz: &TimeZone) -> Result<Option<i64>> {
     let spec: String = text.trim().to_lowercase().split_whitespace().collect();
     if spec.is_empty() {
         bail!("empty snooze time");
@@ -101,7 +124,7 @@ fn when(text: &str, now: i64, tz: &TimeZone) -> Result<i64> {
     let number =
         |digits: &str, unit: i64| digits.parse::<i64>().ok().and_then(|n| n.checked_mul(unit)).ok_or_else(too_far);
     if spec.bytes().all(|b| b.is_ascii_digit()) {
-        return Ok(now + number(&spec, 60)?);
+        return Ok(Some(now + number(&spec, 60)?));
     }
     if let Some(parts) = DURATION.captures(&spec)
         && parts.iter().skip(1).any(|part| part.is_some())
@@ -112,9 +135,9 @@ fn when(text: &str, now: i64, tz: &TimeZone) -> Result<i64> {
                 total = total.checked_add(number(digits.as_str(), unit)?).ok_or_else(too_far)?;
             }
         }
-        return Ok(total);
+        return Ok(Some(total));
     }
-    day_and_clock(text, now, tz)?.ok_or_else(|| Error::Other(format!("cannot understand snooze time: {text}")))
+    day_and_clock(text, now, tz)
 }
 
 /// `14:30`, `5pm`, `tomorrow 9:00`, `friday 2pm`, `next mon`, `2026-12-01 14:30`,
@@ -194,7 +217,7 @@ mod tests {
         for (text, expected) in
             [("30m", b + 1800), ("1h30m", b + 5400), ("2d", b + 2 * 86400), ("1h 30m", b + 5400), ("45", b + 45 * 60)]
         {
-            assert_eq!(parse_when(text, b, &tz()), Ok(expected), "{text}");
+            assert_eq!(parse_when(text, b, &tz()), Ok(Some(expected)), "{text}");
         }
     }
 
@@ -220,8 +243,13 @@ mod tests {
             ("12pm", "2026-11-04T12:00"),
         ];
         for (text, expected) in cases {
-            assert_eq!(parse_when(text, base(), &tz()), Ok(at(expected)), "{text}");
+            assert_eq!(parse_when(text, base(), &tz()), Ok(Some(at(expected))), "{text}");
         }
+    }
+
+    /// What no `date` reads: GNU `date` is not installed.
+    fn no_date(_: &str) -> Option<i64> {
+        None
     }
 
     #[test]
@@ -246,8 +274,37 @@ mod tests {
             "next week",
             "99999999999999999999",
         ] {
-            assert!(parse_when(text, base(), &tz()).is_err(), "{text:?} should be refused");
+            assert!(Until::parse(text, base(), &tz(), no_date).is_err(), "{text:?} should be refused");
         }
+        let said = |text| Until::parse(text, base(), &tz(), no_date).unwrap_err().to_string();
+        assert_eq!(said("next week"), "cannot understand snooze time: next week");
+        assert_eq!(said("0m"), "snooze time must be in the future: 0m");
+        assert_eq!(said("2026-13-01"), "invalid date: 2026-13-01");
+    }
+
+    #[test]
+    fn r4_1_other_phrases_go_to_gnu_date() {
+        // Read by itm itself: none for date; the rest is date's, checked like itm's own.
+        assert_eq!(parse_when("next week", base(), &tz()), Ok(None));
+        assert_eq!(parse_when("+3 days", base(), &tz()), Ok(None));
+        assert_eq!(Until::read("next week", base(), &tz()), Ok(None));
+        assert_eq!(Until::read("2h", base(), &tz()), Ok(Some(Until::Time(base() + 7200))));
+        let week = base() + 7 * 86400;
+        let mut asked = vec![];
+        let date = |phrase: &str| {
+            asked.push(phrase.to_string());
+            Some(week)
+        };
+        assert_eq!(Until::parse("  next week ", base(), &tz(), date), Ok(Until::Time(week)));
+        assert_eq!(asked, ["next week"], "trimmed, as Python passes it");
+        // date is asked only about what itm does not read itself.
+        let never = |_: &str| -> Option<i64> { panic!("date asked about a phrase itm reads") };
+        assert_eq!(Until::parse("tomorrow 9:00", base(), &tz(), never), Ok(Until::Time(at("2026-11-05T09:00"))));
+        assert!(Until::parse("25:00", base(), &tz(), never).is_err());
+        // What date reads is in the future and at most 10 years away, like any snooze.
+        let said = |text, at: i64| Until::parse(text, base(), &tz(), |_| Some(at)).unwrap_err().to_string();
+        assert_eq!(said("last week", base() - 7 * 86400), "snooze time must be in the future: last week");
+        assert_eq!(said("+20 years", base() + 20 * 366 * 86400), "snooze time is too far away: +20 years");
     }
 
     #[test]
@@ -255,7 +312,7 @@ mod tests {
         // New York, the evening before DST ends (2026-11-01 02:00 back to 01:00).
         let ny = TimeZone::posix("EST5EDT,M3.2.0,M11.1.0").unwrap();
         let now = "2026-10-31T23:00".parse::<civil::DateTime>().unwrap().to_zoned(ny.clone()).unwrap();
-        let when = parse_when("22:00", now.timestamp().as_second(), &ny).unwrap();
+        let when = parse_when("22:00", now.timestamp().as_second(), &ny).unwrap().unwrap();
         let local = Timestamp::from_second(when).unwrap().to_zoned(ny);
         assert_eq!(local.datetime(), "2026-11-01T22:00".parse::<civil::DateTime>().unwrap());
     }
@@ -278,8 +335,8 @@ mod tests {
 
     #[test]
     fn until_an_agent_and_descriptions() {
-        assert_eq!(Until::parse("Agent", base(), &tz()), Ok(Until::Agent));
-        assert_eq!(Until::parse("2h", base(), &tz()), Ok(Until::Time(base() + 7200)));
+        assert_eq!(Until::parse("Agent", base(), &tz(), no_date), Ok(Until::Agent));
+        assert_eq!(Until::parse("2h", base(), &tz(), no_date), Ok(Until::Time(base() + 7200)));
         assert_eq!(Until::Agent.describe(base(), &tz()), "until an agent needs you");
         assert_eq!(Until::Time(at("2026-11-04T17:00")).describe(base(), &tz()), "until 17:00");
     }

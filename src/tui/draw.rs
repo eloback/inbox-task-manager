@@ -809,6 +809,8 @@ fn draw_snooze(frame: &mut Frame, dialog: &SnoozeDialog, area: Rect, tz: &TimeZo
     frame.render_widget(Paragraph::new(rows.collect::<Vec<_>>()), presets);
     if let Some(e) = &dialog.error {
         frame.render_widget(Paragraph::new(colored(e.clone(), ERROR)), error);
+    } else if dialog.reading {
+        frame.render_widget(Paragraph::new(muted("Reading the time…")), error);
     }
     frame.render_widget(Paragraph::new(key_hints(&[("enter", "snooze"), ("↑↓", "pick"), ("esc", "cancel")])), keys);
 }

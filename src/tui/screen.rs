@@ -159,6 +159,7 @@ impl Screen {
                 matches!(job, Job::AddProject { .. } | Job::Clone { .. } | Job::CheckProject { .. })
             }
             Screen::Settings(_) => matches!(job, Job::Setting { .. }),
+            Screen::Snooze(_) | Screen::Form(_) => matches!(job, Job::SnoozeTime { .. }),
             Screen::Projects(_) => {
                 matches!(job, Job::RenameProject { .. } | Job::RemovalPlan { .. } | Job::RemoveProject { .. })
             }
@@ -175,6 +176,8 @@ impl Screen {
                 _ => Outcome::Stay,
             },
             Screen::Projects(screen) => screen.done(job, result, cx),
+            Screen::Snooze(dialog) => dialog.read(result),
+            Screen::Form(form) => form.read(result),
             _ => Outcome::Stay,
         }
     }
@@ -361,15 +364,19 @@ pub struct SnoozeDialog {
     pub presets: Vec<(&'static str, Until)>,
     pub selected: usize,
     pub error: Option<String>,
+    /// A time typed that only GNU `date` reads is being read by a worker
+    /// (R4.1); keys wait for it.
+    pub reading: bool,
 }
 
 impl SnoozeDialog {
     pub fn new(session: String, title: String, presets: Vec<(&'static str, Until)>) -> SnoozeDialog {
-        SnoozeDialog { session, title, typed: Input::default(), presets, selected: 0, error: None }
+        SnoozeDialog { session, title, typed: Input::default(), presets, selected: 0, error: None, reading: false }
     }
 
     fn on_key(&mut self, key: KeyEvent, cx: &Context) -> Outcome {
         match key.code {
+            _ if self.reading => {} // for the few milliseconds `date` takes
             KeyCode::Esc => return Outcome::Close,
             _ if moves(key) != 0 => {
                 self.selected = step(self.selected, moves(key), self.presets.len().saturating_sub(1))
@@ -377,15 +384,16 @@ impl SnoozeDialog {
             KeyCode::Enter => {
                 let until = match self.typed.value().trim() {
                     "" => match self.presets.get(self.selected) {
-                        Some(&(_, until)) => Ok(until),
+                        Some(&(_, until)) => Ok(Some(until)),
                         None => return Outcome::Stay, // nothing offered and nothing typed
                     },
-                    typed => Until::parse(typed, cx.now.epoch, cx.tz),
+                    typed => Until::read(typed, cx.now.epoch, cx.tz),
                 };
                 match until {
-                    Ok(until) => {
-                        let job = Job::Snooze { session: self.session.clone(), title: self.title.clone(), until };
-                        return Outcome::CloseAnd(Action::Run(job));
+                    Ok(Some(until)) => return self.snooze(until),
+                    Ok(None) => {
+                        self.reading = true;
+                        return Outcome::Act(Action::Run(Job::SnoozeTime { text: self.typed.value().trim().into() }));
                     }
                     Err(e) => self.error = Some(e.to_string()), // free text keeps working; say why not
                 }
@@ -394,6 +402,21 @@ impl SnoozeDialog {
                 self.typed.handle_event(&Event::Key(key));
                 self.error = None;
             }
+        }
+        Outcome::Stay
+    }
+
+    fn snooze(&self, until: Until) -> Outcome {
+        Outcome::CloseAnd(Action::Run(Job::Snooze { session: self.session.clone(), title: self.title.clone(), until }))
+    }
+
+    /// The time typed was read by a worker (R4.1).
+    fn read(&mut self, result: Result<Reply, Error>) -> Outcome {
+        self.reading = false;
+        match result {
+            Ok(Reply::Until(until)) => return self.snooze(until),
+            Ok(_) => {}
+            Err(e) => self.error = Some(e.to_string()),
         }
         Outcome::Stay
     }

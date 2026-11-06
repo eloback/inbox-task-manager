@@ -215,6 +215,11 @@ pub enum Job {
         title: String,
         until: Until,
     },
+    /// Read a time typed for a snooze that only GNU `date` reads (`next
+    /// week`, R4.1); done, it is [`Reply::Until`], for the screen it was typed in.
+    SnoozeTime {
+        text: String,
+    },
     /// What removing a project would do (it reads its clone with git), for the remove dialog.
     RemovalPlan {
         id: String,
@@ -256,7 +261,7 @@ pub enum Job {
 impl Job {
     /// Whether the switcher's list may show something else once it is done (a refresh follows).
     pub fn changes_tasks(&self) -> bool {
-        !matches!(self, Job::CheckProject { .. } | Job::RemovalPlan { .. })
+        !matches!(self, Job::CheckProject { .. } | Job::RemovalPlan { .. } | Job::SnoozeTime { .. })
     }
 }
 
@@ -271,6 +276,8 @@ pub enum Reply {
     /// A project was saved: its id, and the project as saved.
     Added(String, Project),
     Checked(Check),
+    /// A snooze time typed, as read.
+    Until(Until),
     Plan(RemovalPlan),
     Removed(Vec<RemovalNote>),
     /// (old name, new name, a note).
@@ -727,7 +734,8 @@ impl App {
             (
                 Job::CheckProject { .. } | Job::RemovalPlan { .. } | Job::AddProject { .. } | Job::Clone { .. },
                 Ok(_),
-            ) => {} // its screen closed meanwhile
+            )
+            | (Job::SnoozeTime { .. }, _) => {} // its screen closed meanwhile
             (_, Err(e)) => self.flash(e.to_string(), true),
             (Job::Wake { title, .. }, Ok(_)) => self.flash(format!("“{title}” is active."), false),
             (Job::Archive { session, .. } | Job::Delete { session, .. }, Ok(_)) if here(&session) => {
@@ -1028,10 +1036,10 @@ pub mod tests {
         assert!(app.screens.is_empty());
 
         app.on_key(ctrl('z'));
-        typed(&mut app, "soonish");
+        typed(&mut app, "25:00");
         assert_eq!(app.on_key(key(KeyCode::Enter)), Action::None);
         let [Screen::Snooze(dialog)] = &app.screens[..] else { panic!("the dialog stays open") };
-        assert_eq!(dialog.error.as_deref(), Some("cannot understand snooze time: soonish"));
+        assert_eq!(dialog.error.as_deref(), Some("invalid time: 25:00"));
         for _ in 0..7 {
             app.on_key(key(KeyCode::Backspace));
         }
@@ -1039,6 +1047,39 @@ pub mod tests {
         let action = app.on_key(key(KeyCode::Enter));
         assert!(matches!(action, Action::Run(Job::Snooze { until: Until::Agent, .. })), "{action:?}");
         assert_eq!(app.search.value(), "", "typing went to the dialog, not the search");
+    }
+
+    /// R4.1: a phrase only GNU `date` reads goes to a worker, and its
+    /// answer back to the dialog: a snooze, or why not, with the dialog open.
+    #[test]
+    fn r4_1_the_snooze_dialog_has_gnu_date_read_other_phrases() {
+        let mut app = app(snapshot());
+        app.on_key(ctrl('z'));
+        typed(&mut app, "next week");
+        let read = Job::SnoozeTime { text: "next week".into() };
+        assert_eq!(app.on_key(key(KeyCode::Enter)), Action::Run(read.clone()));
+        assert!(!read.changes_tasks());
+        assert_eq!(app.on_key(key(KeyCode::Esc)), Action::None, "keys wait for the time");
+        let [Screen::Snooze(dialog)] = &app.screens[..] else { panic!("the dialog stays open while date reads") };
+        assert!(dialog.reading);
+        let week = NOW + 7 * 86400;
+        let snooze =
+            Job::Snooze { session: "task-fix-login".into(), title: "Fix login".into(), until: Until::Time(week) };
+        assert_eq!(app.done(read, Ok(Reply::Until(Until::Time(week)))), Action::Run(snooze));
+        assert!(app.screens.is_empty());
+
+        app.on_key(ctrl('z'));
+        typed(&mut app, "monkey");
+        let read = Job::SnoozeTime { text: "monkey".into() };
+        assert_eq!(app.on_key(key(KeyCode::Enter)), Action::Run(read.clone()));
+        let said = Error::Other("cannot understand snooze time: monkey".into());
+        assert_eq!(app.done(read.clone(), Err(said)), Action::None);
+        let [Screen::Snooze(dialog)] = &app.screens[..] else { panic!("the dialog stays open") };
+        assert_eq!((dialog.error.as_deref(), dialog.reading), (Some("cannot understand snooze time: monkey"), false));
+        // Its screen gone, the answer is dropped.
+        app.on_key(key(KeyCode::Esc));
+        assert_eq!(app.done(read, Err(Error::Other("late".into()))), Action::None);
+        assert!(app.message.is_none(), "nothing said for a closed dialog");
     }
 
     #[test]
