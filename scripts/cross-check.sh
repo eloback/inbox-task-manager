@@ -21,8 +21,12 @@
 # binaries. The Nix build of the Python itm puts its own git first on PATH,
 # so git projects run its inner entry point, `.itm-wrapped` next to it
 # (ITM_PYTHON_BARE), with a git whose clone makes an empty checkout of the
-# URL instead of fetching it (no network). Prints PASS/FAIL per check;
-# exits 1 if any failed. Later milestones add their commands here.
+# URL instead of fetching it (no network). Herdr workspaces (R10) need
+# `herdr` and `socat`: each side gets its own headless Herdr session with
+# the same workspaces, and its own daemon runs for a few passes at a time.
+# Prints PASS/FAIL per check (what the Rust itm printed at each step is in
+# cross/steps.log); exits 1 if any failed. Later milestones add their
+# commands here.
 set -u
 root=${ITM_SANDBOX:?run this through scripts/sandbox.sh}
 repo=$(cd "$(dirname "$0")/.." && pwd)
@@ -42,11 +46,12 @@ check() { # check <description> <command...>
 }
 
 # Each side has its own state, data, runtime and Herdr folders; the home folder is shared.
+# With IN_SESSION set, a command runs inside that session of the side's own Herdr.
 side() { # side <name> <command...>
   local dir=$work/$1; shift
   mkdir -p "$dir/state" "$dir/data" "$dir/config" "$dir/runtime"
   env XDG_STATE_HOME="$dir/state" XDG_DATA_HOME="$dir/data" XDG_CONFIG_HOME="$dir/config" \
-    XDG_RUNTIME_DIR="$dir/runtime" "$@"
+    XDG_RUNTIME_DIR="$dir/runtime" ${IN_SESSION:+HERDR_SOCKET_PATH=$dir/config/herdr/sessions/$IN_SESSION/herdr.sock} "$@"
 }
 tasks() { echo "$work/$1/state/inbox-task-manager/tasks.json"; }
 # What may differ between two runs of one command: when, and which side's folders.
@@ -89,6 +94,7 @@ both() { # both <args...>: the same command on side py (Python) and side rs (Rus
       sed -i -E 's/"id": "[0-9a-f]{8}"/"id": "<id>"/' "$work/$name.out"
     else cp "$(tasks $name)" "$work/$name.tasks"; fi
   done
+  { echo "## itm $*"; cat "$work/rs.out" "$work/rs.err"; } >>"$work/steps.log" # what Rust said, for a reader
   check "itm $* -- same output" same "$work/py.out" "$work/rs.out"
   check "itm $* -- same errors" same "$work/py.err" "$work/rs.err"
   check "itm $* -- same tasks.json" same "$work/py.tasks" "$work/rs.tasks"
@@ -281,6 +287,128 @@ check "--delete-clone deletes it anyway" same <(clones py) <(clones rs)
 python=$python_wrapped
 export PATH=$saved_path
 unset GIT_CONFIG_COUNT
+
+echo "== Herdr workspaces and settings (R10), each side with its own headless Herdr"
+# Both sides get the same session with the same workspaces, made in the same
+# order, so Herdr gives them the same ids. Their daemons run for a few passes
+# at a time (the first pass over a session only adds), one side after the other.
+session=task-workspaces
+sock() { echo "$work/$1/config/herdr/sessions/$session/herdr.sock"; }
+call() { printf '%s\n' "$2" | socat -t 5 - "UNIX-CONNECT:$(sock "$1")"; }
+open_ws() { # open_ws <folder> <label or ""> <focus>: on both sides
+  local label="" name; [ -n "$2" ] && label=",\"label\":\"$2\""
+  for name in py rs; do
+    call $name "{\"id\":\"w\",\"method\":\"workspace.create\",\"params\":{\"cwd\":\"$1\"$label,\"focus\":$3}}" >/dev/null
+  done
+}
+close_ws() { local name; for name in py rs; do call $name "{\"id\":\"c\",\"method\":\"workspace.close\",\"params\":{\"workspace_id\":\"$1\"}}" >/dev/null; done; }
+focus_ws() { local name; for name in py rs; do call $name "{\"id\":\"f\",\"method\":\"workspace.focus\",\"params\":{\"workspace_id\":\"$1\"}}" >/dev/null; done; }
+daemons() { # daemons <seconds>: each side's daemon, one side after the other
+  local name itm pid
+  for name in py rs; do
+    itm=$python; [ $name = rs ] && itm=$rust
+    (exec env XDG_STATE_HOME="$work/$name/state" XDG_DATA_HOME="$work/$name/data" XDG_CONFIG_HOME="$work/$name/config" \
+      XDG_RUNTIME_DIR="$work/$name/runtime" "$itm" daemon 2>>"$work/$name-daemon.log") &
+    pid=$!
+    sleep "$1"
+    kill "$pid"; wait "$pid" 2>/dev/null
+  done
+}
+task_has() { # task_has <side> <names...>: the projects of the task Workspaces, in order
+  local name=$1 has; shift
+  has=$(canon "$(tasks $name)" | python3 -c 'import json,sys; print(" ".join(json.load(sys.stdin)["tasks"]["task-workspaces"].get("projects", [])))')
+  [ "$has" = "$*" ] || { echo "    it has: $has"; return 1; }
+}
+same_state() { # same_state <what>: both tasks.json, ids replaced by names, are the same
+  canon "$(tasks py)" >"$work/py.tasks"; canon "$(tasks rs)" >"$work/rs.tasks"
+  check "$1 -- same tasks.json" same "$work/py.tasks" "$work/rs.tasks"
+}
+both new "Workspaces" --no-switch # before its session starts, which would take the name
+servers=()
+for name in py rs; do
+  (exec env XDG_CONFIG_HOME="$work/$name/config" HERDR_SESSION=$session setsid herdr server >"$work/$name-server.log" 2>&1) &
+  servers+=($!)
+done
+stop_servers() {
+  local name
+  for name in py rs; do side $name herdr session stop $session >/dev/null 2>&1; done
+  for pid in "${servers[@]}"; do kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null; done
+}
+trap stop_servers EXIT
+for name in py rs; do
+  for _ in $(seq 50); do [ -S "$(sock $name)" ] && break; sleep 0.1; done
+done
+check "py: its Herdr session answers" test -S "$(sock py)"
+check "rs: its Herdr session answers" test -S "$(sock rs)"
+mkdir -p "$HOME/ws/one/src" "$HOME/ws/two" "$HOME/ws/new" "$HOME/ws/cw"
+both project add dir '~/ws/one'
+both project add dir '~/ws/two'
+both project add name "Client W"
+both project add-workspace --name outside
+
+open_ws "$HOME/ws/one/src" "" true          # w1: in one
+open_ws "$HOME/ws/two" "" false             # w2: in two
+open_ws "$HOME/elsewhere" "Client W" false  # w3: named after a project without a folder
+daemons 3
+same_state "the daemons add the projects the workspaces are in (R10.3)"
+check "rs: they are one, two and Client W, in workspace order" task_has rs "<one>" "<two>" "<Client W>"
+reads rs list --json
+close_ws w2
+daemons 4.5
+same_state "the daemons remove the project whose workspace closed"
+check "rs: two left" task_has rs "<one>" "<Client W>"
+IN_SESSION=$session both edit Workspaces --remove-project one
+IN_SESSION=$session both project rename "Client W" "Client V"
+IN_SESSION=$session both project rename "Client V" "Client W"
+
+echo "-- add-workspace (R10.5), without a terminal"
+open_ws "$HOME/ws/new" "" true               # w4: a new folder, focused
+IN_SESSION=$session both project add-workspace
+IN_SESSION=$session HERDR_ACTIVE_WORKSPACE_ID=w1 both project add-workspace
+IN_SESSION=$session HERDR_ACTIVE_WORKSPACE_ID=w3 both project add-workspace
+open_ws "$HOME/ws/cw" "Client W" true        # w5: named after it, in a folder it could get
+IN_SESSION=$session both project add-workspace
+IN_SESSION=$session both project add-workspace --name other
+open_ws "$HOME" "" true                      # w6: the home folder
+IN_SESSION=$session both project add-workspace --name everything
+open_ws "/" "" true                          # w7: above it
+IN_SESSION=$session both project add-workspace
+focus_ws w4
+IN_SESSION=$session HERDR_ACTIVE_WORKSPACE_ID=nope both project add-workspace --name deeper
+IN_SESSION=task-gone both project add-workspace --name gone
+
+echo "-- settings (R10.4)"
+settings() { # settings <text>: both sides' config.toml
+  local name
+  for name in py rs; do mkdir -p "$work/$name/config/inbox-task-manager"; printf "$1" >"$work/$name/config/inbox-task-manager/config.toml"; done
+}
+settings '[herdr]\nprojects_from_workspaces = false\n'
+open_ws "$HOME/ws/two" "" false              # w8: two again
+IN_SESSION=$session HERDR_ACTIVE_WORKSPACE_ID=w8 both project add-workspace
+daemons 3
+same_state "off: projects are added by hand and the daemon keeps no record"
+settings '[herdr]\nremove_projects_without_workspace = false\n'
+daemons 3
+close_ws w1
+daemons 4.5
+same_state "without removal, a closed workspace's project stays"
+# one moved last when the edit above kept it (R5.4), in both.
+check "rs: one (found in w1) stays" task_has rs "<Client W>" "<one>" "<new>" "<two>"
+both project rename "Client W" "Client U"
+for text in '[herdr]\nnope = true\n' '[other]\n' '[herdr]\nprojects_from_workspaces = 1\n' 'herdr = 2\n'; do
+  settings "$text"
+  : >"$work/py-daemon.log"; : >"$work/rs-daemon.log"
+  daemons 2.5
+  check "the daemons ignore '$(printf "$text" | head -1)' the same way, once" same "$work/py-daemon.log" "$work/rs-daemon.log"
+done
+check "a broken file is logged once" test "$(grep -c 'settings ignored' "$work/rs-daemon.log")" = 1
+settings '[herdr\n'
+both project rename "Client U" "Client T"
+IN_SESSION=$session HERDR_ACTIVE_WORKSPACE_ID=w5 both project add-workspace
+same_state "a broken settings file: nothing follows workspaces"
+settings '# kept\n'
+stop_servers
+trap - EXIT
 
 echo "== each reads the other's state"
 for state in py rs; do
