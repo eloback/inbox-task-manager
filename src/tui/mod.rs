@@ -1,19 +1,28 @@
 //! The switcher (`itm`, `itm ui`): a terminal UI over ratatui, and the
-//! dialogs the CLI opens alone: snooze without a time, the delete question,
-//! what to do with a removed project's clone, and the workspace hotkey's
-//! add dialog and folder question.
+//! screens the CLI opens alone: the New task and edit forms, snooze
+//! without a time, the delete question, what to do with a removed
+//! project's clone, and the workspace hotkey's add dialog and folder
+//! question.
 //!
 //! The event loop waits for a key, a worker's result or a deadline (the
-//! 2 s refresh, a message expiring). Anything that can block (Herdr calls,
-//! the store lock, a hand-off) runs in a worker thread that sends its
-//! result over a channel. What the loop needs from the world is injected
-//! (where time and keys come from, [`Events`]; what workers do, [`Work`];
-//! the terminal backend), so its tests run it on a test backend with a
-//! scripted clock. Choosing a task returns it to the caller, which switches
-//! once the terminal is restored.
+//! 2 s refresh, a message expiring, a check once typing pauses). Anything
+//! that can block (Herdr calls, the store lock, git, a hand-off, a folder
+//! listing) runs in a thread that sends its result over a channel. What
+//! the loop needs from the world is injected (where time and keys come
+//! from, [`Events`]; what workers do, [`Work`]; the terminal backend), so
+//! its tests run it on a test backend with a scripted clock. Choosing a
+//! task returns it to the caller, which switches once the terminal is
+//! restored.
 
+mod add;
 mod app;
+mod clones;
+mod completion;
 mod draw;
+mod finder;
+mod form;
+mod help;
+mod projects;
 mod screen;
 
 use std::panic::{self, AssertUnwindSafe};
@@ -25,16 +34,24 @@ use std::time::{Duration, Instant};
 use jiff::tz::TimeZone;
 use ratatui::Terminal;
 use ratatui::backend::Backend;
-use ratatui::crossterm::event::{self, Event, KeyEvent, KeyEventKind};
+use ratatui::crossterm::event::{self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyEvent, KeyEventKind};
+use ratatui::crossterm::execute;
 
 pub use app::View;
-use app::{Action, App, Job, Moment, NotesTail, Snapshot};
-use screen::{AddDialog, Context as ScreenContext, Outcome, RemoveDialog, Screen, SnoozeDialog};
+use app::{Action, App, Job, Moment, NotesTail, Reply, Snapshot};
+pub use finder::Saved;
+pub use form::{Editing, Effect, TaskForm};
+use screen::{Need, RemoveDialog, Screen, SnoozeDialog};
 
 use crate::error::{Context, Error, Result};
+use crate::folders::{Listing, SCAN_LIMIT, list_folders};
 use crate::itm::Itm;
-use crate::projects::{CloneChoice, RemovalNote, RemovalPlan};
+use crate::paths::Paths;
+use crate::projects::{CloneChoice, RemovalPlan};
 use crate::snooze::{self, Until};
+use crate::system::ExitSignals;
+use crate::tasks::Edit;
+use clones::{Clones, CloseOnDrop};
 
 const REFRESH: Duration = Duration::from_secs(2);
 /// While a worker runs, how long to wait for a key before looking for its result.
@@ -44,12 +61,18 @@ const BUSY_POLL: Duration = Duration::from_millis(10);
 #[derive(Debug)]
 pub enum Input {
     Key(KeyEvent),
+    /// Text pasted into the terminal (bracketed paste).
+    Paste(String),
     /// The terminal changed size: draw again.
     Resized,
     /// The terminal could not be read.
     Failed(Error),
     Loaded(Result<Snapshot>),
-    Done(Job, Result<String>),
+    Done(Job, Result<Reply>),
+    /// A folder listing a screen asked for (None: it cannot be read).
+    Listed(String, Option<Listing>),
+    /// What a clone child said last.
+    Cloning(String),
 }
 
 /// Where the loop's time and keys come from.
@@ -88,6 +111,7 @@ impl Events for TerminalEvents {
             let wait = if busy { left.min(BUSY_POLL) } else { left };
             match event::poll(wait).and_then(|ready| ready.then(event::read).transpose()) {
                 Ok(Some(Event::Key(key))) if key.kind == KeyEventKind::Press => return Some(Input::Key(key)),
+                Ok(Some(Event::Paste(text))) => return Some(Input::Paste(text)),
                 Ok(Some(Event::Resize(..))) => return Some(Input::Resized),
                 Ok(_) => {}
                 Err(e) => return Some(Input::Failed(Error::Other(format!("cannot read the terminal: {e}")))),
@@ -96,13 +120,27 @@ impl Events for TerminalEvents {
     }
 
     fn suspended(&self, program: &mut dyn FnMut() -> Result<()>) -> Result<()> {
-        use ratatui::crossterm::{execute, terminal};
+        use ratatui::crossterm::terminal;
+        let _ = execute!(std::io::stdout(), DisableBracketedPaste);
         ratatui::restore();
         let result = program();
         terminal::enable_raw_mode()
-            .and_then(|()| execute!(std::io::stdout(), terminal::EnterAlternateScreen))
+            .and_then(|()| execute!(std::io::stdout(), terminal::EnterAlternateScreen, EnableBracketedPaste))
             .context(|| "cannot take the terminal back".into())?;
         result
+    }
+}
+
+/// What a job can use besides itm: where its children go, so they are
+/// stopped when the UI ends, and how it says what it is doing.
+pub struct Run {
+    pub clones: Clones,
+    said: Sender<Input>,
+}
+
+impl Run {
+    pub fn say(&self, line: String) {
+        let _ = self.said.send(Input::Cloning(line)); // nothing to tell once the UI closed
     }
 }
 
@@ -110,8 +148,7 @@ impl Events for TerminalEvents {
 pub trait Work: Send + Sync {
     /// Everything the switcher shows.
     fn load(&self) -> Result<Snapshot>;
-    /// Do a job; the session it concerns (removing a project: what happened).
-    fn perform(&self, job: &Job) -> Result<String>;
+    fn perform(&self, job: &Job, run: &Run) -> Result<Reply>;
     /// Open a task's notes in the editor, started first when missing (R9.4).
     fn open_notes(&self, session: &str) -> Result<()>;
 }
@@ -137,6 +174,7 @@ impl Work for Itm {
             false => (None, None),
         };
         let missing = crate::projects::missing_folders(&data);
+        let folders = crate::projects::saved_folders(&data);
         let notes = (data.tasks.keys())
             .filter_map(|name| {
                 let (modified, lines) = self.notes_tail(name, 12)?;
@@ -146,25 +184,45 @@ impl Work for Itm {
             .collect();
         let settings = self.settings().map_err(|e| e.to_string());
         let status = self.status();
-        Ok(Snapshot { data, sessions, status, current, switch_problem, listed, missing, notes, settings })
+        Ok(Snapshot { data, sessions, status, current, switch_problem, listed, missing, folders, notes, settings })
     }
 
-    fn perform(&self, job: &Job) -> Result<String> {
+    fn perform(&self, job: &Job, run: &Run) -> Result<Reply> {
+        let done = |result: Result<()>| result.map(|()| Reply::Done);
         match job {
-            Job::Wake { session, .. } => self.wake_task(session).map(|()| session.clone()),
-            Job::Archive { session, .. } => self.archive_task(session).map(|()| session.clone()),
-            Job::Delete { session, .. } => self.delete_task(session).map(|()| session.clone()),
-            Job::Create { title } => self.create_task(title, None, &[], None),
-            Job::Snooze { session, until, .. } => self.snooze_task(session, *until).map(|()| session.clone()),
-            Job::RemoveProject { id, choice, .. } => {
-                let notes = self.remove_project(id, *choice)?;
-                let lines = notes.into_iter().map(|note| match note {
-                    RemovalNote::Done(line) | RemovalNote::Kept(line) => line,
-                });
-                Ok(lines.collect::<Vec<_>>().join("; "))
+            Job::Wake { session, .. } => done(self.wake_task(session)),
+            Job::Archive { session, .. } => done(self.archive_task(session)),
+            Job::Delete { session, .. } => done(self.delete_task(session)),
+            Job::Create { title, description, projects, until } => {
+                self.create_task(title, description.as_deref(), projects, *until).map(Reply::Created)
             }
-            Job::AddProject { kind, source, name } => self.add_project(*kind, source, name.as_deref()),
-            Job::Setting { setting, on } => self.change_setting(*setting, *on).map(|()| String::new()),
+            Job::Edit { session, title, description, add, remove, order } => {
+                let edit = Edit {
+                    title: Some(title.clone()),
+                    description: Some(description.clone()),
+                    add: add.clone(),
+                    remove: remove.clone(),
+                    order: order.clone(),
+                    ..Edit::default()
+                };
+                self.edit_task(session, &edit).map(Reply::Said)
+            }
+            Job::Snooze { session, until, .. } => done(self.snooze_task(session, *until)),
+            Job::RemovalPlan { id } => self.removal_plan(id).map(Reply::Plan),
+            Job::RemoveProject { id, choice, .. } => self.remove_project(id, *choice).map(Reply::Removed),
+            Job::RenameProject { id, name } => {
+                self.rename_project(id, name).map(|(old, new, note)| Reply::Renamed(old, new, note))
+            }
+            Job::AddProject { kind, source, name } => {
+                let id = self.add_project(*kind, source, name.as_deref())?;
+                let project = self.store().load()?.projects.get(&id).cloned();
+                project.map(|p| Reply::Added(id, p)).ok_or_else(|| Error::Other("the project went again".into()))
+            }
+            Job::CheckProject { kind, source, name } => {
+                self.check_project(*kind, source, name.as_deref()).map(Reply::Checked)
+            }
+            Job::Clone { url, name } => clones::clone_project(self, url, name.as_deref(), &run.clones, &|l| run.say(l)),
+            Job::Setting { setting, on } => done(self.change_setting(*setting, *on)),
         }
     }
 
@@ -176,41 +234,66 @@ impl Work for Itm {
     }
 }
 
+/// Work for a dialog that asks for none (a question).
+struct NoWork;
+
+impl Work for NoWork {
+    fn load(&self) -> Result<Snapshot> {
+        Err(unexpected())
+    }
+
+    fn perform(&self, _: &Job, _: &Run) -> Result<Reply> {
+        Err(unexpected())
+    }
+
+    fn open_notes(&self, _: &str) -> Result<()> {
+        Err(unexpected())
+    }
+}
+
 /// Run the switcher; returns the session to switch to, if one was chosen.
 pub fn run(itm: &Arc<Itm>, view: View) -> Result<Option<String>> {
     // A measurement switch (scripts/measure.sh): quit right after the first frame with tasks.
     let exit_after_draw = std::env::var_os("ITM_EXIT_AFTER_DRAW").is_some_and(|v| v == "1");
     let app = App::new(view, itm.paths.clone(), itm.tz.clone(), Moment::now());
     let work: Arc<dyn Work> = Arc::clone(itm) as Arc<dyn Work>;
-    in_terminal(|terminal| event_loop(terminal, app, work, &TerminalEvents, exit_after_draw))
+    let chosen = in_terminal(|terminal| event_loop(terminal, app, work, &TerminalEvents, exit_after_draw))?;
+    Ok(match chosen {
+        Some(Action::Switch(session)) => Some(session),
+        _ => None,
+    })
+}
+
+/// `screen` alone, with `work` doing what it asks for; the action it closed with.
+fn alone(screen: Screen, paths: &Paths, tz: &TimeZone, work: Arc<dyn Work>) -> Result<Option<Action>> {
+    let app = App::alone(screen, paths.clone(), tz.clone(), Moment::now());
+    in_terminal(|terminal| event_loop(terminal, app, work, &TerminalEvents, false))
 }
 
 /// The snooze dialog alone (`itm snooze` without a time, R4.1): the chosen
 /// snooze, or None when it was closed. "Until an agent needs me" is offered
 /// only when `agent` (an agent could ever wake the task).
-pub fn snooze_dialog(session: &str, title: &str, agent: bool, tz: &TimeZone) -> Result<Option<Until>> {
-    let presets = snooze::presets(crate::times::now(), tz, agent);
+pub fn snooze_dialog(session: &str, title: &str, agent: bool, itm: &Itm) -> Result<Option<Until>> {
+    let presets = snooze::presets(crate::times::now(), &itm.tz, agent);
     let screen = Screen::Snooze(SnoozeDialog::new(session.into(), title.into(), presets));
-    let chosen = in_terminal(|terminal| alone(terminal, screen, tz, &TerminalEvents, None))?;
-    Ok(match chosen {
+    Ok(match alone(screen, &itm.paths, &itm.tz, Arc::new(NoWork))? {
         Some(Action::Run(Job::Snooze { until, .. })) => Some(until),
         _ => None,
     })
 }
 
 /// The delete question alone (`itm delete`, R5.3): whether the user said yes.
-pub fn confirm_delete(session: &str, title: &str) -> Result<bool> {
+pub fn confirm_delete(session: &str, title: &str, itm: &Itm) -> Result<bool> {
     let screen = Screen::ConfirmDelete { session: session.into(), title: title.into() };
-    let chosen = in_terminal(|terminal| alone(terminal, screen, &TimeZone::UTC, &TerminalEvents, None))?;
+    let chosen = alone(screen, &itm.paths, &itm.tz, Arc::new(NoWork))?;
     Ok(matches!(chosen, Some(Action::Run(Job::Delete { .. }))))
 }
 
 /// The workspace hotkey's question (R10.5): whether `project`, which has no
 /// folder, gets `folder`; None when it was closed (nothing changes then).
-pub fn confirm_folder(project: &str, folder: &str) -> Result<Option<bool>> {
+pub fn confirm_folder(project: &str, folder: &str, itm: &Itm) -> Result<Option<bool>> {
     let screen = Screen::ConfirmFolder { project: project.into(), folder: folder.into() };
-    let chosen = in_terminal(|terminal| alone(terminal, screen, &TimeZone::UTC, &TerminalEvents, None))?;
-    Ok(match chosen {
+    Ok(match alone(screen, &itm.paths, &itm.tz, Arc::new(NoWork))? {
         Some(Action::Answer(give)) => Some(give),
         _ => None,
     })
@@ -218,22 +301,52 @@ pub fn confirm_folder(project: &str, folder: &str) -> Result<Option<bool>> {
 
 /// The add dialog alone, filled with a workspace's folder and name (R10.5):
 /// the id of the project it saved, or None when it was closed.
-pub fn add_folder_dialog(itm: &Itm, folder: &str, name: &str) -> Result<Option<String>> {
-    let screen = Screen::AddProject(AddDialog::folder(folder, name));
-    let chosen = in_terminal(|terminal| alone(terminal, screen, &itm.tz, &TerminalEvents, Some(itm)))?;
-    Ok(match chosen {
-        Some(Action::ProjectAdded(id)) => Some(id),
+pub fn add_folder_dialog(itm: &Arc<Itm>, folder: &str, name: &str) -> Result<Option<String>> {
+    let screen = Screen::AddProject(Box::new(add::AddDialog::folder(folder, name)));
+    Ok(match alone(screen, &itm.paths, &itm.tz, Arc::clone(itm) as Arc<dyn Work>)? {
+        Some(Action::ProjectAdded(id, _)) => Some(id),
         _ => None,
     })
 }
 
 /// The remove dialog alone (`itm project remove`, R8.7): what to do with
 /// the clone, or None when it was closed (nothing changes then).
-pub fn remove_project_dialog(plan: &RemovalPlan, paths: &crate::paths::Paths) -> Result<Option<CloneChoice>> {
-    let screen = Screen::RemoveProject(RemoveDialog::new(plan, paths));
-    let chosen = in_terminal(|terminal| alone(terminal, screen, &TimeZone::UTC, &TerminalEvents, None))?;
-    Ok(match chosen {
+pub fn remove_project_dialog(plan: &RemovalPlan, itm: &Itm) -> Result<Option<CloneChoice>> {
+    let screen = Screen::RemoveProject(RemoveDialog::new(plan, &itm.paths));
+    Ok(match alone(screen, &itm.paths, &itm.tz, Arc::new(NoWork))? {
         Some(Action::Run(Job::RemoveProject { choice, .. })) => Some(choice),
+        _ => None,
+    })
+}
+
+/// What the New task form saved (R1.1).
+#[derive(Debug, Clone, PartialEq)]
+pub struct NewTask {
+    pub title: String,
+    pub description: Option<String>,
+    pub projects: Vec<String>,
+    pub until: Option<Until>,
+}
+
+/// The New task form alone (`itm new` without a title, or `-i`); None when it was closed.
+pub fn task_form(itm: &Arc<Itm>, form: TaskForm) -> Result<Option<NewTask>> {
+    let screen = Screen::Form(Box::new(form));
+    Ok(match alone(screen, &itm.paths, &itm.tz, Arc::clone(itm) as Arc<dyn Work>)? {
+        Some(Action::Run(Job::Create { title, description, projects, until })) => {
+            Some(NewTask { title, description, projects, until })
+        }
+        _ => None,
+    })
+}
+
+/// The edit form alone (`itm edit <task>` without options, R5.4): the edit
+/// it saved, or None when it was closed.
+pub fn edit_form(itm: &Arc<Itm>, form: TaskForm) -> Result<Option<Edit>> {
+    let screen = Screen::Form(Box::new(form));
+    Ok(match alone(screen, &itm.paths, &itm.tz, Arc::clone(itm) as Arc<dyn Work>)? {
+        Some(Action::Run(Job::Edit { title, description, add, remove, order, .. })) => {
+            Some(Edit { title: Some(title), description: Some(description), add, remove, order, ..Edit::default() })
+        }
         _ => None,
     })
 }
@@ -241,7 +354,9 @@ pub fn remove_project_dialog(plan: &RemovalPlan, paths: &crate::paths::Paths) ->
 /// Take the terminal while `ui` runs, and give it back.
 fn in_terminal<T>(ui: impl FnOnce(&mut ratatui::DefaultTerminal) -> Result<T>) -> Result<T> {
     let mut terminal = ratatui::try_init().context(|| "cannot open the terminal".into())?;
+    let _ = execute!(std::io::stdout(), EnableBracketedPaste); // without it, a paste arrives as keys
     let result = ui(&mut terminal);
+    let _ = execute!(std::io::stdout(), DisableBracketedPaste);
     ratatui::restore();
     result
 }
@@ -261,25 +376,45 @@ fn unexpected() -> Error {
     Error::Other("something went wrong; see the terminal for details".into())
 }
 
-/// The switcher's loop: refresh every 2 s, one load at a time; keys to the
-/// app; jobs to workers, each followed by a refresh. Returns the session
-/// chosen, if any.
+/// The loop: refresh every 2 s (the switcher only), one load at a time;
+/// keys to the app; jobs, listings and clones to threads, a job followed by
+/// a refresh. Returns what ended it: the session to switch to, or (a
+/// screen alone) the action its last screen closed with.
 fn event_loop<B: Backend>(
     terminal: &mut Terminal<B>,
     mut app: App,
     work: Arc<dyn Work>,
     events: &impl Events,
     exit_after_draw: bool,
-) -> Result<Option<String>> {
+) -> Result<Option<Action>> {
     let (tx, rx) = mpsc::channel();
+    let clones = Clones::default();
+    let _stop_clones = CloseOnDrop(clones.clone()); // on every way out
+    // While a clone runs, a closing popup (SIGHUP) or a kill must stop it first.
+    let mut signals: Option<ExitSignals> = None;
     // One load at a time; a job's result asks for another one right after.
-    let (mut loading, mut reload, mut next_refresh, mut jobs) = (false, true, events.now().instant, 0);
+    let (mut loading, mut reload, mut next_refresh) = (false, !app.alone, events.now().instant);
+    let (mut running, mut cloning) = (0, 0);
     loop {
         app.now = events.now();
-        if !loading && (reload || app.now.instant >= next_refresh) {
+        if !app.alone && !loading && (reload || app.now.instant >= next_refresh) {
             (loading, reload) = (true, false);
             let work = Arc::clone(&work);
             in_worker(&tx, move || Input::Loaded(work.load()), Input::Loaded(Err(unexpected())));
+        }
+        while let Some(need) = app.needs() {
+            running += 1;
+            match need {
+                // A plain thread, never joined: a scan blocked on a slow filesystem holds up nothing.
+                Need::Listing(parent) => {
+                    let (tx, home) = (tx.clone(), app.paths.home.clone());
+                    thread::spawn(move || {
+                        let listing = list_folders(&parent, &home, SCAN_LIMIT);
+                        let _ = tx.send(Input::Listed(parent, listing));
+                    });
+                }
+                Need::Job(job) => start(job, &work, &tx, &clones),
+            }
         }
         app.expire_message();
         let shown = app.now.epoch;
@@ -287,15 +422,19 @@ fn event_loop<B: Backend>(
         if exit_after_draw && app.snapshot.is_some() {
             return Ok(None);
         }
-        // Wake for the next refresh (unless one runs) and for the message to go.
-        let refresh = (!loading).then_some(next_refresh);
-        let deadline = refresh.into_iter().chain(app.message.as_ref().map(|m| m.until)).min();
+        if let Some(signal) = signals.as_mut().and_then(ExitSignals::arrived) {
+            return Err(Error::Exit(128 + signal as u8)); // the clones stop on the way out
+        }
+        // Wake for the next refresh (unless one runs), for the message to go, and for a screen's check.
+        let refresh = (!loading && !app.alone).then_some(next_refresh);
+        let deadline = [refresh, app.message.as_ref().map(|m| m.until), app.due()].into_iter().flatten().min();
         let deadline = deadline.unwrap_or(app.now.instant + Duration::from_secs(3600));
-        let input = events.next(&rx, deadline, loading || jobs > 0);
+        let input = events.next(&rx, deadline, loading || running > 0);
         app.now = events.now();
         let action = match input {
             None | Some(Input::Resized) => Action::None,
             Some(Input::Key(key)) => app.on_key(key),
+            Some(Input::Paste(text)) => app.on_paste(&text),
             Some(Input::Failed(e)) => return Err(e),
             Some(Input::Loaded(snapshot)) => {
                 // Whatever the outcome, this refresh is over and the next one is scheduled.
@@ -303,16 +442,36 @@ fn event_loop<B: Backend>(
                 app.loaded(snapshot);
                 Action::None
             }
+            Some(Input::Listed(parent, listing)) => {
+                running -= 1;
+                app.listed(&parent, &listing);
+                Action::None
+            }
+            Some(Input::Cloning(line)) => {
+                app.cloning(line);
+                Action::None
+            }
             Some(Input::Done(job, result)) => {
-                (jobs, reload) = (jobs - 1, true);
+                running -= 1;
+                if matches!(job, Job::Clone { .. }) {
+                    cloning -= 1;
+                    if cloning == 0 {
+                        signals = None; // they end itm again
+                    }
+                }
+                reload |= job.changes_tasks();
                 app.done(job, result)
             }
         };
+        // A screen alone is done once its last screen closed: its caller acts on what it said.
+        if app.alone && app.screens.is_empty() {
+            return Ok(Some(action).filter(|a| *a != Action::None));
+        }
         match action {
-            Action::None | Action::Answer(_) => {}
-            Action::ProjectAdded(_) => reload = true,
+            Action::None | Action::Answer(_) | Action::ProjectAdded(..) | Action::Picked(..) | Action::Filter(_) => {}
             Action::Quit => return Ok(None),
-            Action::Switch(session) => return Ok(Some(session)),
+            Action::Switch(session) => return Ok(Some(Action::Switch(session))),
+            Action::StopClone => clones.stop(),
             Action::Notes(session) => {
                 // The one blocking call on the loop: nothing is drawn while the editor has the terminal.
                 if let Err(e) = events.suspended(&mut || work.open_notes(&session)) {
@@ -322,55 +481,34 @@ fn event_loop<B: Backend>(
                 reload = true; // the preview shows the notes as they are now
             }
             Action::Run(job) => {
-                jobs += 1;
-                let (work, failed) = (Arc::clone(&work), Input::Done(job.clone(), Err(unexpected())));
-                in_worker(&tx, move || Input::Done(job.clone(), work.perform(&job)), failed);
+                if matches!(job, Job::Clone { .. }) {
+                    cloning += 1;
+                    signals = signals.or_else(|| ExitSignals::catch().ok());
+                }
+                running += 1;
+                start(job, &work, &tx, &clones);
             }
         }
     }
 }
 
-/// A screen with nothing behind it, until it closes; what it decided. Work
-/// it asks for while open is done right here, by `work`: nothing else is
-/// on the screen to keep drawing.
-fn alone<B: Backend>(
-    terminal: &mut Terminal<B>,
-    mut screen: Screen,
-    tz: &TimeZone,
-    events: &impl Events,
-    work: Option<&dyn Work>,
-) -> Result<Option<Action>> {
-    let (_none, results) = mpsc::channel(); // no workers here
-    loop {
-        let now = events.now();
-        terminal.draw(|frame| draw::draw_alone(frame, &screen, tz, now.epoch)).context(|| "cannot draw".into())?;
-        let key = match events.next(&results, now.instant + Duration::from_secs(3600), false) {
-            Some(Input::Key(key)) => key,
-            Some(Input::Failed(e)) => return Err(e),
-            _ => continue,
-        };
-        let mut outcome = screen.on_key(key, &ScreenContext { tz, now: events.now().epoch });
-        if let Outcome::Act(Action::Run(job)) = &outcome {
-            let result = work.map_or_else(|| Err(unexpected()), |work| work.perform(job));
-            outcome = screen.done(job, result);
-        }
-        match outcome {
-            Outcome::Stay | Outcome::Act(_) => {}
-            Outcome::Close => return Ok(None),
-            Outcome::CloseAnd(action) => return Ok(Some(action)),
-        }
-    }
+/// Do `job` in a worker; its result comes back as [`Input::Done`].
+fn start(job: Job, work: &Arc<dyn Work>, tx: &Sender<Input>, clones: &Clones) {
+    let (work, failed) = (Arc::clone(work), Input::Done(job.clone(), Err(unexpected())));
+    let run = Run { clones: clones.clone(), said: tx.clone() };
+    in_worker(tx, move || Input::Done(job.clone(), work.perform(&job, &run)), failed);
 }
-
 #[cfg(test)]
 mod tests {
     use super::app::tests::{NOW, ctrl, key, snapshot};
     use super::*;
     use crate::paths::Paths;
+    use crate::store::{Project, ProjectKind};
     use ratatui::backend::TestBackend;
     use ratatui::crossterm::event::KeyCode;
     use std::cell::{Cell, RefCell};
     use std::collections::VecDeque;
+    use std::process::Command;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -378,6 +516,8 @@ mod tests {
         Key(KeyEvent),
         /// Let this much time pass with no key.
         Wait(Duration),
+        /// A key pressed while a worker runs (Esc during a clone), once no result came for a while.
+        Meanwhile(KeyEvent),
     }
 
     fn secs(n: u64) -> Step {
@@ -386,6 +526,10 @@ mod tests {
 
     fn press(code: KeyCode) -> Step {
         Step::Key(key(code))
+    }
+
+    fn typing(text: &str) -> Vec<Step> {
+        text.chars().map(|c| press(KeyCode::Char(c))).collect()
     }
 
     /// Time that moves only when the script waits, and keys from the
@@ -411,14 +555,25 @@ mod tests {
 
         fn next(&self, results: &Receiver<Input>, deadline: Instant, busy: bool) -> Option<Input> {
             if busy {
-                return Some(results.recv_timeout(Duration::from_secs(10)).expect("a worker never answered"));
+                for _ in 0..100 {
+                    if let Ok(input) = results.recv_timeout(Duration::from_millis(100)) {
+                        return Some(input);
+                    }
+                    let mut steps = self.steps.borrow_mut();
+                    if let Some(Step::Meanwhile(key)) = steps.front() {
+                        let key = *key;
+                        steps.pop_front();
+                        return Some(Input::Key(key));
+                    }
+                }
+                panic!("a worker never answered");
             }
             if let Ok(input) = results.try_recv() {
                 return Some(input);
             }
             let step = self.steps.borrow_mut().pop_front().expect("the switcher wanted more input than the script has");
             match step {
-                Step::Key(key) => Some(Input::Key(key)),
+                Step::Key(key) | Step::Meanwhile(key) => Some(Input::Key(key)),
                 Step::Wait(time) => {
                     let left = deadline.saturating_duration_since(self.now().instant);
                     if time > left {
@@ -436,7 +591,8 @@ mod tests {
     }
 
     /// Loads [`snapshot`] (failing or panicking on the loads `fails` names)
-    /// and records the jobs it is given.
+    /// and records the jobs it is given. A project saved is `p-new`; a
+    /// clone says what git would and is a real child that Esc stops.
     #[derive(Default)]
     struct FakeWork {
         loads: AtomicUsize,
@@ -444,6 +600,17 @@ mod tests {
         jobs: Mutex<Vec<Job>>,
         /// The tasks whose notes were opened.
         notes: Mutex<Vec<String>>,
+    }
+
+    fn new_project(name: &str, path: Option<&str>) -> Project {
+        Project {
+            name: name.into(),
+            path: path.map(Into::into),
+            url: None,
+            added_at: 1,
+            last_used_at: 1,
+            extra: Default::default(),
+        }
     }
 
     impl Work for FakeWork {
@@ -456,9 +623,28 @@ mod tests {
             }
         }
 
-        fn perform(&self, job: &Job) -> Result<String> {
-            self.jobs.lock().unwrap().push(job.clone());
-            Ok(String::new())
+        fn perform(&self, job: &Job, run: &Run) -> Result<Reply> {
+            if !matches!(job, Job::CheckProject { .. }) {
+                self.jobs.lock().unwrap().push(job.clone());
+            }
+            match job {
+                Job::Create { .. } => Ok(Reply::Created("task-new".into())),
+                Job::AddProject { kind: ProjectKind::Dir, source, .. } => {
+                    Ok(Reply::Added("p-new".into(), new_project("alpha", Some(source))))
+                }
+                Job::AddProject { source, .. } => Ok(Reply::Added("p-new".into(), new_project(source, None))),
+                Job::Clone { url, .. } => {
+                    run.say("Receiving objects:  50% (1/2)".into());
+                    let pid =
+                        run.clones.spawn(Command::new("sleep").arg(if url.ends_with("slow") { "30" } else { "0" }));
+                    let status = run.clones.wait(pid.unwrap()).unwrap();
+                    match status.success() {
+                        true => Ok(Reply::Added("p-new".into(), new_project("backend", Some("/r/clones/backend")))),
+                        false => Err(Error::Other("itm: could not clone".into())),
+                    }
+                }
+                _ => Ok(Reply::Done),
+            }
         }
 
         fn open_notes(&self, session: &str) -> Result<()> {
@@ -472,16 +658,32 @@ mod tests {
 
     /// Runs the loop on a test terminal; its result and the last screen drawn.
     fn switcher(steps: Vec<Step>, work: &Arc<FakeWork>, exit_after_draw: bool) -> (Result<Option<String>>, String) {
-        let mut terminal = Terminal::new(TestBackend::new(110, 22)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(110, 30)).unwrap();
         let clock = Script::new(steps);
         let app = App::new(View::Inbox, Paths::under("/r".as_ref()), TimeZone::UTC, clock.now());
         let work = Arc::clone(work) as Arc<dyn Work>;
-        let result = event_loop(&mut terminal, app, work, &clock, exit_after_draw);
+        let result = event_loop(&mut terminal, app, work, &clock, exit_after_draw).map(|chosen| match chosen {
+            Some(Action::Switch(session)) => Some(session),
+            _ => None,
+        });
         (result, format!("{}", terminal.backend()))
+    }
+
+    /// Runs `screen` alone; what it closed with and the last screen drawn.
+    fn alone_screen(screen: Screen, steps: Vec<Step>, work: Arc<dyn Work>, paths: Paths) -> (Option<Action>, String) {
+        let mut terminal = Terminal::new(TestBackend::new(90, 26)).unwrap();
+        let clock = Script::new(steps);
+        let app = App::alone(screen, paths, TimeZone::UTC, clock.now());
+        let chosen = event_loop(&mut terminal, app, work, &clock, false).unwrap();
+        (chosen, format!("{}", terminal.backend()))
     }
 
     fn loads(work: &FakeWork) -> usize {
         work.loads.load(Ordering::SeqCst)
+    }
+
+    fn jobs(work: &FakeWork) -> Vec<Job> {
+        work.jobs.lock().unwrap().clone()
     }
 
     #[test]
@@ -519,7 +721,7 @@ mod tests {
         let work = Arc::new(FakeWork::default());
         let wake = vec![press(KeyCode::Tab), Step::Key(ctrl('u'))];
         let (_, screen) = switcher(wake.into_iter().chain([secs(3), press(KeyCode::Esc)]).collect(), &work, false);
-        assert_eq!(*work.jobs.lock().unwrap(), [Job::Wake { session: "task-later".into(), title: "Later".into() }]);
+        assert_eq!(jobs(&work), [Job::Wake { session: "task-later".into(), title: "Later".into() }]);
         assert_eq!(loads(&work), 3, "the first load, one right after the job, and the one 2 s later");
         assert!(screen.contains("“Later” is active."), "{screen}");
 
@@ -579,12 +781,11 @@ mod tests {
     #[test]
     fn r10_5_the_folder_question_alone() {
         let answer = |code: KeyCode| {
-            let mut terminal = Terminal::new(TestBackend::new(70, 18)).unwrap();
             let screen = Screen::ConfirmFolder { project: "X".into(), folder: "~/x".into() };
-            match alone(&mut terminal, screen, &TimeZone::UTC, &Script::new([press(KeyCode::Enter), press(code)]), None)
-            {
-                Ok(Some(Action::Answer(give))) => Some(give),
-                Ok(None) => None,
+            let steps = vec![press(KeyCode::Enter), press(code)];
+            match alone_screen(screen, steps, Arc::new(NoWork), Paths::under("/r".as_ref())).0 {
+                Some(Action::Answer(give)) => Some(give),
+                None => None,
                 other => panic!("{other:?}"),
             }
         };
@@ -594,30 +795,53 @@ mod tests {
     }
 
     /// R10.5, R8.5: the add dialog alone saves the folder under the name
-    /// given; a name taken keeps the cursor on the name, with why.
+    /// given, in a worker; a name taken keeps the cursor on the name, with why.
     #[test]
     fn r10_5_the_add_dialog_alone_saves_the_folder() {
-        use crate::store::ProjectKind;
         let (_tmp, itm) = crate::itm::tests::itm();
         let code = crate::projects::tests::folder(&itm, "code/new-thing");
         itm.add_project(ProjectKind::Name, "My Thing", None).unwrap();
+        let itm = Arc::new(itm);
         let run = |steps: Vec<Step>| {
-            let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
-            let screen = Screen::AddProject(AddDialog::folder("~/code/new-thing", "My Thing"));
-            let chosen = alone(&mut terminal, screen, &TimeZone::UTC, &Script::new(steps), Some(&itm)).unwrap();
-            (chosen, format!("{}", terminal.backend()))
+            let screen = Screen::AddProject(Box::new(add::AddDialog::folder("~/code/new-thing", "My Thing")));
+            alone_screen(screen, steps, Arc::clone(&itm) as Arc<dyn Work>, itm.paths.clone())
         };
         let (chosen, shown) = run(vec![press(KeyCode::Enter), press(KeyCode::Esc)]);
         assert_eq!(chosen, None);
         assert!(shown.contains("project My Thing has no folder yet"), "{shown}");
         let mut steps = vec![press(KeyCode::Enter)];
-        steps.extend((0..4).map(|_| press(KeyCode::Backspace))); // the cursor went to the name: "My Thing" → "My T"
-        steps.extend("ool".chars().map(|c| press(KeyCode::Char(c))));
+        steps.extend((0..4).map(|_| press(KeyCode::Backspace))); // the cursor is on the name: "My Thing" → "My T"
+        steps.extend(typing("ool"));
         steps.push(press(KeyCode::Enter));
         let (chosen, _) = run(steps);
-        let Some(Action::ProjectAdded(id)) = chosen else { panic!("{chosen:?}") };
+        let Some(Action::ProjectAdded(id, _)) = chosen else { panic!("{chosen:?}") };
         let project = itm.store().load().unwrap().projects[&id].clone();
         assert_eq!((project.name.as_str(), project.path), ("My Tool", Some(code.display().to_string())));
+    }
+
+    /// R8.5: the add dialog checks what is typed once typing pauses, and
+    /// says so before Enter: a name taken, where a clone goes.
+    #[test]
+    fn r8_5_the_add_dialog_checks_while_typing() {
+        let (_tmp, mut itm) = crate::itm::tests::itm();
+        crate::projects::tests::fake_git(&mut itm);
+        crate::projects::tests::folder(&itm, "code/api");
+        itm.add_project(ProjectKind::Dir, "~/code/api", None).unwrap();
+        let itm = Arc::new(itm);
+        let paths = itm.paths.clone();
+        let mut steps = typing("https://github.com/acme/api.git");
+        steps.extend([Step::Wait(Duration::from_millis(300)), press(KeyCode::Esc)]);
+        let screen = Screen::AddProject(Box::new(add::AddDialog::new(ProjectKind::Git, "", "", screen::Field::Source)));
+        let (chosen, shown) = alone_screen(screen, steps, Arc::clone(&itm) as Arc<dyn Work>, paths.clone());
+        assert_eq!(chosen, None);
+        assert!(shown.contains("project already exists: api (~/code/api); choose another name"), "{shown}");
+        let mut steps = typing("https://github.com/acme/web.git");
+        steps.extend([Step::Wait(Duration::from_millis(300)), press(KeyCode::Esc)]);
+        let screen = Screen::AddProject(Box::new(add::AddDialog::new(ProjectKind::Git, "", "", screen::Field::Source)));
+        let (_, shown) = alone_screen(screen, steps, itm as Arc<dyn Work>, paths);
+        assert!(shown.contains("Clones to") && shown.contains("projects/github.com/acme/web"), "{shown}");
+        assert!(shown.contains("Esc stops the clone and removes what it copied."), "{shown}");
+        assert!(shown.contains("Name    web"), "the default name: {shown}");
     }
 
     /// R10.4: in the switcher, Ctrl+S then Enter saves the first setting in a worker.
@@ -635,7 +859,7 @@ mod tests {
         let (result, shown) = switcher(steps, &work, false);
         assert_eq!(result.unwrap(), None);
         let setting = Job::Setting { setting: crate::config::Setting::ProjectsFromWorkspaces, on: false };
-        assert_eq!(*work.jobs.lock().unwrap(), [setting]);
+        assert_eq!(jobs(&work), [setting]);
         assert!(!shown.contains("Herdr integration"), "closed");
     }
 
@@ -644,17 +868,97 @@ mod tests {
     fn the_snooze_dialog_alone_returns_the_choice() {
         let presets = vec![("1 hour", Until::Time(NOW + 3600)), ("Until an agent needs me", Until::Agent)];
         let dialog = || Screen::Snooze(SnoozeDialog::new("task-a".into(), "A".into(), presets.clone()));
-        let chosen = |steps: Vec<Step>| {
-            let mut terminal = Terminal::new(TestBackend::new(70, 18)).unwrap();
-            match alone(&mut terminal, dialog(), &TimeZone::UTC, &Script::new(steps), None).unwrap() {
+        let chosen =
+            |steps: Vec<Step>| match alone_screen(dialog(), steps, Arc::new(NoWork), Paths::under("/r".as_ref())).0 {
                 Some(Action::Run(Job::Snooze { session, until, .. })) => Some((session, until)),
                 None => None,
                 other => panic!("{other:?}"),
-            }
-        };
+            };
         assert_eq!(chosen(vec![press(KeyCode::Down), press(KeyCode::Enter)]), Some(("task-a".into(), Until::Agent)));
         assert_eq!(chosen(vec![press(KeyCode::Esc)]), None);
-        let typed = "2h".chars().map(|c| press(KeyCode::Char(c))).chain([press(KeyCode::Enter)]).collect();
+        let typed = typing("2h").into_iter().chain([press(KeyCode::Enter)]).collect();
         assert_eq!(chosen(typed), Some(("task-a".into(), Until::Time(NOW + 7200))));
+    }
+
+    /// R1.1: Ctrl+N, a title, Tab to the description, Ctrl+S: the task is
+    /// created with both, and the switcher switches to it.
+    #[test]
+    fn r1_1_the_new_task_form_creates_and_switches() {
+        let work = Arc::new(FakeWork::default());
+        let mut steps = vec![Step::Key(ctrl('n'))];
+        steps.extend(typing("Plan launch"));
+        steps.extend([Step::Key(ctrl('a')), press(KeyCode::Tab)]); // ctrl+a stays in the form
+        steps.extend(typing("one"));
+        steps.push(press(KeyCode::Enter));
+        steps.extend(typing("two"));
+        steps.push(Step::Key(ctrl('s')));
+        let (result, _) = switcher(steps, &work, false);
+        assert_eq!(result, Ok(Some("task-new".into())));
+        let create = Job::Create {
+            title: "Plan launch".into(),
+            description: Some("one\ntwo".into()),
+            projects: vec![],
+            until: None,
+        };
+        assert_eq!(jobs(&work), [create]);
+    }
+
+    /// R1.6: a typed path lists folders (read in a thread); Tab goes into
+    /// one, Enter opens the add dialog on it, which saves it in a worker,
+    /// and the form has it. Enter in the title then creates the task with it.
+    #[test]
+    fn r1_6_a_folder_typed_in_the_finder_is_added_through_the_add_dialog() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::under(&crate::paths::resolved(tmp.path()));
+        for name in ["work/alpha/inner", "work/beta"] {
+            std::fs::create_dir_all(paths.home.join(name)).unwrap();
+        }
+        let saved = Saved::default();
+        let form = TaskForm::new_task("Plan", vec![], saved, vec![], &paths);
+        let mut steps = vec![press(KeyCode::Tab), press(KeyCode::Tab)]; // to Projects
+        steps.extend(typing("~/work/al")); // the first key opens the finder; the rest goes into it
+        steps.extend([press(KeyCode::Tab), press(KeyCode::Enter)]); // into ~/work/alpha/, then "Use" it
+        steps.push(press(KeyCode::Enter)); // the add dialog, ready on the name: saves the folder
+        steps.extend([press(KeyCode::BackTab), press(KeyCode::BackTab), press(KeyCode::Enter)]); // the title: create
+        let work = Arc::new(FakeWork::default());
+        let (chosen, _) = alone_screen(Screen::Form(Box::new(form)), steps, Arc::clone(&work) as Arc<dyn Work>, paths);
+        let add = Job::AddProject { kind: ProjectKind::Dir, source: "~/work/alpha/".into(), name: None };
+        assert_eq!(jobs(&work), [add]);
+        let create =
+            Job::Create { title: "Plan".into(), description: None, projects: vec!["p-new".into()], until: None };
+        assert_eq!(chosen, Some(Action::Run(create)), "the form alone returns what to create");
+    }
+
+    /// R8.8: a clone is a real child (here a stand-in that waits); Esc
+    /// stops it with SIGTERM and the dialog says nothing was kept.
+    #[test]
+    fn r8_8_esc_stops_a_clone_and_the_dialog_says_so() {
+        let work = Arc::new(FakeWork::default());
+        let dialog = add::AddDialog::new(ProjectKind::Git, "", "", screen::Field::Source);
+        let mut steps = typing("https://github.com/acme/slow");
+        steps.extend([press(KeyCode::Enter), Step::Meanwhile(key(KeyCode::Esc)), press(KeyCode::Esc)]);
+        let started = Instant::now();
+        let paths = Paths::under("/r".as_ref());
+        let (chosen, shown) =
+            alone_screen(Screen::AddProject(Box::new(dialog)), steps, Arc::clone(&work) as Arc<dyn Work>, paths);
+        assert_eq!(chosen, None);
+        assert!(shown.contains("Stopped. Nothing of the clone was kept."), "{shown}");
+        assert!(started.elapsed() < Duration::from_secs(10), "the child did not wait its 30 s");
+        assert_eq!(jobs(&work), [Job::Clone { url: "https://github.com/acme/slow".into(), name: None }]);
+    }
+
+    /// R8.3, R8.8: Ctrl+N on the Projects screen adds a repository; once its
+    /// clone is done, the screen says so and lists it.
+    #[test]
+    fn r8_3_the_projects_screen_adds_a_repository() {
+        let work = Arc::new(FakeWork::default());
+        let screen = Screen::Projects(projects::ProjectsScreen::new(&snapshot()));
+        let mut steps = vec![Step::Key(ctrl('n'))];
+        steps.extend(typing("git@github.com:acme/backend.git"));
+        steps.extend([press(KeyCode::Enter), press(KeyCode::Esc)]);
+        let (chosen, shown) =
+            alone_screen(screen, steps, Arc::clone(&work) as Arc<dyn Work>, Paths::under("/r".as_ref()));
+        assert_eq!(chosen, None);
+        assert!(shown.contains("Project added.") && shown.contains("◆ backend"), "{shown}");
     }
 }

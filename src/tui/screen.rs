@@ -1,22 +1,36 @@
-//! Screens that open over the task list: dialogs and Settings now, and
-//! later the New task form, Projects and help. They are a stack: only the
-//! top one gets keys, so list keys never act on the task behind a dialog
-//! (DESIGN.md section 4, rules for the TUI), and Esc closes only the top.
-//! The app pushes them; a screen that opens another (the form's project
-//! finder) will say so in its [`Outcome`]. A screen that has work done and
-//! stays open (saving a setting, adding a project) gets the result back in
-//! [`Screen::done`].
+//! Screens that open over the task list, or alone (a dialog the CLI opens):
+//! the dialogs, the New task and edit form, its project finder, the add,
+//! rename and remove dialogs, Projects, Settings and help. They are a
+//! stack: only the top one gets keys, so list keys never act on the task
+//! behind a dialog (DESIGN.md section 4), and Esc closes only the top.
+//!
+//! A screen says what a key did in its [`Outcome`]: it stays, closes (with
+//! an action for the screen below, which gets it in [`Screen::returned`],
+//! like a dialog's result), has work done while it stays open (the result
+//! comes back in [`Screen::done`]), or opens another screen over itself.
+//! Screens do no I/O: what they need read (a folder listing, a check of
+//! what was typed) they say in [`Screen::needs`], and the event loop
+//! reads it in a thread and hands it back.
+//!
 //! A new screen is a new variant; every `match` that must handle it then
 //! fails to compile until it does.
+
+use std::time::Instant;
 
 use jiff::tz::TimeZone;
 use ratatui::crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 use tui_input::Input;
 use tui_input::backend::crossterm::EventHandler;
 
-use super::app::{Action, Job};
+use super::add::AddDialog;
+use super::app::{Action, Job, Moment, Reply, Snapshot};
+use super::finder::Finder;
+use super::form::TaskForm;
+use super::help::Help;
+use super::projects::{ProjectsScreen, RenameDialog};
 use crate::config::{Setting, Settings};
 use crate::error::Error;
+use crate::folders::Listing;
 use crate::paths::Paths;
 use crate::projects::{CloneChoice, CloneState, RemovalPlan};
 use crate::snooze::Until;
@@ -35,6 +49,8 @@ pub enum Screen {
         session: String,
         title: String,
     },
+    /// Esc in a form with something typed in it (R1.1): y discards it.
+    ConfirmDiscard,
     Snooze(SnoozeDialog),
     RemoveProject(RemoveDialog),
     /// The workspace hotkey asks before giving a project without a folder
@@ -45,8 +61,13 @@ pub enum Screen {
         /// As shown, `~` for the home folder.
         folder: String,
     },
-    AddProject(AddDialog),
+    AddProject(Box<AddDialog>),
     Settings(SettingsScreen),
+    Form(Box<TaskForm>),
+    Finder(Box<Finder>),
+    Projects(ProjectsScreen),
+    Rename(RenameDialog),
+    Help(Help),
 }
 
 /// What a key did to the screen on top.
@@ -54,17 +75,30 @@ pub enum Screen {
 pub enum Outcome {
     Stay,
     Close,
-    /// Close, then act.
+    /// Close, then the screen below gets the action ([`Screen::returned`]);
+    /// with none below, the switcher acts on it (or the CLI that opened the screen alone gets it).
     CloseAnd(Action),
-    /// Act and stay: the result comes back to this screen ([`Screen::done`]).
+    /// Act and stay: a job's result comes back to this screen ([`Screen::done`]).
     Act(Action),
+    /// Open a screen over this one.
+    Open(Box<Screen>),
 }
 
 /// What a screen may need besides its own state.
 pub struct Context<'a> {
     pub tz: &'a TimeZone,
-    /// The epoch second the key arrived.
-    pub now: i64,
+    /// When the key arrived.
+    pub now: Moment,
+    pub paths: &'a Paths,
+}
+
+/// Something a screen needs read to show what it should.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Need {
+    /// The listing of a folder as typed (folder completion, R1.6).
+    Listing(String),
+    /// A job whose result comes back to the screen (the add dialog's check of what was typed).
+    Job(Job),
 }
 
 impl Screen {
@@ -84,6 +118,11 @@ impl Screen {
                 KeyCode::Char('n') | KeyCode::Esc => Outcome::Close,
                 _ => Outcome::Stay,
             },
+            Screen::ConfirmDiscard => match key.code {
+                KeyCode::Char('y') => Outcome::CloseAnd(Action::Answer(true)),
+                KeyCode::Char('n') | KeyCode::Esc => Outcome::Close, // keep editing
+                _ => Outcome::Stay,
+            },
             Screen::Snooze(dialog) => dialog.on_key(key, cx),
             Screen::RemoveProject(dialog) => dialog.on_key(key),
             Screen::ConfirmFolder { .. } => match key.code {
@@ -92,94 +131,95 @@ impl Screen {
                 KeyCode::Esc => Outcome::Close,
                 _ => Outcome::Stay,
             },
-            Screen::AddProject(dialog) => dialog.on_key(key),
+            Screen::AddProject(dialog) => dialog.on_key(key, cx),
             Screen::Settings(screen) => screen.on_key(key),
+            Screen::Form(form) => form.on_key(key, cx),
+            Screen::Finder(finder) => finder.on_key(key),
+            Screen::Projects(screen) => screen.on_key(key),
+            Screen::Rename(dialog) => dialog.on_key(key, cx),
+            Screen::Help(help) => help.on_key(key),
         }
     }
 
-    /// The result of the work this screen asked for ([`Outcome::Act`]).
-    pub fn done(&mut self, job: &Job, result: Result<String, Error>) -> Outcome {
-        match (self, job) {
-            (Screen::AddProject(dialog), Job::AddProject { .. }) => dialog.done(result),
-            (Screen::Settings(screen), Job::Setting { setting, on }) => screen.done(*setting, *on, result),
-            _ => Outcome::Stay, // not this screen's: it was closed meanwhile
+    /// The screen above closed with `action` (a dialog's result). What is
+    /// not for this screen goes on to the switcher.
+    pub fn returned(&mut self, action: Action) -> Outcome {
+        match self {
+            Screen::Form(form) => form.returned(action),
+            Screen::Finder(finder) => finder.returned(action),
+            Screen::Projects(screen) => screen.returned(action),
+            _ => Outcome::Act(action),
+        }
+    }
+
+    /// Whether this screen asked for `job`, so its result comes back here.
+    pub fn takes(&self, job: &Job) -> bool {
+        match self {
+            Screen::AddProject(_) => {
+                matches!(job, Job::AddProject { .. } | Job::Clone { .. } | Job::CheckProject { .. })
+            }
+            Screen::Settings(_) => matches!(job, Job::Setting { .. }),
+            Screen::Projects(_) => {
+                matches!(job, Job::RenameProject { .. } | Job::RemovalPlan { .. } | Job::RemoveProject { .. })
+            }
+            _ => false,
+        }
+    }
+
+    /// The result of a job this screen asked for ([`Screen::takes`]).
+    pub fn done(&mut self, job: &Job, result: Result<Reply, Error>, cx: &Context) -> Outcome {
+        match self {
+            Screen::AddProject(dialog) => dialog.done(job, result),
+            Screen::Settings(screen) => match job {
+                Job::Setting { setting, on } => screen.done(*setting, *on, result),
+                _ => Outcome::Stay,
+            },
+            Screen::Projects(screen) => screen.done(job, result, cx),
+            _ => Outcome::Stay,
+        }
+    }
+
+    /// What this screen needs read now, asked for once each.
+    pub fn needs(&mut self, now: Instant) -> Option<Need> {
+        match self {
+            Screen::AddProject(dialog) => dialog.needs(now),
+            Screen::Finder(finder) => finder.needs(),
+            _ => None,
+        }
+    }
+
+    /// When this screen will need something (a check once typing pauses).
+    pub fn due(&self) -> Option<Instant> {
+        match self {
+            Screen::AddProject(dialog) => dialog.due(),
+            _ => None,
+        }
+    }
+
+    /// A folder listing some screen asked for arrived.
+    pub fn listed(&mut self, parent: &str, listing: &Option<Listing>) {
+        match self {
+            Screen::AddProject(dialog) => dialog.folders.arrived(parent, listing),
+            Screen::Finder(finder) => finder.listed(parent, listing),
+            _ => {}
+        }
+    }
+
+    /// The switcher refreshed: screens that show its state follow it.
+    pub fn reread(&mut self, snapshot: &Snapshot) {
+        match self {
+            Screen::Settings(screen) => screen.reread(&snapshot.settings),
+            Screen::Projects(screen) => screen.reread(snapshot),
+            _ => {}
         }
     }
 }
 
-/// Which field of a dialog has the cursor.
+/// Which field of a two-field dialog has the cursor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Field {
     Source,
     Name,
-}
-
-/// Adding a project. For now a folder only, as the workspace hotkey adds
-/// it (R10.5): the folder and the name, filled in. Enter saves it; a
-/// problem with the name keeps the cursor on the name (R8.5). The Projects
-/// screen (R8.3) will add the other kinds.
-#[derive(Debug, Clone)]
-pub struct AddDialog {
-    pub kind: ProjectKind,
-    pub source: Input,
-    pub name: Input,
-    pub focus: Field,
-    /// Why the last try did not save it.
-    pub error: Option<String>,
-    /// A save runs: Enter waits for it.
-    pub saving: bool,
-}
-
-impl AddDialog {
-    pub fn folder(folder: &str, name: &str) -> AddDialog {
-        AddDialog {
-            kind: ProjectKind::Dir,
-            source: Input::new(folder.into()),
-            name: Input::new(name.into()),
-            focus: Field::Source,
-            error: None,
-            saving: false,
-        }
-    }
-
-    fn on_key(&mut self, key: KeyEvent) -> Outcome {
-        match key.code {
-            KeyCode::Esc => return Outcome::Close,
-            KeyCode::Tab | KeyCode::BackTab | KeyCode::Up | KeyCode::Down => {
-                self.focus = if self.focus == Field::Source { Field::Name } else { Field::Source };
-            }
-            KeyCode::Enter if !self.saving => {
-                self.saving = true;
-                let name = Some(self.name.value().trim().to_string()).filter(|n| !n.is_empty());
-                let job = Job::AddProject { kind: self.kind, source: self.source.value().trim().into(), name };
-                return Outcome::Act(Action::Run(job));
-            }
-            KeyCode::Enter => {}
-            _ => {
-                let field = if self.focus == Field::Source { &mut self.source } else { &mut self.name };
-                if field.handle_event(&Event::Key(key)).is_some_and(|change| change.value) {
-                    self.error = None;
-                }
-            }
-        }
-        Outcome::Stay
-    }
-
-    /// Saved: close with the project's id. Not saved: say why, on the name
-    /// when the name is the problem.
-    fn done(&mut self, result: Result<String, Error>) -> Outcome {
-        self.saving = false;
-        match result {
-            Ok(id) => Outcome::CloseAnd(Action::ProjectAdded(id)),
-            Err(e) => {
-                if e.is_about_the_name() {
-                    self.focus = Field::Name;
-                }
-                self.error = Some(e.to_string());
-                Outcome::Stay
-            }
-        }
-    }
 }
 
 /// The settings in `config.toml` (R10.4), saved one toggle at a time as
@@ -212,14 +252,10 @@ impl SettingsScreen {
     }
 
     fn on_key(&mut self, key: KeyEvent) -> Outcome {
-        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let last = Setting::ALL.len() - 1;
         match key.code {
             KeyCode::Esc => return Outcome::Close,
-            KeyCode::Up => self.selected = self.selected.saturating_sub(1),
-            KeyCode::Char('k') if ctrl => self.selected = self.selected.saturating_sub(1),
-            KeyCode::Down => self.selected = (self.selected + 1).min(last),
-            KeyCode::Char('j') if ctrl => self.selected = (self.selected + 1).min(last),
+            _ if moves(key) != 0 => self.selected = step(self.selected, moves(key), last),
             KeyCode::Enter | KeyCode::Char(' ') if !self.saving => {
                 if let Ok(settings) = &self.settings {
                     let setting = Setting::ALL[self.selected];
@@ -232,7 +268,7 @@ impl SettingsScreen {
         Outcome::Stay
     }
 
-    fn done(&mut self, setting: Setting, on: bool, result: Result<String, Error>) -> Outcome {
+    fn done(&mut self, setting: Setting, on: bool, result: Result<Reply, Error>) -> Outcome {
         self.saving = false;
         match (result, &mut self.settings) {
             (Ok(_), Ok(settings)) => settings.set(setting, on),
@@ -241,6 +277,23 @@ impl SettingsScreen {
         }
         Outcome::Stay
     }
+}
+
+/// Up and down in a list: ↑↓, and Ctrl+K / Ctrl+J as in vim; 0 for any other key.
+pub fn moves(key: KeyEvent) -> isize {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    match key.code {
+        KeyCode::Up => -1,
+        KeyCode::Down => 1,
+        KeyCode::Char('k') if ctrl => -1,
+        KeyCode::Char('j') if ctrl => 1,
+        _ => 0,
+    }
+}
+
+/// `at` moved by `by`, within `0..=last`.
+pub fn step(at: usize, by: isize, last: usize) -> usize {
+    at.saturating_add_signed(by).min(last)
 }
 
 /// Removing a project (R8.7), following `itm project remove`: a clone is
@@ -282,14 +335,11 @@ impl RemoveDialog {
     }
 
     fn on_key(&mut self, key: KeyEvent) -> Outcome {
-        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-        let last = self.choices.len().saturating_sub(1);
         match key.code {
             KeyCode::Esc => return Outcome::Close,
-            KeyCode::Up => self.selected = self.selected.saturating_sub(1),
-            KeyCode::Char('k') if ctrl => self.selected = self.selected.saturating_sub(1),
-            KeyCode::Down => self.selected = (self.selected + 1).min(last),
-            KeyCode::Char('j') if ctrl => self.selected = (self.selected + 1).min(last),
+            _ if moves(key) != 0 => {
+                self.selected = step(self.selected, moves(key), self.choices.len().saturating_sub(1))
+            }
             KeyCode::Enter => {
                 if let Some(&choice) = self.choices.get(self.selected) {
                     let job = Job::RemoveProject { id: self.id.clone(), name: self.name.clone(), choice };
@@ -319,21 +369,18 @@ impl SnoozeDialog {
     }
 
     fn on_key(&mut self, key: KeyEvent, cx: &Context) -> Outcome {
-        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-        let last = self.presets.len().saturating_sub(1);
         match key.code {
             KeyCode::Esc => return Outcome::Close,
-            KeyCode::Up => self.selected = self.selected.saturating_sub(1),
-            KeyCode::Char('k') if ctrl => self.selected = self.selected.saturating_sub(1),
-            KeyCode::Down => self.selected = (self.selected + 1).min(last),
-            KeyCode::Char('j') if ctrl => self.selected = (self.selected + 1).min(last),
+            _ if moves(key) != 0 => {
+                self.selected = step(self.selected, moves(key), self.presets.len().saturating_sub(1))
+            }
             KeyCode::Enter => {
                 let until = match self.typed.value().trim() {
                     "" => match self.presets.get(self.selected) {
                         Some(&(_, until)) => Ok(until),
                         None => return Outcome::Stay, // nothing offered and nothing typed
                     },
-                    typed => Until::parse(typed, cx.now, cx.tz),
+                    typed => Until::parse(typed, cx.now.epoch, cx.tz),
                 };
                 match until {
                     Ok(until) => {

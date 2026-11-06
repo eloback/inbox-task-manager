@@ -10,7 +10,7 @@ use serde::Serialize;
 use crate::error::{Context, Error, Result, bail};
 use crate::herdr::Sessions;
 use crate::itm::Itm;
-use crate::projects::{CloneChoice, CloneState, RemovalNote, project_rows};
+use crate::projects::{CloneChoice, CloneState, RemovalNote, project_rows, resolve_project};
 use crate::snooze::Until;
 use crate::status::Status;
 use crate::store::{Data, ProjectKind, State, python_json};
@@ -57,6 +57,9 @@ enum Command {
         snooze: Option<String>,
         #[arg(long)]
         no_switch: bool,
+        /// Open the New task form with what was given filled in (it opens without a title too)
+        #[arg(short, long)]
+        interactive: bool,
     },
     /// Hide a task until a time: snooze [task] [when]; without a time, a dialog
     Snooze {
@@ -200,10 +203,11 @@ enum ListView {
 
 pub fn run(cli: Cli, itm: Itm) -> Result<()> {
     let now = times::now();
+    // Shared with the workers of a terminal UI.
+    let itm = Arc::new(itm);
     match cli.command.unwrap_or(Command::Ui { view: tui::View::Inbox }) {
         Command::Ui { view } => {
             // Switching happens after the switcher gave the terminal back.
-            let itm = Arc::new(itm);
             match tui::run(&itm, view)? {
                 Some(target) => itm.switch_to(&target),
                 None => Ok(()),
@@ -215,28 +219,67 @@ pub fn run(cli: Cli, itm: Itm) -> Result<()> {
             }
             itm.switch_to(&target)
         }
-        Command::New { title, description, projects, snooze, no_switch } => {
+        Command::New { title, description, projects, snooze, no_switch, interactive } => {
+            // What was given is checked before the form asks for the rest.
             let until = snooze.map(|text| Until::parse(&text, now, &itm.tz)).transpose()?;
             if until == Some(Until::Agent) {
                 bail!("a new task has no agents yet, so none could wake it; snooze it until a time");
             }
+            let mut projects = {
+                let data = itm.store().load()?;
+                let ids: Result<Vec<String>> = projects.iter().map(|query| resolve_project(&data, query)).collect();
+                let mut ids = ids?;
+                let mut seen = std::collections::BTreeSet::new();
+                ids.retain(|id| seen.insert(id.clone()));
+                ids
+            };
             let title = title.join(" ");
-            if title.trim().is_empty() {
-                // Without a title the New task form opens (R1.1), which needs a terminal.
-                needs_terminal()?;
-                bail!("give the task a title: itm new \"<title>\" (the New task form is not built yet)");
+            // Without a title, or with -i, the New task form (R1.1), which needs a terminal.
+            let ask = interactive || title.trim().is_empty();
+            if ask && projects.is_empty() && itm.inside_herdr() {
+                // It starts with the first project of the task you are in (R1.6).
+                let current = itm.current_session(&itm.herdr.sessions()?);
+                let data = itm.store().load()?;
+                projects = current
+                    .and_then(|c| data.tasks.get(&c))
+                    .map_or(vec![], |t| t.projects.iter().take(1).cloned().collect());
             }
             // A snoozed task is not switched to (R1.7). Check that a switch can
-            // work before saving, so a failed one leaves no task.
+            // work before saving, so a failed one leaves no task; the form says
+            // why instead and saves without switching (R1.4).
             let switch = !no_switch && until.is_none();
+            let mut cannot_switch = None;
             if switch && itm.inside_herdr() {
-                itm.switchable_session(&itm.herdr.sessions()?)?;
+                match itm.switchable_session(&itm.herdr.sessions()?) {
+                    Err(e) if ask => cannot_switch = Some(e.to_string()),
+                    Err(e) => return Err(e),
+                    Ok(_) => {}
+                }
             } else if switch && which("herdr").is_none() {
                 return Err(Error::Missing("herdr"));
             }
+            let (title, description, projects, until) = match ask {
+                false => (title, description, projects, until),
+                true => {
+                    needs_terminal()?;
+                    let saved = tui::Saved::read(&itm.store().load()?);
+                    let presets = crate::snooze::presets(now, &itm.tz, false); // a new task has no agents yet
+                    let form = tui::TaskForm::new_task(title.trim(), projects, saved, presets, &itm.paths)
+                        .cannot_switch(cannot_switch.clone())
+                        .until(until, &itm.tz);
+                    let new = tui::task_form(&itm, form)?.ok_or(Error::Cancelled)?;
+                    (new.title, new.description, new.projects, new.until)
+                }
+            };
             let name = itm.create_task(&title, description.as_deref(), &projects, until)?;
             println!("{name}");
-            if switch { itm.switch_to(&name) } else { Ok(()) }
+            if no_switch || until.is_some() {
+                return Ok(());
+            }
+            if let Some(problem) = cannot_switch {
+                bail!("{name} saved without switching: {problem}");
+            }
+            itm.switch_to(&name)
         }
         Command::Snooze { task, until_agent, words } => {
             let data = itm.store().load()?;
@@ -249,7 +292,7 @@ pub fn run(cli: Cli, itm: Itm) -> Result<()> {
                     needs_terminal()?;
                     let agent = Itm::agent_snooze_problem(&name, &itm.herdr.sessions()?, &itm.status()).is_none();
                     let title = data.tasks.get(&name).map_or(name.as_str(), |t| t.title.as_str());
-                    tui::snooze_dialog(&name, title, agent, &itm.tz)?.ok_or(Error::Cancelled)?
+                    tui::snooze_dialog(&name, title, agent, &itm)?.ok_or(Error::Cancelled)?
                 }
             };
             itm.snooze_task(&name, until)?;
@@ -278,7 +321,7 @@ pub fn run(cli: Cli, itm: Itm) -> Result<()> {
             if !yes {
                 // R5.3: after confirmation. A no is said by the exit status alone, as in the Python itm.
                 needs_terminal()?;
-                if !tui::confirm_delete(&name, &data.tasks[&name].title)? {
+                if !tui::confirm_delete(&name, &data.tasks[&name].title, &itm)? {
                     return Err(Error::Exit(1));
                 }
             }
@@ -292,14 +335,29 @@ pub fn run(cli: Cli, itm: Itm) -> Result<()> {
             if projects.is_some() && !(add.is_empty() && remove.is_empty()) {
                 bail!("--project and --no-project set the projects; --add-project and --remove-project change them");
             }
-            if title.is_none() && description.is_none() && projects.is_none() && add.is_empty() && remove.is_empty() {
-                // Without options the edit form opens (R5.4), which needs a terminal.
-                needs_terminal()?;
-                bail!(
-                    "say what to change: --title, --description, --project, --add-project, --remove-project (the edit form is not built yet)"
-                );
-            }
-            let said = itm.edit_task(&name, &Edit { title, description, projects, add, remove, ..Edit::default() })?;
+            let edit = match title.is_none()
+                && description.is_none()
+                && projects.is_none()
+                && add.is_empty()
+                && remove.is_empty()
+            {
+                false => Edit { title, description, projects, add, remove, ..Edit::default() },
+                // Without options, the edit form (R5.4), which needs a terminal.
+                true => {
+                    needs_terminal()?;
+                    let data = itm.store().load()?;
+                    let task = &data.tasks[&name];
+                    // Herdr not answering: the form says it is unknown whether the session runs.
+                    let effect = itm.herdr.sessions().ok().map(|sessions| tui::Effect::of(sessions.get(&name)));
+                    let settings = itm.settings();
+                    let follows = settings.as_ref().is_ok_and(|s| s.projects_from_workspaces) && itm.status().fresh;
+                    let broken = settings.err().map(|e| e.to_string());
+                    let editing = tui::Editing::with(name.clone(), task, effect, follows, broken);
+                    let form = tui::TaskForm::edit(task, tui::Saved::read(&data), editing);
+                    tui::edit_form(&itm, form)?.ok_or(Error::Cancelled)?
+                }
+            };
+            let said = itm.edit_task(&name, &edit)?;
             println!("{name} updated{}", said.iter().map(|s| format!("; {s}")).collect::<String>());
             Ok(())
         }
@@ -403,7 +461,7 @@ pub fn run(cli: Cli, itm: Itm) -> Result<()> {
         Command::Project(ProjectCommand::AddWorkspace { name }) => {
             // A popup's workspace is the one it was opened over (R10.5).
             let active = std::env::var("HERDR_ACTIVE_WORKSPACE_ID").ok();
-            let dialogs = Dialogs(&itm);
+            let dialogs = Dialogs(Arc::clone(&itm));
             let ask = terminal().then_some(&dialogs as &dyn Ask);
             let added = itm.add_workspace(name.as_deref(), active.as_deref(), ask)?;
             let said: String = added.said.iter().map(|line| format!("; {line}")).collect();
@@ -457,7 +515,7 @@ pub fn run(cli: Cli, itm: Itm) -> Result<()> {
             println!("{}", itm.current_session(&itm.herdr.sessions()?).unwrap_or_default());
             Ok(())
         }
-        Command::Daemon => Arc::new(itm).run_daemon(),
+        Command::Daemon => itm.run_daemon(),
         Command::Setsid { program, args } => Err(crate::system::setsid_exec(&program, &args)),
     }
 }
@@ -471,15 +529,15 @@ pub fn popup() -> bool {
 }
 
 /// `add-workspace`'s questions, asked in this terminal.
-struct Dialogs<'a>(&'a Itm);
+struct Dialogs(Arc<Itm>);
 
-impl Ask for Dialogs<'_> {
+impl Ask for Dialogs {
     fn add_folder(&self, folder: &std::path::Path, name: &str) -> Result<Option<String>> {
-        tui::add_folder_dialog(self.0, &self.0.paths.display(folder), name)
+        tui::add_folder_dialog(&self.0, &self.0.paths.display(folder), name)
     }
 
     fn give_folder(&self, project: &str, folder: &str) -> Result<Option<bool>> {
-        tui::confirm_folder(project, folder)
+        tui::confirm_folder(project, folder, &self.0)
     }
 }
 
@@ -509,7 +567,7 @@ fn remove_choice(itm: &Itm, query: &str) -> Result<(CloneChoice, Vec<RemovalNote
             kept(&format!("it has {work}; --delete-clone deletes it anyway"))
         }
         Some(CloneState::Deletable { local_work: None }) if plan.users.is_empty() => match terminal() {
-            true => Ok((tui::remove_project_dialog(&plan, &itm.paths)?.ok_or(Error::Cancelled)?, vec![])),
+            true => Ok((tui::remove_project_dialog(&plan, itm)?.ok_or(Error::Cancelled)?, vec![])),
             false => kept("no terminal to ask; --delete-clone deletes it"),
         },
         _ => Ok((CloneChoice::Keep, vec![])),

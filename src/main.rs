@@ -6,6 +6,8 @@ mod cli;
 mod config;
 mod daemon;
 mod error;
+mod folders;
+mod fuzzy;
 mod git;
 mod herdr;
 mod itm;

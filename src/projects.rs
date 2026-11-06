@@ -7,18 +7,21 @@
 //! outside the store lock, because it can take minutes and the daemon
 //! writes the store every 2 s (DESIGN.md section 2, Projects).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::fs::{self, File};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::LazyLock;
 
+use regex_lite::Regex;
 use serde::Serialize;
 
 use crate::error::{Context, Error, Result, bail, shell_quote};
+use crate::git::normalize_git_url;
 use crate::itm::Itm;
-use crate::paths::{expand_home, resolved};
+use crate::paths::{Paths, expand_home, resolved};
 use crate::store::{Data, Project, ProjectKind, State, flocked};
 use crate::system::{ExitSignals, in_new_session};
 use crate::times;
@@ -56,11 +59,36 @@ pub struct RemovalPlan {
     pub clone: Option<CloneState>,
 }
 
+/// Where a new project's folder would be, and the name it defaults to.
+struct Spec {
+    folder: Option<PathBuf>,
+    default_name: String,
+}
+
+/// What adding a project would do ([`Itm::check_project`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Check {
+    /// The folder it gets: a repository's clone, a folder resolved; None for a name.
+    pub folder: Option<PathBuf>,
+    /// The name it gets when none is given (empty for a name only).
+    pub default_name: String,
+    /// Why it cannot be added; None when it can.
+    pub problem: Option<Error>,
+}
+
 /// A line of what removing a project did. A clone kept is a warning.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RemovalNote {
     Done(String),
     Kept(String),
+}
+
+impl RemovalNote {
+    pub fn line(self) -> String {
+        match self {
+            RemovalNote::Done(line) | RemovalNote::Kept(line) => line,
+        }
+    }
 }
 
 impl Itm {
@@ -69,32 +97,25 @@ impl Itm {
     /// source. The name defaults to the repository's or folder's.
     pub fn add_project(&self, kind: ProjectKind, source: &str, name: Option<&str>) -> Result<String> {
         let source = source.trim();
-        let (url, path) = match kind {
-            ProjectKind::Git => (Some(source), Some(self.paths.projects.join(self.git.repo_key(source)?))),
-            ProjectKind::Dir => (None, Some(self.folder_spec(source)?)),
-            ProjectKind::Name => (None, None),
-        };
-        let name = match kind {
-            ProjectKind::Name if name.is_some_and(|n| !n.is_empty()) => {
-                bail!("a name-only project is named by its source: `itm project add name <name>`")
-            }
-            ProjectKind::Name => check_project_name(source)?, // nothing else to name it after
-            _ => {
-                let default = path.as_ref().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().into_owned());
-                let given = name.map(str::trim).filter(|n| !n.is_empty());
-                check_project_name(given.or(default.as_deref()).unwrap_or("project"))?
-            }
-        };
+        if kind == ProjectKind::Name && name.is_some_and(|n| !n.is_empty()) {
+            bail!("a name-only project is named by its source: `itm project add name <name>`")
+        }
+        let spec = self.project_spec(kind, source)?;
+        let name = check_project_name(match kind {
+            ProjectKind::Name => source, // nothing else to name it after
+            _ => name.map(str::trim).filter(|n| !n.is_empty()).unwrap_or(&spec.default_name),
+        })?;
         // Every writer of projects holds this lock, so checking once before the clone is enough.
         let _lock = self.projects_lock()?;
-        self.check_project_free(&self.store().load()?, path.as_deref(), Some(&name), kind, None)?;
-        if let (Some(url), Some(clone)) = (url, &path) {
+        self.check_project_free(&self.store().load()?, spec.folder.as_deref(), Some(&name), kind, None)?;
+        let url = (kind == ProjectKind::Git).then_some(source);
+        if let (Some(url), Some(clone)) = (url, &spec.folder) {
             self.clone_repo(url, clone)?;
         }
         let now = times::now();
         self.store().edit(|data| {
             let id = new_project_id(data)?;
-            let path = path.as_ref().map(|p| p.display().to_string());
+            let path = spec.folder.as_ref().map(|p| p.display().to_string());
             let project = Project {
                 name,
                 path,
@@ -106,6 +127,42 @@ impl Itm {
             data.projects.insert(id.clone(), project);
             Ok(id)
         })
+    }
+
+    /// Where a project of `kind` from `source` goes: a repository's clone
+    /// under the projects folder (its normalized URL, `insteadOf` followed,
+    /// R8.4), a folder resolved, nothing for a name; and the name it
+    /// defaults to.
+    fn project_spec(&self, kind: ProjectKind, source: &str) -> Result<Spec> {
+        let source = source.trim();
+        let folder = match kind {
+            ProjectKind::Git => Some(self.paths.projects.join(self.git.repo_key(source)?)),
+            ProjectKind::Dir => Some(self.folder_spec(source)?),
+            ProjectKind::Name => None,
+        };
+        let default = folder.as_ref().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().into_owned());
+        Ok(Spec { default_name: default.unwrap_or_else(|| "project".into()), folder })
+    }
+
+    /// What adding a project would do, as the add dialog shows it while
+    /// typing (R8.5); nothing is saved. Err: the source is no folder or
+    /// git URL. Otherwise the folder it would get, the name it defaults
+    /// to, and why it could not be added (saved already, a name taken),
+    /// as adding it would say.
+    pub fn check_project(&self, kind: ProjectKind, source: &str, name: Option<&str>) -> Result<Check> {
+        let spec = match kind {
+            ProjectKind::Name => Spec { folder: None, default_name: String::new() },
+            _ => self.project_spec(kind, source)?,
+        };
+        // As adding it checks: the name first, then whether it is free.
+        let name = match kind {
+            ProjectKind::Name => source.trim(),
+            _ => name.map(str::trim).filter(|n| !n.is_empty()).unwrap_or(&spec.default_name),
+        };
+        let free = check_project_name(name).and_then(|name| {
+            self.check_project_free(&self.store().load()?, spec.folder.as_deref(), Some(&name), kind, None)
+        });
+        Ok(Check { folder: spec.folder, default_name: spec.default_name, problem: free.err() })
     }
 
     pub(crate) fn projects_lock(&self) -> Result<File> {
@@ -373,13 +430,11 @@ impl Itm {
     /// host-key question can neither draw over the UI nor hang. Its output,
     /// git's progress included, is for the UI to read; its last line is the
     /// project's name.
-    #[cfg_attr(not(test), expect(dead_code, reason = "the add dialog (R8.3, milestone 4) starts the clone child"))]
     pub fn clone_child(&self, url: &str, name: Option<&str>) -> io::Result<Command> {
         let mut command = in_new_session(&self.program)?;
-        command.args(["project", "add", "git", url]);
-        if let Some(name) = name {
-            command.args(["--name", name]);
-        }
+        command.args(["project", "add", "git"]);
+        // `--name=…` and `--`: a name or URL starting with "-" is not read as an option.
+        command.args(name.map(|name| format!("--name={name}"))).args(["--", url]);
         let ssh = std::env::var_os("GIT_SSH_COMMAND");
         command
             .env_remove("ITM_POPUP") // it would delay every error by 2.5 s
@@ -513,7 +568,6 @@ fn batch_ssh(current: Option<&std::ffi::OsStr>) -> OsString {
 
 /// What a clone that failed because git or ssh wanted to ask something
 /// should say next (R8.8): add it from a terminal, where they can ask.
-#[cfg_attr(not(test), expect(dead_code, reason = "the add dialog (R8.3, milestone 4) starts the clone child"))]
 pub fn clone_hint(output: &str) -> Option<&'static str> {
     const PROMPTS: [&str; 6] = [
         "terminal prompts disabled",
@@ -527,6 +581,12 @@ pub fn clone_hint(output: &str) -> Option<&'static str> {
     PROMPTS.iter().any(|p| lowered.contains(p)).then_some(
         "this repository needs a password or a host key confirmation; run `itm project add git <url>` in a terminal",
     )
+}
+
+/// Each saved folder with its links resolved, and its project: a folder
+/// reached through a link is the project's (the finder, R1.6).
+pub fn saved_folders(data: &Data) -> BTreeMap<PathBuf, String> {
+    (data.projects.iter()).filter_map(|(id, p)| Some((resolved(p.folder()?), id.clone()))).collect()
 }
 
 /// Ids of the projects whose folder is set and not there; a project
@@ -544,6 +604,50 @@ pub fn resolve_project(data: &Data, query: &str) -> Result<String> {
         [id] => Ok((*id).clone()),
         _ if data.projects.contains_key(query) => Ok(query.into()),
         _ => Err(Error::NoSuchProject(query.into())),
+    }
+}
+
+/// Projects with their ids, the most recently used first (R1.6, R8.3).
+pub fn projects_by_recent(projects: &BTreeMap<String, Project>) -> Vec<(&String, &Project)> {
+    let mut projects: Vec<_> = projects.iter().collect();
+    projects.sort_by_key(|(_, p)| (std::cmp::Reverse(p.last_used_at), p.name.to_lowercase()));
+    projects
+}
+
+/// Whether typed text is a git URL being typed (`scheme://…` or
+/// `user@host:path`) rather than a project's name.
+pub fn looks_like_git_url(text: &str) -> bool {
+    static URL: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^(?i)[a-z][a-z0-9+.-]*://\S").unwrap());
+    static SCP: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[^@\s/:]+@[^@\s/:]+:\S+$").unwrap());
+    URL.is_match(text) || SCP.is_match(text)
+}
+
+/// The saved git project of `url`'s repository, compared as R8.4 normalizes
+/// URLs (no git call, so no `insteadOf`).
+pub fn saved_repository<'a>(projects: &'a BTreeMap<String, Project>, url: &str) -> Option<&'a String> {
+    let key = normalize_git_url(url).ok()?;
+    let same = |p: &Project| p.url.as_deref().and_then(|u| normalize_git_url(u).ok()).is_some_and(|k| k == key);
+    projects.iter().find(|(_, p)| same(p)).map(|(id, _)| id)
+}
+
+/// Why `name` cannot be the name of the project `id` (a rename, R8.5):
+/// not a name a project can have, or another project's, ignoring case.
+pub fn name_problem(data: &Data, paths: &Paths, name: &str, id: &str) -> Option<Error> {
+    match check_project_name(name) {
+        Err(e) => Some(e),
+        Ok(name) => named(data, &name, Some(id))
+            .map(|taken| Error::ProjectNameTaken { name: taken.name.clone(), place: paths.place(taken) }),
+    }
+}
+
+/// What a TUI's clone child (R8.8) said when it failed: its last `itm:`
+/// error, else its last line, and the hint when git or ssh wanted to ask.
+pub fn clone_failure(output: &str) -> String {
+    let error = output.lines().rev().find_map(|l| l.strip_prefix("itm: "));
+    let message = error.or_else(|| output.trim().lines().next_back()).unwrap_or("the clone failed").trim().to_string();
+    match clone_hint(output) {
+        Some(hint) => format!("{message}\n{hint}"),
+        None => message,
     }
 }
 
@@ -1125,7 +1229,7 @@ esac
         let args: Vec<_> = command.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
         assert_eq!(
             args,
-            ["setsid", "/opt/itm/bin/itm", "project", "add", "git", "git@github.com:acme/api.git", "--name", "api2"]
+            ["setsid", "/opt/itm/bin/itm", "project", "add", "git", "--name=api2", "--", "git@github.com:acme/api.git"]
         );
         let envs: Vec<_> = command
             .get_envs()
@@ -1219,5 +1323,82 @@ esac
         itm.prepare_first_start(&data, &name).unwrap(); // would fail to start a server: none is started
         data.tasks.insert("task-plain".into(), Task::new("Plain", 1));
         itm.prepare_first_start(&data, "task-plain").unwrap();
+    }
+
+    /// R8.5: the add dialog's check while typing says what adding would do,
+    /// as adding says it, and saves nothing.
+    #[test]
+    fn r8_5_the_check_while_typing_says_what_adding_would_do() {
+        let (_tmp, mut itm) = itm();
+        fake_git(&mut itm);
+        let api = folder(&itm, "code/api");
+        folder(&itm, "other/api");
+        let check = itm.check_project(ProjectKind::Dir, "~/code/api", None).unwrap();
+        assert_eq!(
+            (check.folder.as_deref(), check.default_name.as_str(), check.problem),
+            (Some(api.as_path()), "api", None)
+        );
+        itm.add_project(ProjectKind::Dir, "~/code/api", None).unwrap();
+        let problem =
+            |kind, source, name| itm.check_project(kind, source, name).unwrap().problem.map(|e| e.to_string());
+        assert_eq!(problem(ProjectKind::Dir, "~/code/api/", None).as_deref(), Some("project already exists: api"));
+        let taken = problem(ProjectKind::Dir, "~/other/api", None).unwrap();
+        assert!(taken.starts_with("project already exists: api (~/code/api); choose another name"), "{taken}");
+        assert_eq!(problem(ProjectKind::Dir, "~/other/api", Some("api2")), None);
+        assert_eq!(problem(ProjectKind::Name, "API", None).as_deref(), Some(taken.as_str()));
+        assert_eq!(problem(ProjectKind::Name, "Client X", None), None);
+        let check = itm.check_project(ProjectKind::Git, "https://github.com/acme/web.git", None).unwrap();
+        assert_eq!(check.folder, Some(itm.paths.projects.join("github.com/acme/web")));
+        assert_eq!((check.default_name.as_str(), check.problem), ("web", None));
+        let err = itm.check_project(ProjectKind::Dir, "~no-such-user-x", None).unwrap_err();
+        assert_eq!(err.to_string(), "not a folder: ~no-such-user-x");
+        assert_eq!(itm.store().load().unwrap().projects.len(), 1, "nothing saved");
+        let blank = itm.add_project(ProjectKind::Name, "  ", None).unwrap_err();
+        assert_eq!(blank, Error::ProjectName, "a blank name is refused, not saved as \"project\"");
+    }
+
+    /// R1.6, R8.3, R8.4: recency order, git URLs being typed, and the saved repository of a URL.
+    #[test]
+    fn r1_6_projects_by_recent_and_saved_repositories() {
+        let mut data = Data::default();
+        let project = |name: &str, url: Option<&str>, used| Project {
+            name: name.into(),
+            path: Some(format!("/p/{name}")),
+            url: url.map(Into::into),
+            added_at: 0,
+            last_used_at: used,
+            extra: Default::default(),
+        };
+        data.projects.insert("p1".into(), project("web", None, 5));
+        data.projects.insert("p2".into(), project("api", Some("git@github.com:acme/api.git"), 9));
+        data.projects.insert("p3".into(), project("Docs", None, 5));
+        let order: Vec<&str> = projects_by_recent(&data.projects).iter().map(|(_, p)| p.name.as_str()).collect();
+        assert_eq!(order, ["api", "Docs", "web"]);
+        for url in ["https://github.com/acme/api", "git@github.com:acme/api.git", "ssh://git@github.com/acme/api"] {
+            assert!(looks_like_git_url(url), "{url}");
+            assert_eq!(saved_repository(&data.projects, url).map(String::as_str), Some("p2"), "{url}");
+        }
+        assert_eq!(saved_repository(&data.projects, "https://github.com/acme/web"), None);
+        for text in ["api", "my api", "~/code", "git@github.com", "a@b:"] {
+            assert!(!looks_like_git_url(text), "{text}");
+        }
+        let paths = Paths::under(Path::new("/r"));
+        assert_eq!(name_problem(&data, &paths, "API", "p2"), None, "its own name, in any case");
+        let taken = name_problem(&data, &paths, "docs", "p2").unwrap();
+        assert!(taken.is_about_the_name() && taken.to_string().starts_with("project already exists: Docs (/p/Docs)"));
+        assert_eq!(name_problem(&data, &paths, " ", "p2"), Some(Error::ProjectName));
+    }
+
+    /// R8.8: what a failed clone child said, and the hint when it wanted to ask.
+    #[test]
+    fn r8_8_a_failed_clone_says_its_last_error() {
+        let said =
+            "Cloning into 'x'...\nfatal: could not read Username for 'https://github.com'\nitm: could not clone x\n";
+        assert_eq!(
+            clone_failure(said),
+            "could not clone x\nthis repository needs a password or a host key confirmation; run `itm project add git <url>` in a terminal"
+        );
+        assert_eq!(clone_failure("fatal: repository not found\n"), "fatal: repository not found");
+        assert_eq!(clone_failure(""), "the clone failed");
     }
 }

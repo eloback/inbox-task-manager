@@ -1,10 +1,11 @@
 ---
 source: src/tui/draw.rs
+assertion_line: 978
 expression: screen
 ---
 "  Inbox 3   Snoozed 1   Archived 1   All 5        ⚑ 1 needs you "
 "                                                                "
-" › Search tasks · or type a new title                           "
+" › Search tasks · @project filters · or type a new title        "
 "                                                                "
 " NEEDS YOU                              │  Fix login            "
 " ⚑ Fix login        claude waiting · 4m │                       "
@@ -17,8 +18,8 @@ expression: screen
 "                                        │    Refactor auth      "
 "                                        │                       "
 "                                        │  Notes · none yet ·   "
-"                                        │  ctrl+o writes some   "
 "                                        │  enter open           "
+"                                        │  ctrl+o notes         "
 "                                                                "
-" enter open  tab view  alt+1…9 row  ^z snooze  ^u wake          "
-" ^a archive  esc close                                          "
+" enter open  tab view  ^n new  ^e edit  ^z snooze  ^p projects  "
+" ? all keys                                                     "

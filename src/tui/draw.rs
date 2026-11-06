@@ -1,6 +1,7 @@
 //! Drawing the switcher (DESIGN.md section 3): views with counts, the
-//! inbox list, a preview of the highlighted task, at most seven keys.
-//! Pure: what is drawn depends only on the app and `now`.
+//! inbox list, a preview of the highlighted task, at most seven keys, and
+//! the small dialogs; the helpers the other screens draw with. Pure: what
+//! is drawn depends only on the app and `now`.
 
 use jiff::tz::TimeZone;
 use ratatui::Frame;
@@ -9,42 +10,71 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, List, ListItem, Paragraph, Wrap};
 
-use super::app::{App, Row, Snapshot, View};
-use super::screen::{AddDialog, Field, RemoveDialog, Screen, SettingsScreen, SnoozeDialog};
+use super::app::{App, Query, Row, Snapshot, View};
+use super::screen::{RemoveDialog, Screen, SettingsScreen, SnoozeDialog};
 use crate::config::Setting;
+use crate::paths::Paths;
 use crate::projects::{CloneChoice, CloneState};
 use crate::snooze::Until;
 use crate::status::AgentState;
-use crate::store::{ProjectKind, State, Task};
+use crate::store::{Project, ProjectKind, State, Task};
 use crate::times::{age, day_and_clock, rel};
 
-const ACCENT: Color = Color::Cyan;
-const PROJECT: Color = Color::Magenta;
-const ERROR: Color = Color::Red;
-const WARNING: Color = Color::Yellow;
-const SUCCESS: Color = Color::Green;
-const MUTED: Color = Color::DarkGray;
+pub const ACCENT: Color = Color::Cyan;
+pub const PROJECT: Color = Color::Magenta;
+pub const ERROR: Color = Color::Red;
+pub const WARNING: Color = Color::Yellow;
+pub const SUCCESS: Color = Color::Green;
+pub const MUTED: Color = Color::DarkGray;
 
-/// At most seven keys (UX principle 5); arrows move, as everywhere.
+/// Dialogs are this wide, or as wide as the popup when it is narrower.
+pub const DIALOG: u16 = 64;
+/// The forms and their dialogs.
+pub const WIDE: u16 = 84;
+
+/// At most seven keys (UX principle 5); arrows move, as everywhere; the
+/// rest are in the help (`?`).
 const KEYS: [(&str, &str); 7] = [
     ("enter", "open"),
     ("tab", "view"),
-    ("alt+1…9", "row"),
+    ("^n", "new"),
+    ("^e", "edit"),
     ("^z", "snooze"),
-    ("^u", "wake"),
-    ("^a", "archive"),
-    ("esc", "close"),
+    ("^p", "projects"),
+    ("?", "all keys"),
 ];
 
-fn muted(text: impl Into<String>) -> Span<'static> {
+/// How a line of a screen is drawn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tone {
+    Muted,
+    Error,
+    Warning,
+}
+
+impl Tone {
+    pub fn span(self, text: impl Into<String>) -> Span<'static> {
+        match self {
+            Tone::Muted => muted(text),
+            Tone::Error => colored(text, ERROR),
+            Tone::Warning => colored(text, WARNING),
+        }
+    }
+}
+
+pub fn muted(text: impl Into<String>) -> Span<'static> {
     Span::styled(text.into(), Style::new().fg(MUTED))
 }
 
-fn colored(text: impl Into<String>, color: Color) -> Span<'static> {
+pub fn colored(text: impl Into<String>, color: Color) -> Span<'static> {
     Span::styled(text.into(), Style::new().fg(color))
 }
 
-fn key_hints(keys: &[(&str, &str)]) -> Line<'static> {
+pub fn bold(text: impl Into<String>) -> Span<'static> {
+    Span::styled(text.into(), Style::new().bold())
+}
+
+pub fn key_hints(keys: &[(&str, &str)]) -> Line<'static> {
     let mut spans = vec![];
     for (key, what) in keys {
         spans.push(Span::styled(key.to_string(), Style::new().fg(ACCENT).bold()));
@@ -70,11 +100,17 @@ fn wrapped_key_hints(keys: &[(&str, &str)], width: u16) -> Vec<Line<'static>> {
 }
 
 /// At most `max` characters, with "…" when cut.
-fn cut(text: &str, max: usize) -> String {
+pub fn cut(text: &str, max: usize) -> String {
     if text.chars().count() <= max { text.into() } else { text.chars().take(max - 1).chain(['…']).collect() }
 }
 
 pub fn draw(frame: &mut Frame, app: &mut App, now: i64) {
+    if app.alone {
+        for screen in &app.screens {
+            draw_screen(frame, screen, frame.area(), &app.tz, now, &app.paths);
+        }
+        return;
+    }
     let area = frame.area().inner(Margin { horizontal: 1, vertical: 0 });
     let hints = wrapped_key_hints(&KEYS, area.width);
     let [top, _, search, _, body, message, keys] = Layout::vertical([
@@ -98,13 +134,8 @@ pub fn draw(frame: &mut Frame, app: &mut App, now: i64) {
     }
     frame.render_widget(Paragraph::new(hints), keys);
     for screen in &app.screens {
-        draw_screen(frame, screen, area, &app.tz, now);
+        draw_screen(frame, screen, frame.area(), &app.tz, now, &app.paths);
     }
-}
-
-/// A screen with nothing behind it (`itm snooze` without a time).
-pub fn draw_alone(frame: &mut Frame, screen: &Screen, tz: &TimeZone, now: i64) {
-    draw_screen(frame, screen, frame.area(), tz, now);
 }
 
 /// Views are always shown with their counts (R6.1), and the inbox says
@@ -141,8 +172,11 @@ fn draw_views(frame: &mut Frame, app: &App, area: Rect) {
 /// Creating is discoverable from the search box (UX principle 6).
 fn draw_search(frame: &mut Frame, app: &App, area: Rect) {
     let typed = app.search.value();
-    let text =
-        if typed.is_empty() { muted("Search tasks · or type a new title") } else { Span::raw(typed.to_string()) };
+    let text = if typed.is_empty() {
+        muted("Search tasks · @project filters · or type a new title")
+    } else {
+        Span::raw(typed.to_string())
+    };
     frame.render_widget(Paragraph::new(Line::from(vec![colored("› ", ACCENT), text])), area);
     if app.screens.is_empty() {
         frame.set_cursor_position((area.x + 2 + app.search.visual_cursor() as u16, area.y));
@@ -166,10 +200,18 @@ fn draw_list(frame: &mut Frame, app: &mut App, area: Rect, now: i64) {
                 let color = if *header == "NEEDS YOU" { ERROR } else { MUTED };
                 ListItem::new(Span::styled(*header, Style::new().fg(color).bold()))
             }
-            (Row::Create, _) => ListItem::new(Line::from(vec![
-                colored("+ ", ACCENT),
-                Span::raw(format!("Create task “{}”", app.search.value().trim())),
-            ])),
+            (Row::UnknownProject(name), _) => ListItem::new(colored(format!("No project named “{name}”"), WARNING)),
+            (Row::Create, _) => {
+                let mut line = vec![
+                    colored("+ ", ACCENT),
+                    Span::raw(format!("Create task “{}”", Query::parse(app.search.value()).text)),
+                ];
+                // R6.2: in the filter's project (or the current task's first).
+                if let Some(project) = app.default_projects().first().and_then(|id| snap.data.projects.get(id)) {
+                    line.extend([Span::raw(" in "), colored(format!("◆ {}", project.name), PROJECT)]);
+                }
+                ListItem::new(Line::from(line))
+            }
             (Row::Task(_), None) => unreachable!("every task row has a status"),
         })
         .collect();
@@ -277,12 +319,17 @@ fn draw_preview(frame: &mut Frame, app: &App, area: Rect, now: i64) {
     let block = Block::new().borders(Borders::LEFT).border_style(Style::new().fg(MUTED));
     let inner = block.inner(area).inner(Margin { horizontal: 2, vertical: 0 });
     frame.render_widget(block, area);
-    let [text, keys] = Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(inner);
     let (lines, enter) = preview(app, now);
+    // Pinned: a long preview never hides the keys, and they are never cut.
+    let hints: &[(&str, &str)] = match enter {
+        Some("create") => &[("enter", "create")],
+        Some(enter) => &[("enter", enter), ("ctrl+o", "notes")],
+        None => &[],
+    };
+    let hints = if hints.is_empty() { vec![] } else { wrapped_key_hints(hints, inner.width) };
+    let [text, keys] = Layout::vertical([Constraint::Fill(1), Constraint::Length(hints.len() as u16)]).areas(inner);
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), text);
-    if let Some(enter) = enter {
-        frame.render_widget(Paragraph::new(key_hints(&[("enter", enter)])), keys);
-    }
+    frame.render_widget(Paragraph::new(hints), keys);
 }
 
 fn preview(app: &App, now: i64) -> (Vec<Line<'static>>, Option<&'static str>) {
@@ -290,14 +337,14 @@ fn preview(app: &App, now: i64) -> (Vec<Line<'static>>, Option<&'static str>) {
     let (name, task) = match app.highlighted() {
         Some(Row::Task(name)) => (name, &snap.data.tasks[name]),
         Some(Row::Create) => {
-            let title = app.search.value().trim();
+            let title = Query::parse(app.search.value()).text;
             return (
                 vec![Line::from(muted(format!("No task matches. Press enter to create “{title}”.")))],
                 Some("create"),
             );
         }
         _ if snap.data.tasks.is_empty() => {
-            return (vec![Line::from(muted("No tasks yet. Type a title and press enter."))], None);
+            return (vec![Line::from(muted("No tasks yet. Type a title and press enter, or ctrl+n."))], None);
         }
         _ => return (vec![], None),
     };
@@ -409,14 +456,15 @@ fn not_started(app: &App, snap: &Snapshot, task: &Task) -> String {
     format!("Not started yet · starts in {}{more}", app.paths.display(&folder))
 }
 
-/// A box of `height` rows in the middle of `area`, at most 64 columns wide;
-/// returns the area inside its border.
-fn dialog_box(frame: &mut Frame, area: Rect, height: u16) -> Rect {
+/// A box of `height` rows in the middle of `area`, at most `width` columns
+/// wide (Herdr's popup border is the only outer border, so a dialog alone
+/// fills the popup when it is smaller); returns the area inside its border.
+pub fn dialog_box(frame: &mut Frame, area: Rect, width: u16, height: u16) -> Rect {
     let [_, row, _] =
         Layout::vertical([Constraint::Fill(1), Constraint::Length(height.min(area.height)), Constraint::Fill(1)])
             .areas(area);
     let [_, rect, _] =
-        Layout::horizontal([Constraint::Fill(1), Constraint::Length(area.width.min(64)), Constraint::Fill(1)])
+        Layout::horizontal([Constraint::Fill(1), Constraint::Length(area.width.min(width)), Constraint::Fill(1)])
             .areas(row);
     let block = Block::bordered().border_type(BorderType::Rounded).border_style(Style::new().fg(ACCENT));
     frame.render_widget(Clear, rect);
@@ -425,24 +473,105 @@ fn dialog_box(frame: &mut Frame, area: Rect, height: u16) -> Rect {
     inside
 }
 
-fn draw_screen(frame: &mut Frame, screen: &Screen, area: Rect, tz: &TimeZone, now: i64) {
+fn draw_screen(frame: &mut Frame, screen: &Screen, area: Rect, tz: &TimeZone, now: i64, paths: &Paths) {
     match screen {
         Screen::ConfirmArchive { title, .. } => draw_archive(frame, title, area),
         Screen::ConfirmDelete { title, .. } => draw_delete(frame, title, area),
+        Screen::ConfirmDiscard => draw_discard(frame, area),
         Screen::Snooze(snooze) => draw_snooze(frame, snooze, area, tz, now),
         Screen::RemoveProject(dialog) => draw_remove(frame, dialog, area),
         Screen::ConfirmFolder { project, folder } => draw_confirm_folder(frame, project, folder, area),
-        Screen::AddProject(dialog) => draw_add(frame, dialog, area),
+        Screen::AddProject(dialog) => dialog.draw(frame, area, paths),
         Screen::Settings(screen) => draw_settings(frame, screen, area),
+        Screen::Form(form) => form.draw(frame, area, paths, now, tz),
+        Screen::Finder(finder) => finder.draw(frame, area),
+        Screen::Projects(screen) => screen.draw(frame, area, paths, now),
+        Screen::Rename(dialog) => dialog.draw(frame, area),
+        Screen::Help(help) => help.draw(frame, area),
     }
 }
 
-/// Lines in a dialog box as tall as they wrap to (64 columns, less border and margin).
-fn wrapped_dialog(frame: &mut Frame, area: Rect, lines: Vec<Line<'static>>) -> Rect {
-    let rows: usize = lines.iter().map(|line| line.width().max(1).div_ceil(60)).sum();
-    let inside = dialog_box(frame, area, rows as u16 + 2);
+/// Lines in a dialog box as tall as they wrap to.
+pub fn wrapped_dialog(frame: &mut Frame, area: Rect, width: u16, lines: Vec<Line<'static>>) -> Rect {
+    let inner = (area.width.min(width).saturating_sub(4)).max(1) as usize; // less border and margin
+    let rows: usize = lines.iter().map(|line| wrapped_rows(line, inner)).sum();
+    let inside = dialog_box(frame, area, width, rows as u16 + 2);
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inside);
     inside
+}
+
+/// How many rows `line` takes wrapped at words in `width` columns, as a
+/// paragraph wraps it (a word wider than a row takes several).
+pub fn wrapped_rows(line: &Line, width: usize) -> usize {
+    let width = width.max(1);
+    let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+    let (mut rows, mut used) = (1, 0);
+    for word in text.split(' ') {
+        let len = word.chars().count();
+        match used {
+            0 if len <= width => used = len,
+            _ if used > 0 && used + 1 + len <= width => used += 1 + len,
+            _ => {
+                rows += usize::from(used > 0) + len.saturating_sub(1) / width;
+                used = len - len.saturating_sub(1) / width * width;
+            }
+        }
+    }
+    rows
+}
+
+/// A project's name as a badge in `width` cells (`◆ name`, cut with "…"),
+/// the letters a search matched underlined (R1.6).
+pub fn name_badge(name: &str, width: usize, matched: &[usize]) -> Vec<Span<'static>> {
+    let chars: Vec<char> = name.chars().collect();
+    let room = width.saturating_sub(4).max(1);
+    let cut = chars.len() > width.saturating_sub(3);
+    let shown: Vec<char> = if cut { chars[..room.min(chars.len())].to_vec() } else { chars };
+    let mut spans = vec![colored("◆ ", PROJECT)];
+    let style = Style::new().fg(PROJECT);
+    for (i, c) in shown.iter().enumerate() {
+        let style =
+            if matched.contains(&i) { style.add_modifier(Modifier::BOLD | Modifier::UNDERLINED) } else { style };
+        spans.push(Span::styled(c.to_string(), style));
+    }
+    if cut {
+        spans.push(colored("…", PROJECT));
+    }
+    let used: usize = spans.iter().map(Span::width).sum();
+    spans.push(Span::raw(" ".repeat(width.saturating_sub(used).max(1))));
+    spans
+}
+
+/// A project on one line: its badge, its kind and where it is.
+pub fn project_line(project: &Project, matched: &[usize], missing: bool, paths: &Paths) -> Vec<Span<'static>> {
+    let mut spans = name_badge(&project.name, 14, matched);
+    let gone = if missing { " (folder missing)" } else { "" };
+    spans.push(muted(format!("{:<4} {}{gone}", project.kind().name(), paths.place(project))));
+    spans
+}
+
+/// A one-line text field: its label, then what was typed (or the
+/// placeholder), and ghost text after it. Returns the column the cursor goes in.
+pub fn field_line<'a>(
+    label: &str,
+    width: usize,
+    input: &tui_input::Input,
+    placeholder: &str,
+    ghost: Option<&str>,
+    focused: bool,
+) -> Line<'a> {
+    let style = if focused { Style::new().fg(ACCENT).bold() } else { Style::new().fg(MUTED) };
+    let mut spans = vec![Span::styled(format!("{label:<width$}"), style)];
+    match input.value() {
+        "" => spans.push(muted(placeholder.to_string())),
+        value => {
+            spans.push(Span::raw(value.to_string()));
+            if let Some(rest) = ghost.and_then(|g| g.strip_prefix(value)) {
+                spans.push(muted(rest.to_string()));
+            }
+        }
+    }
+    Line::from(spans)
 }
 
 /// Giving a folder changes which workspaces count as the project in every
@@ -457,46 +586,7 @@ fn draw_confirm_folder(frame: &mut Frame, project: &str, folder: &str, area: Rec
         Line::default(),
         key_hints(&[("y", "give it"), ("n", "keep it without a folder"), ("esc", "cancel")]),
     ];
-    wrapped_dialog(frame, area, lines);
-}
-
-/// The add dialog: the source and the name, the focused one marked, and
-/// what saving does or why it did not (R10.5, R8.5).
-fn draw_add(frame: &mut Frame, dialog: &AddDialog, area: Rect) {
-    let kind = match dialog.kind {
-        ProjectKind::Git => "Git repository",
-        ProjectKind::Dir => "Local folder",
-        ProjectKind::Name => "Name only",
-    };
-    let field = |label: &str, input: &tui_input::Input, which: Field, hint: &str| {
-        let style = if dialog.focus == which { Style::new().fg(ACCENT).bold() } else { Style::new().fg(MUTED) };
-        let value = match input.value() {
-            "" => muted(hint.to_string()),
-            value => Span::raw(value.to_string()),
-        };
-        Line::from(vec![Span::styled(format!("{label:<8}"), style), value])
-    };
-    let status = match &dialog.error {
-        Some(e) => colored(e.clone(), ERROR),
-        None => muted("Saves the folder; nothing is copied."),
-    };
-    let lines = vec![
-        Line::from(vec![Span::styled("Add project", Style::new().bold()), muted(format!("  {kind}"))]),
-        Line::default(),
-        field("Source", &dialog.source, Field::Source, "~/code/project"),
-        field("Name", &dialog.name, Field::Name, "defaults to the folder name"),
-        Line::default(),
-        Line::from(status),
-        Line::default(),
-        key_hints(&[("enter", "add"), ("tab", "next field"), ("esc", "cancel")]),
-    ];
-    let inside = wrapped_dialog(frame, area, lines);
-    let (row, input) = match dialog.focus {
-        Field::Source => (2, &dialog.source),
-        Field::Name => (3, &dialog.name),
-    };
-    let x = (inside.x + 8 + input.visual_cursor() as u16).min(inside.right().saturating_sub(1));
-    frame.set_cursor_position((x, inside.y + row));
+    wrapped_dialog(frame, area, DIALOG, lines);
 }
 
 /// The settings, each with what it does; a file with a mistake is shown
@@ -532,7 +622,22 @@ fn draw_settings(frame: &mut Frame, screen: &SettingsScreen, area: Rect) {
     }));
     lines.push(Line::default());
     lines.push(key_hints(&[("enter / space", "toggle"), ("esc", "close")]));
-    wrapped_dialog(frame, area, lines);
+    wrapped_dialog(frame, area, WIDE, lines);
+}
+
+/// Esc in a form with something typed in it (R1.1).
+fn draw_discard(frame: &mut Frame, area: Rect) {
+    let lines = vec![
+        Line::from(bold("Discard what you typed?")),
+        Line::default(),
+        Line::from(vec![
+            Span::styled("y", Style::new().fg(ERROR).bold()),
+            muted(" discard   "),
+            Span::styled("n", Style::new().fg(ACCENT).bold()),
+            muted(" keep editing"),
+        ]),
+    ];
+    wrapped_dialog(frame, area, DIALOG, lines);
 }
 
 /// Deleting cannot be undone, and the question says what goes (UX principle 10).
@@ -551,8 +656,7 @@ fn draw_delete(frame: &mut Frame, title: &str, area: Rect) {
             muted(" keep"),
         ]),
     ];
-    let inside = dialog_box(frame, area, 9);
-    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inside);
+    wrapped_dialog(frame, area, DIALOG, lines);
 }
 
 /// What removing a project does to its clone (R8.7): only a clean clone of
@@ -612,10 +716,7 @@ fn draw_remove(frame: &mut Frame, dialog: &RemoveDialog, area: Rect) {
         false => &[("enter", "remove"), ("esc", "cancel, nothing changes")],
     };
     lines.push(key_hints(keys));
-    // Each line on as many rows as it wraps to inside the box (64 columns, less border and margin).
-    let rows: usize = lines.iter().map(|line| line.width().max(1).div_ceil(60)).sum();
-    let inside = dialog_box(frame, area, rows as u16 + 2);
-    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inside);
+    wrapped_dialog(frame, area, WIDE, lines);
 }
 
 /// Destructive actions confirm and say what will be lost (UX principle 10).
@@ -634,13 +735,12 @@ fn draw_archive(frame: &mut Frame, title: &str, area: Rect) {
             muted(" keep"),
         ]),
     ];
-    let inside = dialog_box(frame, area, 9);
-    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inside);
+    wrapped_dialog(frame, area, DIALOG, lines);
 }
 
 /// Presets before free text, sorted by time; free text keeps working (UX principle 9).
 fn draw_snooze(frame: &mut Frame, dialog: &SnoozeDialog, area: Rect, tz: &TimeZone, now: i64) {
-    let inside = dialog_box(frame, area, dialog.presets.len() as u16 + 9);
+    let inside = dialog_box(frame, area, DIALOG, dialog.presets.len() as u16 + 9);
     let [title, _, typed, _, presets, _, error, keys] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(1),
@@ -747,11 +847,13 @@ mod tests {
     /// R10.5: the add dialog, filled with the workspace's folder and name.
     #[test]
     fn the_add_dialog() {
-        use crate::tui::screen::AddDialog;
+        use crate::tui::add::AddDialog;
         let mut app = app(snapshot());
         let mut dialog = AddDialog::folder("~/code/new-thing", "My Thing");
-        dialog.error = Some("project already exists: My Thing (no folder); choose another name".into());
-        app.screens.push(Screen::AddProject(dialog));
+        dialog.said = Some(crate::tui::add::Said::Failed(
+            "project already exists: My Thing (no folder); choose another name".into(),
+        ));
+        app.screens.push(Screen::AddProject(Box::new(dialog)));
         insta::assert_snapshot!(screen(&mut app));
     }
 

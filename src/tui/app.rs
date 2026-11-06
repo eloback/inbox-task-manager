@@ -2,28 +2,37 @@
 //! here: keys come in, [`Action`]s go out, and the event loop
 //! (`tui/mod.rs`) does the I/O and says what time it is. Only the screen on
 //! top of the stack gets keys, so list keys can never act on the task
-//! behind a dialog.
+//! behind a dialog. The same state runs a dialog alone (the CLI's): then
+//! there is no list, and the loop ends when the last screen closes.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::PathBuf;
+use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 
 use clap::ValueEnum;
 use jiff::tz::TimeZone;
 use ratatui::crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 use ratatui::widgets::ListState;
+use regex_lite::Regex;
 use tui_input::Input;
 use tui_input::backend::crossterm::EventHandler;
 
-use super::screen::{Context, Outcome, Screen, SettingsScreen, SnoozeDialog};
+use super::finder::Saved;
+use super::form::{Editing, Effect, TaskForm};
+use super::help::Help;
+use super::projects::ProjectsScreen;
+use super::screen::{Context, Need, Outcome, Screen, SettingsScreen, SnoozeDialog};
 use crate::config::{Setting, Settings};
 use crate::error::Error;
+use crate::folders::Listing;
 use crate::herdr::Sessions;
 use crate::itm::Itm;
 use crate::paths::Paths;
-use crate::projects::CloneChoice;
+use crate::projects::{Check, CloneChoice, RemovalNote, RemovalPlan, resolve_project};
 use crate::snooze::{self, Until};
 use crate::status::Status;
-use crate::store::{Data, ProjectKind, State, Task};
+use crate::store::{Data, Project, ProjectKind, State, Task};
 use crate::tasks::inbox_order;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -71,6 +80,9 @@ pub struct Snapshot {
     /// Ids of the projects whose folder is set and not there. A project
     /// without a folder is never missing (DESIGN.md section 2, Projects).
     pub missing: BTreeSet<String>,
+    /// Each saved folder, its links resolved, and its project: the finder
+    /// knows a saved folder reached through a link (R1.6).
+    pub folders: BTreeMap<PathBuf, String>,
     /// The end of each task's notes (R9.5), by session.
     pub notes: BTreeMap<String, NotesTail>,
     /// The settings (R10.4), or why `config.toml` could not be read.
@@ -87,9 +99,17 @@ impl Default for Snapshot {
             switch_problem: None,
             listed: false,
             missing: BTreeSet::new(),
+            folders: BTreeMap::new(),
             notes: BTreeMap::new(),
             settings: Ok(Settings::default()),
         }
+    }
+}
+
+impl Snapshot {
+    /// The saved projects as the form and its finder show them.
+    pub fn saved(&self) -> Saved {
+        Saved { projects: self.data.projects.clone(), missing: self.missing.clone(), folders: self.folders.clone() }
     }
 }
 
@@ -104,8 +124,41 @@ pub struct NotesTail {
 pub enum Row {
     Header(&'static str),
     Task(String),
+    /// An `@name` filter that names no project (R6.2).
+    UnknownProject(String),
     /// "Create task" when nothing matches the search.
     Create,
+}
+
+impl Row {
+    fn selectable(&self) -> bool {
+        matches!(self, Row::Task(_) | Row::Create)
+    }
+}
+
+/// A search as typed (R6.2): `@name` or `@"a name"` shows one project's
+/// tasks; the rest searches titles.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Query {
+    pub projects: Vec<String>,
+    pub text: String,
+}
+
+impl Query {
+    pub fn parse(typed: &str) -> Query {
+        static FILTER: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"@"([^"]*)"?|@(\S+)"#).unwrap());
+        let projects = (FILTER.captures_iter(typed))
+            .filter_map(|c| c.get(1).or(c.get(2)).map(|m| m.as_str().to_string()))
+            .filter(|token| !token.trim().is_empty())
+            .collect();
+        let text = FILTER.replace_all(typed, " ").split_whitespace().collect::<Vec<_>>().join(" ");
+        Query { projects, text }
+    }
+}
+
+/// The search token that shows a project's tasks (the Projects screen's Enter).
+pub fn filter_token(name: &str) -> String {
+    if name.contains(' ') { format!("@\"{name}\"") } else { format!("@{name}") }
 }
 
 /// When the switcher acts: an instant for its timers, and the epoch second
@@ -122,7 +175,8 @@ impl Moment {
     }
 }
 
-/// Blocking work for a worker thread (Herdr calls, the store lock, hand-offs).
+/// Blocking work for a worker thread (Herdr calls, the store lock, git,
+/// hand-offs).
 #[derive(Debug, Clone, PartialEq)]
 pub enum Job {
     Wake {
@@ -137,23 +191,59 @@ pub enum Job {
         session: String,
         title: String,
     },
+    /// A new task (R1.1); done, it is [`Reply::Created`].
     Create {
         title: String,
+        description: Option<String>,
+        /// Project ids, the first where the session starts.
+        projects: Vec<String>,
+        until: Option<Until>,
+    },
+    /// The edit form saved (R5.4); done, it says what happened besides.
+    Edit {
+        session: String,
+        title: String,
+        /// Empty clears it.
+        description: String,
+        add: Vec<String>,
+        remove: Vec<String>,
+        /// The projects in the form's order, when it changed them.
+        order: Vec<String>,
     },
     Snooze {
         session: String,
         title: String,
         until: Until,
     },
+    /// What removing a project would do (it reads its clone with git), for the remove dialog.
+    RemovalPlan {
+        id: String,
+    },
     RemoveProject {
         id: String,
         name: String,
         choice: CloneChoice,
     },
-    /// Save a project; done, it is the project's id.
+    RenameProject {
+        id: String,
+        name: String,
+    },
+    /// Save a folder or a name; done, it is [`Reply::Added`].
     AddProject {
         kind: ProjectKind,
         source: String,
+        name: Option<String>,
+    },
+    /// What adding a project would do, as typed so far (R8.5): nothing is saved.
+    CheckProject {
+        kind: ProjectKind,
+        source: String,
+        name: Option<String>,
+    },
+    /// Clone a repository in a child `itm project add git` (R8.8); what git
+    /// says on the way comes as [`super::Input::Cloning`].
+    Clone {
+        url: String,
         name: Option<String>,
     },
     /// Change a setting in `config.toml` (R10.4).
@@ -161,6 +251,30 @@ pub enum Job {
         setting: Setting,
         on: bool,
     },
+}
+
+impl Job {
+    /// Whether the switcher's list may show something else once it is done (a refresh follows).
+    pub fn changes_tasks(&self) -> bool {
+        !matches!(self, Job::CheckProject { .. } | Job::RemovalPlan { .. })
+    }
+}
+
+/// What a job that worked gives back.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Reply {
+    Done,
+    /// A task was saved: its session.
+    Created(String),
+    /// What happened besides, a line each (an edit's notes).
+    Said(Vec<String>),
+    /// A project was saved: its id, and the project as saved.
+    Added(String, Project),
+    Checked(Check),
+    Plan(RemovalPlan),
+    Removed(Vec<RemovalNote>),
+    /// (old name, new name, a note).
+    Renamed(String, String, Option<String>),
 }
 
 #[derive(Debug, PartialEq)]
@@ -172,10 +286,16 @@ pub enum Action {
     Run(Job),
     /// Open this task's notes in the editor, which gets the terminal meanwhile (R9.4).
     Notes(String),
-    /// A question asked alone was answered yes or no.
+    /// A question was answered yes or no.
     Answer(bool),
-    /// A project was saved (its id); what opened the add dialog takes it.
-    ProjectAdded(String),
+    /// A project was saved: its id, and the project. What opened the add dialog takes it.
+    ProjectAdded(String, Project),
+    /// The finder's choice: the task's projects now (ids), and a project saved on the way.
+    Picked(Vec<String>, Option<(String, Project)>),
+    /// Show this project's tasks (`@name` in the search, R6.2).
+    Filter(String),
+    /// Esc during a clone: stop it (SIGTERM), which keeps nothing of it.
+    StopClone,
 }
 
 pub struct Message {
@@ -198,6 +318,8 @@ pub struct App {
     pub tz: TimeZone,
     /// The time the event loop last said it is.
     pub now: Moment,
+    /// A dialog alone (the CLI's): no list behind it; done once its last screen closes.
+    pub alone: bool,
 }
 
 impl App {
@@ -213,7 +335,13 @@ impl App {
             paths,
             tz,
             now,
+            alone: false,
         }
+    }
+
+    /// `screen` with nothing behind it.
+    pub fn alone(screen: Screen, paths: Paths, tz: TimeZone, now: Moment) -> App {
+        App { screens: vec![screen], alone: true, ..App::new(View::Inbox, paths, tz, now) }
     }
 
     pub fn task(&self, session: &str) -> Option<&Task> {
@@ -249,9 +377,7 @@ impl App {
         match snapshot {
             Ok(snapshot) => {
                 for screen in &mut self.screens {
-                    if let Screen::Settings(settings) = screen {
-                        settings.reread(&snapshot.settings);
-                    }
+                    screen.reread(&snapshot);
                 }
                 self.snapshot = Some(snapshot);
                 self.rebuild();
@@ -264,19 +390,45 @@ impl App {
     fn rebuild(&mut self) {
         let keep = self.highlighted().cloned();
         self.rows = self.visible_rows();
-        let selectable = |row: &Row| !matches!(row, Row::Header(_));
-        let at = keep.and_then(|k| self.rows.iter().position(|r| *r == k && selectable(r)));
-        self.list.select(at.or_else(|| self.rows.iter().position(selectable)));
+        let at = keep.and_then(|k| self.rows.iter().position(|r| *r == k && r.selectable()));
+        self.list.select(at.or_else(|| self.rows.iter().position(Row::selectable)));
+    }
+
+    /// The project an `@name` filter names (Ok), or the name when it names none (Err).
+    pub fn filter_project(&self, query: &Query) -> Option<Result<String, String>> {
+        let token = query.projects.first()?;
+        let data = &self.snapshot.as_ref()?.data;
+        Some(resolve_project(data, token).map_err(|_| token.clone()))
+    }
+
+    /// A new task's projects: the `@name` filter's, else the first of the
+    /// task this switcher runs in (R1.6).
+    pub fn default_projects(&self) -> Vec<String> {
+        match self.filter_project(&Query::parse(self.search.value())) {
+            Some(Ok(id)) => vec![id],
+            Some(Err(_)) => vec![],
+            None => (self.snapshot.as_ref())
+                .and_then(|s| s.data.tasks.get(s.current.as_deref()?))
+                .map_or(vec![], |task| task.projects.iter().take(1).cloned().collect()),
+        }
     }
 
     fn visible_rows(&self) -> Vec<Row> {
         let Some(snap) = &self.snapshot else { return vec![] };
-        let query = self.search.value().trim().to_lowercase();
+        let query = Query::parse(self.search.value());
+        let filter = self.filter_project(&query);
+        let text = query.text.to_lowercase();
+        let in_project = |task: &Task| match &filter {
+            None => true,
+            Some(Ok(id)) => task.projects.contains(id),
+            Some(Err(_)) => false, // a project that does not exist has no tasks
+        };
         let mut tasks: Vec<(&String, &Task)> = (snap.data.tasks.iter())
-            .filter(|(_, task)| self.view.shows(task) && task.title.to_lowercase().contains(&query))
+            .filter(|(_, task)| self.view.shows(task) && task.title.to_lowercase().contains(&text) && in_project(task))
             .collect();
         tasks.sort_by_key(|(name, task)| inbox_order(&snap.status, name, task));
         let mut rows = vec![];
+        let none = tasks.is_empty();
         if self.view == View::Inbox {
             // Inbox first: the tasks waiting for you, with what they wait for (R2.3).
             let (needs, rest): (Vec<_>, Vec<_>) =
@@ -290,25 +442,25 @@ impl App {
         } else {
             rows.extend(tasks.into_iter().map(|(name, _)| Row::Task(name.clone())));
         }
-        if rows.is_empty() && !query.is_empty() {
+        if let Some(Err(unknown)) = filter {
+            rows.push(Row::UnknownProject(unknown));
+        }
+        if none && !query.text.is_empty() {
             rows.push(Row::Create);
         }
         rows
     }
 
+    /// What the screens' keys see besides their own state.
+    fn context(&self) -> Context<'_> {
+        Context { tz: &self.tz, now: self.now, paths: &self.paths }
+    }
+
     pub fn on_key(&mut self, key: KeyEvent) -> Action {
-        if let Some(top) = self.screens.last_mut() {
-            let cx = Context { tz: &self.tz, now: self.now.epoch };
-            match top.on_key(key, &cx) {
-                Outcome::Stay => {}
-                Outcome::Close => drop(self.screens.pop()),
-                Outcome::CloseAnd(action) => {
-                    self.screens.pop();
-                    return action;
-                }
-                Outcome::Act(action) => return action,
-            }
-            return Action::None;
+        if let Some(mut top) = self.screens.pop() {
+            let outcome = top.on_key(key, &self.context());
+            self.screens.push(top);
+            return self.apply(outcome);
         }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
@@ -323,14 +475,20 @@ impl App {
             KeyCode::Char('k') if ctrl => self.move_by(-1),
             KeyCode::Char('j') if ctrl => self.move_by(1),
             KeyCode::Char(digit @ '1'..='9') if alt => return self.open_row(digit as usize - '0' as usize),
+            KeyCode::Char('n') if ctrl => self.new_task(),
+            KeyCode::Char('e') if ctrl => self.edit_task(),
             KeyCode::Char('z') if ctrl => self.snooze(),
             KeyCode::Char('u') if ctrl => return self.wake(),
             KeyCode::Char('a') if ctrl => return self.archive(),
             KeyCode::Char('d') if ctrl => self.delete(),
+            KeyCode::Char('p') if ctrl => self.open_projects(),
             KeyCode::Char('s') if ctrl => self.open_settings(),
             KeyCode::Char('o') if ctrl => {
                 return self.highlighted_task().map_or(Action::None, |(s, _)| Action::Notes(s));
             }
+            KeyCode::F(1) => self.screens.push(Screen::Help(Help::default())),
+            // "?" is help only while the search is empty; otherwise it is typed.
+            KeyCode::Char('?') if self.search.value().is_empty() => self.screens.push(Screen::Help(Help::default())),
             _ if alt => {}
             _ => {
                 if self.search.handle_event(&Event::Key(key)).is_some_and(|change| change.value) {
@@ -339,6 +497,85 @@ impl App {
             }
         }
         Action::None
+    }
+
+    /// Pasted text goes where typing goes, its whitespace (newlines too) one space each.
+    pub fn on_paste(&mut self, text: &str) -> Action {
+        let mut action = Action::None;
+        for (i, word) in text.split_whitespace().enumerate() {
+            for c in (i > 0).then_some(' ').into_iter().chain(word.chars()) {
+                action = self.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+                if action != Action::None {
+                    return action;
+                }
+            }
+        }
+        action
+    }
+
+    /// What a screen's outcome does to the stack; returns what the event loop does next.
+    fn apply(&mut self, outcome: Outcome) -> Action {
+        let mut outcome = outcome;
+        loop {
+            match outcome {
+                Outcome::Stay => return Action::None,
+                Outcome::Act(action) => return self.reached(action),
+                Outcome::Open(screen) => {
+                    self.screens.push(*screen);
+                    return Action::None;
+                }
+                Outcome::Close => {
+                    self.screens.pop();
+                    return Action::None;
+                }
+                Outcome::CloseAnd(action) => {
+                    self.screens.pop();
+                    match self.screens.last_mut() {
+                        Some(below) => outcome = below.returned(action),
+                        None => return self.reached(action),
+                    }
+                }
+            }
+        }
+    }
+
+    /// An action no screen took: the switcher's own, else for the event loop.
+    fn reached(&mut self, action: Action) -> Action {
+        match action {
+            Action::Filter(name) if !self.alone => {
+                self.search = Input::new(format!("{} ", filter_token(&name)));
+                self.rebuild();
+                Action::None
+            }
+            action => action,
+        }
+    }
+
+    /// What the screen on top needs read now (a folder listing, a check).
+    pub fn needs(&mut self) -> Option<Need> {
+        let now = self.now.instant;
+        self.screens.last_mut()?.needs(now)
+    }
+
+    /// When the screen on top will need something.
+    pub fn due(&self) -> Option<Instant> {
+        self.screens.last()?.due()
+    }
+
+    /// A folder listing arrived: every screen that asked for it keeps it.
+    pub fn listed(&mut self, parent: &str, listing: &Option<Listing>) {
+        for screen in &mut self.screens {
+            screen.listed(parent, listing);
+        }
+    }
+
+    /// What a clone child said last, for the add dialog that runs it.
+    pub fn cloning(&mut self, line: String) {
+        if let Some(Screen::AddProject(dialog)) =
+            self.screens.iter_mut().rev().find(|s| matches!(s, Screen::AddProject(_)))
+        {
+            dialog.cloning(line);
+        }
     }
 
     /// Tab / Shift+Tab: the next view; the search text stays (R6.1).
@@ -350,17 +587,22 @@ impl App {
 
     /// Up and down skip the section headers.
     fn move_by(&mut self, step: isize) {
-        let selectable: Vec<usize> =
-            (0..self.rows.len()).filter(|&i| !matches!(self.rows[i], Row::Header(_))).collect();
+        let selectable: Vec<usize> = (0..self.rows.len()).filter(|&i| self.rows[i].selectable()).collect();
         let Some(at) = self.list.selected().and_then(|s| selectable.iter().position(|&i| i == s)) else { return };
         let next = (at as isize + step).clamp(0, selectable.len() as isize - 1) as usize;
         self.list.select(Some(selectable[next]));
     }
 
-    /// Enter: open the task (the attach wakes or reopens it), or create one.
+    /// Enter: open the task (the attach wakes or reopens it), or create one
+    /// in the filter's project (or the current task's first).
     fn open(&mut self) -> Action {
         match self.highlighted() {
-            Some(Row::Create) => Action::Run(Job::Create { title: self.search.value().trim().to_string() }),
+            Some(Row::Create) => Action::Run(Job::Create {
+                title: Query::parse(self.search.value()).text,
+                description: None,
+                projects: self.default_projects(),
+                until: None,
+            }),
             Some(Row::Task(session)) => self.switch(session.clone()),
             _ => Action::None,
         }
@@ -382,6 +624,25 @@ impl App {
             }
             None => Action::Switch(session),
         }
+    }
+
+    /// Ctrl+N: the New task form (R1.1), with the search's title and the
+    /// filter's project (or the current task's first).
+    fn new_task(&mut self) {
+        let Some(snap) = &self.snapshot else { return };
+        let title = Query::parse(self.search.value()).text;
+        let presets = snooze::presets(self.now.epoch, &self.tz, false); // a new task has no agents yet
+        let form = TaskForm::new_task(&title, self.default_projects(), snap.saved(), presets, &self.paths)
+            .cannot_switch(snap.switch_problem.clone());
+        self.screens.push(Screen::Form(Box::new(form)));
+    }
+
+    /// Ctrl+E: the edit form (R5.4), saying what a project added does to the session.
+    fn edit_task(&mut self) {
+        let (Some(snap), Some((session, task))) = (&self.snapshot, self.highlighted_task()) else { return };
+        let editing = Editing::new(session, task, snap);
+        let form = TaskForm::edit(task, snap.saved(), editing);
+        self.screens.push(Screen::Form(Box::new(form)));
     }
 
     /// Ctrl+Z: "Until an agent needs me" is offered only when an agent could ever wake the task.
@@ -423,6 +684,13 @@ impl App {
         }
     }
 
+    /// Ctrl+P: the saved projects (R8.3).
+    fn open_projects(&mut self) {
+        if let Some(snap) = &self.snapshot {
+            self.screens.push(Screen::Projects(ProjectsScreen::new(snap)));
+        }
+    }
+
     /// Ctrl+S: the settings (R10.4), as the last refresh read them.
     fn open_settings(&mut self) {
         let settings = self.snapshot.as_ref().map_or(Ok(Settings::default()), |s| s.settings.clone());
@@ -430,49 +698,59 @@ impl App {
         self.screens.push(Screen::Settings(SettingsScreen::new(settings, file)));
     }
 
-    /// A job finished in its worker.
-    pub fn done(&mut self, job: Job, result: Result<String, Error>) -> Action {
+    /// A job finished in its worker. The screen that asked for it gets the
+    /// result; when the user went on to another screen meanwhile, that one
+    /// stays where it is.
+    pub fn done(&mut self, job: Job, result: Result<Reply, Error>) -> Action {
+        if let Some(at) = self.screens.iter().rposition(|s| s.takes(&job)) {
+            let mut screen = self.screens.remove(at);
+            let outcome = screen.done(&job, result, &self.context());
+            self.screens.insert(at, screen);
+            return match outcome {
+                outcome if at + 1 == self.screens.len() => self.apply(outcome),
+                Outcome::Act(action) => self.reached(action),
+                _ => Action::None,
+            };
+        }
         let current = self.snapshot.as_ref().and_then(|s| s.current.clone());
         let problem = self.snapshot.as_ref().and_then(|s| s.switch_problem.clone());
+        // Its clients moved to another task: this one's too, so leave (R4.7).
+        let here = |session: &str| current.as_deref() == Some(session);
         match (job, result) {
-            // The screen that asked for it says how it went.
-            (job @ (Job::AddProject { .. } | Job::Setting { .. }), result) => {
-                let Some(top) = self.screens.last_mut() else { return Action::None };
-                match top.done(&job, result) {
-                    Outcome::Stay | Outcome::Act(_) => {}
-                    Outcome::Close => drop(self.screens.pop()),
-                    Outcome::CloseAnd(action) => {
-                        self.screens.pop();
-                        return action;
-                    }
-                }
-            }
+            (
+                Job::CheckProject { .. } | Job::RemovalPlan { .. } | Job::AddProject { .. } | Job::Clone { .. },
+                Ok(_),
+            ) => {} // its screen closed meanwhile
             (_, Err(e)) => self.flash(e.to_string(), true),
             (Job::Wake { title, .. }, Ok(_)) => self.flash(format!("“{title}” is active."), false),
-            (Job::Archive { session, title }, Ok(_)) => {
-                // Its clients moved to another task: this one included, so leave.
-                if current.as_deref() == Some(&session) {
-                    return Action::Quit;
-                }
-                self.flash(format!("Archived “{title}”."), false);
+            (Job::Archive { session, .. } | Job::Delete { session, .. }, Ok(_)) if here(&session) => {
+                return Action::Quit;
             }
-            (Job::Delete { session, title }, Ok(_)) => {
-                if current.as_deref() == Some(&session) {
-                    return Action::Quit; // its clients moved to the next task, this one included
-                }
-                self.flash(format!("Deleted “{title}”."), false);
+            (Job::Archive { title, .. }, Ok(_)) => self.flash(format!("Archived “{title}”."), false),
+            (Job::Delete { title, .. }, Ok(_)) => self.flash(format!("Deleted “{title}”."), false),
+            (Job::Snooze { session, .. }, Ok(_)) if here(&session) => return Action::Quit,
+            (Job::Snooze { title, until, .. }, Ok(_)) => {
+                self.flash(format!("Snoozed “{title}” {}.", until.describe(self.now.epoch, &self.tz)), false)
             }
-            (Job::RemoveProject { .. }, Ok(said)) => {
-                let kept = said.contains("kept ");
-                self.flash(said, kept);
+            (Job::RemoveProject { .. }, Ok(Reply::Removed(notes))) => {
+                let kept = notes.iter().any(|n| matches!(n, RemovalNote::Kept(_)));
+                let lines: Vec<String> = notes.into_iter().map(RemovalNote::line).collect();
+                self.flash(lines.join("; "), kept);
             }
-            (Job::Snooze { session, title, until }, Ok(_)) => {
-                if current.as_deref() == Some(&session) {
-                    return Action::Quit; // its clients moved to the next task, this one included
-                }
-                self.flash(format!("Snoozed “{title}” {}.", until.describe(self.now.epoch, &self.tz)), false);
+            (Job::RenameProject { .. }, Ok(Reply::Renamed(old, new, note))) => {
+                self.flash(renamed(&old, &new, note), false)
             }
-            (Job::Create { title }, Ok(session)) => match problem {
+            (Job::Edit { .. }, Ok(Reply::Said(notes))) => {
+                // A workspace that could not be opened, or a folder missing, is worth reading.
+                let failed = notes.iter().any(|n| n.starts_with("could not") || n.contains(" is missing"));
+                self.flash(format!("Saved{}.", notes.iter().map(|n| format!("; {n}")).collect::<String>()), failed);
+            }
+            (Job::Create { title, until: Some(until), .. }, Ok(_)) => {
+                self.search.reset();
+                self.rebuild();
+                self.flash(format!("Saved “{title}”, snoozed {}.", until.describe(self.now.epoch, &self.tz)), false);
+            }
+            (Job::Create { title, .. }, Ok(Reply::Created(session))) => match problem {
                 None => return Action::Switch(session),
                 Some(problem) => {
                     self.search.reset();
@@ -480,8 +758,25 @@ impl App {
                     self.flash(format!("Saved “{title}” without switching: {problem}"), true);
                 }
             },
+            (_, Ok(_)) => {}
         }
         Action::None
+    }
+}
+
+/// What a rename says (R8.2), as the Python itm's Projects screen says it.
+pub fn renamed(old: &str, new: &str, note: Option<String>) -> String {
+    format!("Renamed {old} to {new}.{}", note.map(|n| format!(" {n}.")).unwrap_or_default())
+}
+
+impl Editing {
+    /// What the edit form shows of the session from the switcher's last
+    /// refresh: whether it runs, and which projects keep their workspace
+    /// (R5.4: while projects follow workspaces and the daemon runs).
+    pub fn new(session: String, task: &Task, snap: &Snapshot) -> Editing {
+        let effect = snap.listed.then(|| Effect::of(snap.sessions.get(&session)));
+        let follows = snap.settings.as_ref().is_ok_and(|s| s.projects_from_workspaces) && snap.status.fresh;
+        Editing::with(session, task, effect, follows, snap.settings.as_ref().err().cloned())
     }
 }
 
@@ -622,9 +917,12 @@ pub mod tests {
         let mut app = app(snapshot());
         typed(&mut app, "Brand new");
         assert_eq!(app.rows, [Row::Create]);
-        let create = Job::Create { title: "Brand new".into() };
+        let create = Job::Create { title: "Brand new".into(), description: None, projects: vec![], until: None };
         assert_eq!(app.on_key(key(KeyCode::Enter)), Action::Run(create.clone()));
-        assert_eq!(app.done(create, Ok("task-brand-new".into())), Action::Switch("task-brand-new".into()));
+        assert_eq!(
+            app.done(create, Ok(Reply::Created("task-brand-new".into()))),
+            Action::Switch("task-brand-new".into())
+        );
     }
 
     /// R1.4: in a client that cannot be switched, the switcher saves the task without switching and says why.
@@ -634,9 +932,9 @@ pub mod tests {
         snap.switch_problem = Some("this Herdr client was not started by `itm attach`".into());
         let mut app = app(snap);
         typed(&mut app, "Brand new");
-        let create = Job::Create { title: "Brand new".into() };
+        let create = Job::Create { title: "Brand new".into(), description: None, projects: vec![], until: None };
         assert_eq!(app.on_key(key(KeyCode::Enter)), Action::Run(create.clone()));
-        assert_eq!(app.done(create, Ok("task-brand-new".into())), Action::None);
+        assert_eq!(app.done(create, Ok(Reply::Created("task-brand-new".into()))), Action::None);
         let message = app.message.as_ref().expect("a message");
         assert!(message.error && message.text.starts_with("Saved “Brand new” without switching: this Herdr client"));
         assert_eq!(app.search.value(), "", "the search is cleared for the next one");
@@ -719,7 +1017,7 @@ pub mod tests {
         snap.current = Some("task-fix-login".into());
         let mut app = app(snap);
         let job = Job::Archive { session: "task-fix-login".into(), title: "Fix login".into() };
-        assert_eq!(app.done(job, Ok(String::new())), Action::Quit);
+        assert_eq!(app.done(job, Ok(Reply::Done)), Action::Quit);
     }
 
     #[test]
@@ -748,10 +1046,10 @@ pub mod tests {
         app.on_key(ctrl('d'));
         let delete = Job::Delete { session: "task-fix-login".into(), title: "Fix login".into() };
         assert_eq!(app.on_key(key(KeyCode::Char('y'))), Action::Run(delete.clone()));
-        assert_eq!(app.done(delete, Ok(String::new())), Action::None);
+        assert_eq!(app.done(delete, Ok(Reply::Done)), Action::None);
         assert_eq!(app.message.as_ref().map(|m| m.text.as_str()), Some("Deleted “Fix login”."));
         let here = Job::Delete { session: "task-write-docs".into(), title: "Write docs".into() };
-        assert_eq!(app.done(here, Ok(String::new())), Action::Quit);
+        assert_eq!(app.done(here, Ok(Reply::Done)), Action::Quit);
     }
 
     /// R10.4: Ctrl+S opens the settings; a toggle saves one at a time, and
@@ -773,7 +1071,7 @@ pub mod tests {
         assert_eq!(app.on_key(key(KeyCode::Enter)), Action::None, "one save at a time");
         app.loaded(Ok(snapshot())); // a refresh while saving keeps what is being saved
         assert!(shown(&app).saving);
-        assert_eq!(app.done(off, Ok(String::new())), Action::None);
+        assert_eq!(app.done(off, Ok(Reply::Done)), Action::None);
         let screen: SettingsScreen = shown(&app);
         assert_eq!((screen.saving, screen.settings.unwrap().remove_projects_without_workspace), (false, false));
         let on = Job::Setting { setting: RemoveProjectsWithoutWorkspace, on: true };

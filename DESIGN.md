@@ -371,7 +371,9 @@ Verified against Herdr 0.9.3. Re-check them after a Herdr upgrade.
   call `clone_repo` from a worker thread; it runs
   `inbox-task-manager project add …` as a child process, which keeps the
   cleanup above. The Rust TUI runs the same child (`Itm::clone_child`:
-  `ITM_SELF`, else the running binary, through `itm setsid`). That child:
+  `ITM_SELF`, else the running binary, through `itm setsid`; `--name=<name>
+  -- <url>`, so a name or URL starting with "-" is no option), from a
+  worker (`tui/clones.rs`, section 4). That child:
   - gets `git clone --progress` (git prints no progress when its output is
     captured);
   - must not prompt: `stdin` closed, `GIT_TERMINAL_PROMPT=0`, ssh in batch
@@ -503,7 +505,8 @@ The switcher and its dialogs follow these principles.
     `herdr session list --json`, takes about 2 ms.
   - All keys listed in section 1 arrive.
   - The closure grows by about 27 MiB.
-- **Rules for the TUI:**
+- **Rules for the TUI** (the Python switcher's; the Rust switcher keeps
+  them in its own terms, see 2026-11-06):
   - Only the TUI imports Textual, lazily. The CLI and the daemon stay
     standard-library only, so they start in milliseconds and the daemon stays
     small.
@@ -749,6 +752,10 @@ The switcher and its dialogs follow these principles.
   - ratatui (crossterm backend, default features off) and tui-input: the
     switcher's drawing and its line editing. ratatui has no forms or focus,
     so those are built in itm;
+  - ratatui-textarea (crossterm only): the form's description, the one
+    field with several lines (cursor moves, word wrap, undo), which
+    tui-input cannot edit; from the ratatui organization, and its own
+    dependencies are already in the graph through ratatui;
   - rustix: the safe system calls std lacks (`getuid`, `kill` with a
     signal, `setsid`, a non-blocking `connect` with `poll`); `unsafe` code
     is denied in the crate;
@@ -765,51 +772,140 @@ The switcher and its dialogs follow these principles.
     `Cargo.lock` to releases at least two weeks old (winnow 1.0.4,
     toml_writer 1.1.3, toml_datetime 1.1.2), not the newest;
   - insta (tests only): screen snapshots on ratatui's `TestBackend`.
-- **The switcher in Rust** keeps the Textual rules' intent in its own terms:
+- **The switcher in Rust** keeps the Textual rules (2026-11-04 above,
+  which the Python switcher follows) in its own terms:
   - The app (`tui/app.rs`) holds state and turns keys into actions with no
     I/O and no clock; the event loop (`tui/mod.rs`) says what time it is,
-    draws, and runs anything that can block (Herdr, the store lock, a
-    hand-off) in a worker thread.
-  - Screens over the list (dialogs now; the form, Projects, Settings and
-    help later) are a stack (`tui/screen.rs`): only the top one gets keys,
-    so list keys never act on the task behind a dialog, and Esc closes only
-    the top. A new screen is a new `Screen` variant.
+    draws, and runs anything that can block (Herdr, the store lock, git, a
+    hand-off, a folder listing) in a thread of its own. There is nothing to
+    import lazily: the TUI is part of the one binary and costs nothing
+    until it runs.
+  - Screens over the list (dialogs, the New task and edit form, its project
+    finder, the add, rename and remove dialogs, Projects, Settings, help)
+    are a stack (`tui/screen.rs`): only the top one gets keys, so list keys
+    never act on the task behind a dialog, and Esc closes only the top. A
+    new screen is a new `Screen` variant. A key's `Outcome` says whether
+    the screen stays, closes, has work done while it stays (`Act`), or
+    opens another over itself (`Open`); a screen that closes with an action
+    (`CloseAnd`: the finder's projects, the add dialog's new project, a
+    question's answer) hands it to the screen below (`Screen::returned`),
+    like a Textual dismiss callback, and with none below the switcher acts
+    on it. Nothing awaits a callback, so Textual's rule about returning
+    `dismiss()` has no counterpart.
+  - A job's result goes to the screen that asked for it (`Screen::takes`):
+    the add dialog's saves, checks and clones, the Settings screen's
+    toggles, the Projects screen's renames and removals. When the user went
+    on to another screen meanwhile, the asking screen only updates itself
+    (no screen opens or closes behind the user's back); when it closed, the
+    switcher says what went wrong, if anything.
+  - Screens do no I/O: what they need read they say in `Screen::needs` (a
+    folder listing, the add dialog's check of what was typed) and when
+    (`Screen::due`, a check once typing pauses for 250 ms), and the loop
+    reads it after each event and hands it back.
   - The loop waits for a key, a worker's result (over a channel) or a
-    deadline (the 2 s refresh, a message's expiry). Idle, it blocks on the
-    terminal until the deadline; while a worker runs it looks at the
-    results every 10 ms. One load runs at a time, and a job's result asks
-    for a load. A worker that panics still sends a result, so a refresh
-    always ends.
+    deadline (the 2 s refresh, a message's expiry, a screen's check).
+    Idle, it blocks on the terminal until the deadline; while a worker runs
+    it looks at the results every 10 ms. One load runs at a time, and a
+    job that can change tasks asks for a load once done. A worker that
+    panics still sends a result, so a refresh always ends.
   - Keys are read on the loop's thread, only while it waits, never by a
     thread of their own: crossterm reads input while it polls, so a reader
     left running after the switcher closed would take keys meant for the
     `herdr session attach` that follows a switch, and it cannot be stopped
-    at once (joining one cost 50 ms on every exit).
+    at once (joining one cost 50 ms on every exit). Keys are handled one at
+    a time, in order, so a key that opens the finder (typed on the form's
+    project field) is followed by the next key in the finder: Textual's
+    rules about keys that arrive before a picker is up, and about
+    `select_on_focus`, have no counterpart. A paste (bracketed paste) is
+    fed as keys, its whitespace (newlines too) one space each, so a pasted
+    URL opens the finder like typing does and never presses Enter.
+  - The main list's keys are matched before the search box gets a key,
+    except `?`, which opens the help only while the search is empty and is
+    typed otherwise (Textual's `check_consume_key` rule). F1 opens it
+    always. The footer shows seven keys (`?` among them); the help lists
+    the rest (Ctrl+U, Ctrl+A, Ctrl+D, Ctrl+O, Ctrl+S, Alt+1…9, Esc).
+  - Text is drawn as ratatui spans, never parsed as markup, so a title or
+    project name with `[` styles nothing (Textual's `$variables` rule).
   - Time, keys and work are injected (`Events`, `Work`, the backend), so
     tests run the loop itself on ratatui's `TestBackend` with a scripted
-    clock.
-  - `itm snooze` without a time (R4.1) runs the snooze screen alone; Esc
-    is `cancelled` (exit 1, and no delay in a popup). So do `itm delete`'s
-    question (no is exit 1 and says nothing, like the Python itm), `itm
-    project remove`'s clone dialog, and `itm project add-workspace`'s add
-    dialog and folder question (R10.5).
-  - A screen that has work done and stays open (the Settings screen saving
-    a toggle, the add dialog saving a project) returns `Outcome::Act`; the
-    result comes back to it in `Screen::done`. In the switcher the work
-    runs in a worker like any job; a screen run alone has it done right
-    there, since nothing else is on the screen. The add dialog checks what
-    was typed when Enter is pressed (Python checks while typing), and a
-    problem with the name puts the cursor on the name (`Error::
-    is_about_the_name`, R8.5).
+    clock, folder listings read in real threads, and clones as real child
+    processes.
+  - One loop runs the switcher and the screens the CLI opens alone
+    (`App::alone`): there is no list behind them, nothing is loaded, their
+    work runs in workers like the switcher's, and the loop ends when the
+    last screen closes, returning what it closed with for the CLI to act on.
+    So `itm snooze` without a time (R4.1) runs the snooze screen alone; Esc
+    is `cancelled` (exit 1, and no delay in a popup). So do `itm new`
+    without a title or with `-i` (the New task form, R1.1), `itm edit`
+    without options (the edit form, R5.4), `itm delete`'s question (no is
+    exit 1 and says nothing, like the Python itm), `itm project remove`'s
+    clone dialog, and `itm project add-workspace`'s add dialog and folder
+    question (R10.5).
+  - The New task and edit form (`tui/form.rs`) has its fields in Tab order
+    (title, description, projects, and for a new task the snooze and a time
+    typed for "Other time…"); Enter in the title (or a time) saves, Ctrl+S
+    saves from any field, and Esc asks first when something was typed (for
+    an edit: also when the projects changed). The description is a
+    ratatui-textarea (Enter adds a line, Tab moves on). Textual's snooze
+    `Select` became a field whose choice ←/→ change; typing on it picks
+    "Other time…" and types the time there. Below the fields the form says
+    what saving does, worked out from the projects' folders as the last
+    refresh saw them (`Saved`: which folders are missing, and each saved
+    folder resolved).
+  - The project finder (`tui/finder.rs`) and the add dialog (`tui/add.rs`)
+    complete folders as Textual's `FolderLister` and `FolderSuggester` did
+    (`tui/completion.rs`): each screen keeps the listings it asked for
+    while it is open, each folder read once in a plain thread that is never
+    joined (a scan blocked on NFS, autofs or a cold /nix/store holds up
+    neither the loop nor the exit), and filters them in memory on every
+    key. A listing comes back to every screen that asked for it, and one
+    for a screen that closed meanwhile is dropped. While a folder is read
+    the finder has no rows ("Reading the folder…"), so Enter and Tab never
+    act on rows left from earlier text; a listing that arrives late rebuilds
+    the rows from what is typed then. Symlinked folders are resolved in the
+    reading thread (`Listing.links`), so a saved folder reached through a
+    link is found. Ghost text (`Folders::ghost`) is a completion that starts
+    with exactly what was typed (no casefolding), none after a trailing
+    "/"; it is worked out when drawn, from the listings the dialog has, so a
+    late listing shows it and a kind switch (only folders complete) clears
+    it. → at the end of the source, or Tab, takes it.
+  - Fuzzy matching is `fuzzy::fuzzy_match` (linear time), for projects and
+    folders alike.
+  - The add dialog checks what was typed once typing pauses (Python's
+    0.25 s debounce): a `Job::CheckProject` in a worker says where the
+    project would go and whether it is saved already or its name taken, as
+    adding would (`Itm::check_project`, which may ask git how `insteadOf`
+    rewrites the URL); only the check of what is typed now is kept. Enter
+    adds, and adding checks again; a clone is checked before its child
+    starts, so a name taken comes back typed and puts the cursor on the
+    name (`Error::is_about_the_name`, R8.5). Its kinds are tabs: Ctrl+←/→
+    cycle them, plain ←/→ change them only in an empty source and stop at
+    the ends, never while a save or a clone runs.
+  - A clone from the add dialog (`tui/clones.rs`) runs the child `itm
+    project add git --name=<name> -- <url>` from a worker that reads its
+    output as it comes and says the last line of each chunk (git's
+    progress, `\r` included). The child is registered with the loop's
+    `Clones` and reaped only under its lock, so the pid signalled is never
+    another process's. Esc sends it SIGTERM (it removes what it copied; the
+    dialog says "Stopped" once it ended, and takes the project if the clone
+    finished first); every way out of the loop stops the children that
+    run (a guard), and one started after that is stopped at once. While a
+    clone runs the loop catches SIGHUP (the popup closed), SIGTERM and
+    SIGINT (`ExitSignals`), stops it and exits with 128 + the signal.
   - The Settings screen (Ctrl+S, R10.4) shows the settings each refresh
     read (`Snapshot.settings`, so a file fixed meanwhile shows), saves one
     toggle at a time in a worker, and shows a file with a mistake, with
     nothing to toggle, or why a save failed.
+  - The Projects screen (Ctrl+P, R8.3) follows each refresh, keeping the
+    highlighted project by its id; Enter closes it and searches for
+    `@name` (R6.2). Ctrl+D first reads the clone in a worker
+    (`Job::RemovalPlan`, git), then opens the remove dialog.
   - The editor for notes (Ctrl+O) is the one blocking call on the loop's
     thread: the terminal is given back first (`Events::suspended`: raw mode
-    off, main screen), taken back after, and drawn again in full; nothing
-    reads keys meanwhile, and no lock is held. The preview's notes are read
-    by the load worker with the rest of the snapshot, so drawing stays pure.
+    and bracketed paste off, main screen), taken back after, and drawn
+    again in full; nothing reads keys meanwhile, and no lock is held. The
+    preview's notes are read by the load worker with the rest of the
+    snapshot, so drawing stays pure.
 - **Other systems.** `system.rs` keeps `system.py`'s split: the process
   table from `/proc`, else `ps -ww` with one `-o` per column (bounded by a
   5 s timeout), and notifications through `osascript` on macOS (title and
@@ -829,9 +925,15 @@ The switcher and its dialogs follow these principles.
   `times.rs`, `error.rs`, `git.rs` (URL normalization, `insteadOf`, checkouts,
   local work, the clone, the repository a folder is in), `config.rs` (the
   settings), `workspaces.rs` (which project a workspace is in, and `itm
-  project add-workspace`) and `tui/` (`app.rs` state and keys without I/O,
-  `screen.rs` the screens over the list, `draw.rs` rendering, `mod.rs` the
-  event loop and its workers). Tests sit
+  project add-workspace`), `fuzzy.rs` (fuzzy matching), `folders.rs`
+  (folder completion) and `tui/` (`app.rs` the switcher's state and keys
+  without I/O, `screen.rs` the screen stack and the small dialogs,
+  `draw.rs` the list, the preview, the small dialogs and the helpers every
+  screen draws with, `mod.rs` the event loop and its workers; the larger
+  screens each in a module with their state, keys and drawing: `form.rs`,
+  `finder.rs`, `add.rs`, `projects.rs` (with the rename dialog),
+  `help.rs`; `completion.rs` a screen's folder listings, `clones.rs` the
+  clone children). Tests sit
   next to the code; `tests/switching.rs` runs the switching protocol with
   real processes and signals.
 

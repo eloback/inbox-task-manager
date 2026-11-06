@@ -1,26 +1,27 @@
 ---
 source: src/tui/draw.rs
+assertion_line: 850
 expression: screen(&mut app)
 ---
   Inbox 3   Snoozed 1   Archived 1   All 5                                                      ⚑ 1 needs you
 
- › Search tasks · or type a new title
+ › Search tasks · @project filters · or type a new title
 
  NEEDS YOU                                                           │  Fix login
- ⚑ Fix login                                claude waiting · 4m      │
- ACTIVE                ╭──────────────────────────────────────────────────────────────╮d out
- ● Write docs          │ Add project  Local folder                                    │
- ○ Old idea            │                                                              │
-                       │ Source  ~/code/new-thing                                     │ng 4m
-                       │ Name    My Thing                                             │
-                       │                                                              │
-                       │ project already exists: My Thing (no folder); choose another │t · ctrl+o writes
-                       │ name                                                         │
-                       │                                                              │
-                       │ enter add  tab next field  esc cancel                        │
-                       ╰──────────────────────────────────────────────────────────────╯
+ ⚑ Fix login ╭──────────────────────────────────────────────────────────────────────────────────╮
+ ACTIVE      │ Add project                                                                      │
+ ● Write docs│  Git repository   Local folder   Name only                                       │
+ ○ Old idea  │                                                                                  │
+             │ Source  ~/code/new-thing                                                         │
+             │ Name    My Thing                                                                 │
+             │                                                                                  │
+             │ project already exists: My Thing (no folder); choose another name                │ writes
+             │                                                                                  │
+             │ enter add  tab complete  ←→ kind (empty source)  esc back                        │
+             │                                                                                  │
+             ╰──────────────────────────────────────────────────────────────────────────────────╯
                                                                      │
                                                                      │
-                                                                     │  enter open
+                                                                     │  enter open  ctrl+o notes
 
- enter open  tab view  alt+1…9 row  ^z snooze  ^u wake  ^a archive  esc close
+ enter open  tab view  ^n new  ^e edit  ^z snooze  ^p projects  ? all keys
