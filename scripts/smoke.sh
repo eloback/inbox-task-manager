@@ -311,9 +311,10 @@ keys y
 check "y gives it the folder" wait_for 5 sh -c "'$itm' project list | grep -q '^Client Y	dir	~/code/client-y'"
 check "no second project was saved" test "$("$itm" project list | grep -c '^Client Y')" = 1
 popup_ws=$(open_workspace task-fix-login "$HOME/code/docs" "" false)
-check "a popup's workspace is the one it was opened over, given by HERDR_ACTIVE_WORKSPACE_ID" \
-  test "$(HERDR_SOCKET_PATH="$sessions/task-fix-login/herdr.sock" HERDR_ACTIVE_WORKSPACE_ID="$popup_ws" "$itm" project add-workspace --name popup </dev/null)" \
-  = "project docs (~/code/docs); added to 'Fix login'"
+HERDR_SOCKET_PATH="$sessions/task-fix-login/herdr.sock" HERDR_ACTIVE_WORKSPACE_ID="$popup_ws" "$itm" project add-workspace --name popup </dev/null >"$root/popup-ws.txt" 2>&1
+# The daemon may have found docs in that workspace first: then the task has it already.
+docs_picked() { grep -qxE "project docs \(~/code/docs\); (added to 'Fix login'|'Fix login' has it already)" "$root/popup-ws.txt"; }
+check "a popup's workspace is the one it was opened over, given by HERDR_ACTIVE_WORKSPACE_ID" docs_picked
 home_ws=$(open_workspace task-fix-login "$HOME" "" false)
 HERDR_SOCKET_PATH="$sessions/task-fix-login/herdr.sock" HERDR_ACTIVE_WORKSPACE_ID="$home_ws" "$itm" project add-workspace --name everything </dev/null >"$root/home.txt" 2>&1
 check "the home folder is refused" contains "$root/home.txt" "itm: ~ holds every workspace under it"
@@ -485,9 +486,13 @@ notes_here=$("$itm" notes "$(marker)" --path)
 ready # the client was handed to another session: it drops the first keys
 keys C-b E
 check "prefix+shift+e: the current task's notes in the editor" wait_for 5 contains "$notes_here" "written in the editor"
+# The editor wrote; the popup closes once its itm exits, and takes every key until then.
+no_itm() { test -z "$(sandbox_pids "$1")"; }
+wait_for 5 no_itm "itm notes"
 here=$(marker)
 mkdir -p "$HOME/code/popup"
 open_workspace "$here" "$HOME/code/popup" "" true >/dev/null
+ready # Herdr 0.9.5 drops the first keys after that popup closed and the new workspace took focus
 keys C-b A
 check "prefix+shift+a: the add dialog with the workspace's folder" wait_for 5 shows 'Source  ~/code/popup'
 keys Enter

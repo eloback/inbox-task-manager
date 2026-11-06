@@ -8,11 +8,39 @@ commit.
 
 ## 1. Herdr facts itm depends on
 
-Verified against Herdr 0.9.3. Re-check them after a Herdr upgrade.
+Verified against Herdr 0.9.3 (the user's); the smoke run passes against
+0.9.5 too, which the flake bundles as a fallback. Re-check them after a
+Herdr upgrade.
 
 - **Sessions are separate servers.** `herdr session list --json` gives each
   session's `socket_path`. To talk to a session, set `HERDR_SOCKET_PATH` to that
   socket. `HERDR_SESSION` does not override an inherited `HERDR_SOCKET_PATH`.
+- **Session discovery.** No socket method lists sessions: `herdr session
+  list` reads `<config>/herdr/sessions/` (`<config>` is `$XDG_CONFIG_HOME`,
+  else `~/.config`, on macOS too), whose folder names are 1–64 bytes of
+  `[A-Za-z0-9._-]` (not `.`, `..` or `default`), adds the default session
+  (`<config>/herdr/herdr.sock`), and calls a session running when a
+  connect to its `herdr.sock` succeeds. itm does the same (`Herdr::sessions`).
+- **The socket API.** Each session's server answers on its `herdr.sock`
+  (mode `0600`; `herdr-client.sock` next to it is the attach protocol): one
+  JSON object per line, one request per connection. A request is `{"id":
+  "<string>", "method": "<name>", "params": {…}}` (`params` required, even
+  empty); the answer is one line, `{"id", "result": {"type", …}}` or `{"id",
+  "error": {"code", "message"}}`, and the server closes. Match errors by
+  `code`. The server gives each step 5 s; clients keep their own deadline.
+  `herdr api schema --json` prints the JSON Schema (protocol 22 from 0.9.0
+  to 0.9.5; 0.9.5's schema is the same as 0.9.3's), and the documented
+  contract is that clients ignore unknown fields and treat an unsupported
+  method as an ordinary error. The CLI pings first and refuses a server
+  whose protocol number differs (`protocol_mismatch`, until the server
+  restarts after an upgrade); a raw client is not refused. itm uses
+  `session.snapshot` (agents, workspaces, tabs, layouts and panes in one
+  answer), `workspace.create`, `workspace.list`, `workspace.rename`,
+  `notification.show` and `server.stop`; the smoke run also uses
+  `pane.send_input`, `pane.report_agent` and `workspace.close`.
+- **Stopping and deleting.** `server.stop` answers, then stops the server,
+  so the caller may run inside that session. `herdr session delete`
+  refuses a running session and has no socket method.
 - **No nested attach, no detach API.** A client inside Herdr cannot attach to
   another session, and nothing in the socket API detaches a client. Sending
   SIGTERM to the `herdr session attach` process detaches it cleanly: it exits
@@ -31,7 +59,8 @@ Verified against Herdr 0.9.3. Re-check them after a Herdr upgrade.
   `cycle_pane_next`, and `prefix+shift+<letter>` is the capital letter
   after the prefix (Herdr 0.9.3, checked with each contrib key).
 - **Toasts.** `ui.toast.delivery` defaults to `off`. Then
-  `herdr notification show` returns `shown: false, reason: "disabled"`. Other
+  `notification.show` (`herdr notification show`) returns `shown: false,
+  reason: "disabled"`. Other
   reasons: `rate_limited`, `no_foreground_client`, `busy`. Herdr itself toasts
   blocked agents in the attached session, except in the active tab.
 - **Agent state.** `agent_status` is one of idle, working, blocked, done,
@@ -67,9 +96,9 @@ Verified against Herdr 0.9.3. Re-check them after a Herdr upgrade.
   or `workspace rename` (or `prefix+shift+w`) and survives a restart. There
   is no way back to no name: `workspace rename <id> ""` sets an empty label.
 - **The workspace's folder over the API.** No call reports `identity_cwd`.
-  `herdr api snapshot` has the workspaces, the tabs in order, each tab's
-  layout with its panes in layout order, and each pane's `cwd`, which is
-  enough to find the first pane of the first tab. `session.json` has it too,
+  `session.snapshot` (`herdr api snapshot`) has the workspaces, the tabs in
+  order, each tab's layout with its panes in layout order, and each pane's
+  `cwd`, which is enough to find the first pane of the first tab. `session.json` has it too,
   but is Herdr's internal format and is saved a few seconds late.
 - **Building a session before attaching.** `HERDR_SESSION=<name> herdr
   server` starts a session with no workspace; `workspace create --cwd <path>
@@ -84,7 +113,11 @@ Verified against Herdr 0.9.3. Re-check them after a Herdr upgrade.
 - **Popup environment.** A popup command gets the workspace, tab and pane it
   was opened over as `HERDR_ACTIVE_WORKSPACE_ID`, `HERDR_ACTIVE_TAB_ID`,
   `HERDR_ACTIVE_PANE_ID` and `HERDR_ACTIVE_PANE_CWD`, and no
-  `HERDR_WORKSPACE_ID` (a pane's own variable).
+  `HERDR_WORKSPACE_ID` (a pane's own variable). The same in 0.9.5.
+- **Dropped keys (0.9.5).** Besides a client just handed to another session
+  (section 6), a 0.9.5 client dropped the first keys sent right after a
+  popup closed and a new workspace took focus; 0.9.3 did not. 0.9.5 also
+  greets a new config with a welcome dialog and its integrations settings.
 
 ## 2. Rules that must stay true
 
