@@ -520,6 +520,24 @@ pub fn wrapped_rows(line: &Line, width: usize) -> usize {
     rows
 }
 
+/// `text` wrapped at words in `width` columns, every line after `indent` spaces.
+pub fn indented(text: &str, width: usize, indent: usize) -> Vec<String> {
+    let room = width.saturating_sub(indent).max(1);
+    let mut lines: Vec<String> = vec![];
+    let mut line = String::new();
+    for word in text.split_whitespace() {
+        if !line.is_empty() && line.chars().count() + 1 + word.chars().count() > room {
+            lines.push(std::mem::take(&mut line));
+        }
+        if !line.is_empty() {
+            line.push(' ');
+        }
+        line.push_str(word);
+    }
+    lines.push(line);
+    lines.into_iter().map(|line| format!("{}{line}", " ".repeat(indent))).collect()
+}
+
 /// A project's name as a badge in `width` cells (`◆ name`, cut with "…"),
 /// the letters a search matched underlined (R1.6).
 pub fn name_badge(name: &str, width: usize, matched: &[usize]) -> Vec<Span<'static>> {
@@ -626,7 +644,8 @@ fn draw_settings(frame: &mut Frame, screen: &SettingsScreen, area: Rect) {
             Err(_) => Style::new().fg(MUTED),
         };
         lines.push(Line::from(vec![mark, Span::styled(setting.label(), style)]));
-        lines.push(Line::from(muted(format!("  {}", setting.help()))));
+        let width = area.width.min(WIDE).saturating_sub(4) as usize; // inside the border and margin
+        lines.extend(indented(setting.help(), width, 2).into_iter().map(|line| Line::from(muted(line))));
     }
     lines.push(Line::default());
     lines.push(Line::from(match (&screen.settings, &screen.failed) {
@@ -1103,6 +1122,17 @@ mod tests {
             assert!(shown.contains(hint), "{hint} cut:\n{shown}");
         }
         insta::assert_snapshot!(shown);
+    }
+
+    /// R10.4: a setting's help keeps its indent on every line it wraps to.
+    #[test]
+    fn help_text_keeps_its_indent_when_it_wraps() {
+        assert_eq!(indented("one two three four", 11, 2), ["  one two", "  three", "  four"]);
+        assert_eq!(indented("", 11, 2), ["  "]);
+        let mut app = app(snapshot());
+        app.on_key(ctrl('s'));
+        let shown = screen(&mut app);
+        assert!(shown.contains("│   folder Herdr names a workspace after)"), "{shown}");
     }
 
     /// A value longer than its field scrolls to keep the cursor in view; the

@@ -1,6 +1,6 @@
 ---
 source: src/tui/draw.rs
-assertion_line: 837
+assertion_line: 882
 expression: screen(&mut app)
 ---
   Inbox 3   Snoozed 1   Archived 1   All 5                                                      ⚑ 1 needs you
@@ -12,12 +12,12 @@ expression: screen(&mut app)
  ACTIVE      │ Herdr integration                                                                │
  ● Write docs│ ● Projects follow workspaces                                                     │
  ○ Old idea  │   A running task's projects are the saved projects its workspaces are in (the    │
-             │ folder Herdr names a workspace after). Off: projects change only when you edit   │
-             │ them.                                                                            │
+             │   folder Herdr names a workspace after). Off: projects change only when you edit │
+             │   them.                                                                          │
              │ ● Remove a project when its workspace closes                                     │
              │   With the above: a project found in a workspace leaves the task once its        │ writes
-             │ workspace closed; projects you added yourself stay. Off: projects are only       │
-             │ added.                                                                           │
+             │   workspace closed; projects you added yourself stay. Off: projects are only     │
+             │   added.                                                                         │
              │                                                                                  │
              │ ~/.config/inbox-task-manager/config.toml: unknown setting herdr.nope             │
              │                                                                                  │
