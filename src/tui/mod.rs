@@ -1,14 +1,14 @@
 //! The switcher (`itm`, `itm ui`): a terminal UI over ratatui, and the
 //! snooze dialog `itm snooze` opens without a time.
 //!
-//! The event loop waits on one channel. Keys arrive from a reader thread;
-//! anything that can block (Herdr calls, the store lock, a hand-off) runs in
-//! a worker thread that sends its result to the same channel. Timers (the
-//! 2 s refresh, a message expiring) are deadlines of that wait. What the
-//! loop needs from the world is injected (where time and input come from,
-//! [`Clock`]; what workers do, [`Work`]; the terminal backend), so its tests
-//! run it on a test backend with a scripted clock. Choosing a task returns
-//! it to the caller, which switches once the terminal is restored.
+//! The event loop waits for a key, a worker's result or a deadline (the
+//! 2 s refresh, a message expiring). Anything that can block (Herdr calls,
+//! the store lock, a hand-off) runs in a worker thread that sends its
+//! result over a channel. What the loop needs from the world is injected
+//! (where time and keys come from, [`Events`]; what workers do, [`Work`];
+//! the terminal backend), so its tests run it on a test backend with a
+//! scripted clock. Choosing a task returns it to the caller, which switches
+//! once the terminal is restored.
 
 mod app;
 mod draw;
@@ -16,9 +16,8 @@ mod screen;
 
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::thread::{self, JoinHandle};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use jiff::tz::TimeZone;
@@ -35,8 +34,8 @@ use crate::itm::Itm;
 use crate::snooze::{self, Until};
 
 const REFRESH: Duration = Duration::from_secs(2);
-/// How often the key reader looks whether it should stop.
-const KEY_POLL: Duration = Duration::from_millis(50);
+/// While a worker runs, how long to wait for a key before looking for its result.
+const BUSY_POLL: Duration = Duration::from_millis(10);
 
 /// What wakes the loop.
 #[derive(Debug)]
@@ -50,24 +49,44 @@ pub enum Input {
     Done(Job, Result<String>),
 }
 
-/// Where the loop's time comes from, and how it waits for input.
-pub trait Clock {
+/// Where the loop's time and keys come from.
+pub trait Events {
     fn now(&self) -> Moment;
-    /// The next input, or None once `deadline` passed without one. `busy`
-    /// says whether a worker is running (a scripted clock waits for it).
-    fn wait(&self, inputs: &Receiver<Input>, deadline: Instant, busy: bool) -> Option<Input>;
+    /// The next input, a key or what a worker sent on `results`, or None
+    /// once `deadline` passed. `busy`: a worker runs, so a result may come.
+    fn next(&self, results: &Receiver<Input>, deadline: Instant, busy: bool) -> Option<Input>;
 }
 
-/// The system clock.
-pub struct SystemClock;
+/// The terminal and the system clock. Keys are read only while the loop
+/// waits, on its own thread: nothing reads the terminal once the switcher
+/// has closed, where a reader left running would take keys meant for the
+/// `herdr session attach` that follows a switch (and could not be stopped
+/// at once, which would delay every switch).
+pub struct TerminalEvents;
 
-impl Clock for SystemClock {
+impl Events for TerminalEvents {
     fn now(&self) -> Moment {
         Moment::now()
     }
 
-    fn wait(&self, inputs: &Receiver<Input>, deadline: Instant, _busy: bool) -> Option<Input> {
-        inputs.recv_timeout(deadline.saturating_duration_since(Instant::now())).ok()
+    fn next(&self, results: &Receiver<Input>, deadline: Instant, busy: bool) -> Option<Input> {
+        loop {
+            if let Ok(input) = results.try_recv() {
+                return Some(input);
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return None;
+            }
+            // Idle, only a key or the deadline can come: wait for them. Busy, look at the results often.
+            let wait = if busy { left.min(BUSY_POLL) } else { left };
+            match event::poll(wait).and_then(|ready| ready.then(event::read).transpose()) {
+                Ok(Some(Event::Key(key))) if key.kind == KeyEventKind::Press => return Some(Input::Key(key)),
+                Ok(Some(Event::Resize(..))) => return Some(Input::Resized),
+                Ok(_) => {}
+                Err(e) => return Some(Input::Failed(Error::Other(format!("cannot read the terminal: {e}")))),
+            }
+        }
     }
 }
 
@@ -119,7 +138,7 @@ pub fn run(itm: &Arc<Itm>, view: View) -> Result<Option<String>> {
     let exit_after_draw = std::env::var_os("ITM_EXIT_AFTER_DRAW").is_some_and(|v| v == "1");
     let app = App::new(view, itm.paths.clone(), itm.tz.clone(), Moment::now());
     let work: Arc<dyn Work> = Arc::clone(itm) as Arc<dyn Work>;
-    in_terminal(|terminal, inputs| event_loop(terminal, app, work, &SystemClock, inputs, exit_after_draw))
+    in_terminal(|terminal| event_loop(terminal, app, work, &TerminalEvents, exit_after_draw))
 }
 
 /// The snooze dialog alone (`itm snooze` without a time, R4.1): the chosen
@@ -128,63 +147,19 @@ pub fn run(itm: &Arc<Itm>, view: View) -> Result<Option<String>> {
 pub fn snooze_dialog(session: &str, title: &str, agent: bool, tz: &TimeZone) -> Result<Option<Until>> {
     let presets = snooze::presets(crate::times::now(), tz, agent);
     let screen = Screen::Snooze(SnoozeDialog::new(session.into(), title.into(), presets));
-    let chosen = in_terminal(|terminal, (_, inputs)| alone(terminal, screen, tz, &SystemClock, &inputs))?;
+    let chosen = in_terminal(|terminal| alone(terminal, screen, tz, &TerminalEvents))?;
     Ok(match chosen {
         Some(Action::Run(Job::Snooze { until, .. })) => Some(until),
         _ => None,
     })
 }
 
-/// Take the terminal, read its keys into the input channel while `ui`
-/// runs, and give the terminal back. The key reader stops before that, so
-/// it never reads keys meant for what runs next (`herdr session attach`).
-fn in_terminal<T>(
-    ui: impl FnOnce(&mut ratatui::DefaultTerminal, (Sender<Input>, Receiver<Input>)) -> Result<T>,
-) -> Result<T> {
+/// Take the terminal while `ui` runs, and give it back.
+fn in_terminal<T>(ui: impl FnOnce(&mut ratatui::DefaultTerminal) -> Result<T>) -> Result<T> {
     let mut terminal = ratatui::try_init().context(|| "cannot open the terminal".into())?;
-    let (tx, rx) = mpsc::channel();
-    let keys = KeyReader::start(tx.clone());
-    let result = ui(&mut terminal, (tx, rx));
-    drop(keys);
+    let result = ui(&mut terminal);
     ratatui::restore();
     result
-}
-
-/// Reads the terminal's keys on a thread, until dropped.
-struct KeyReader {
-    stop: Arc<AtomicBool>,
-    thread: Option<JoinHandle<()>>,
-}
-
-impl KeyReader {
-    fn start(inputs: Sender<Input>) -> KeyReader {
-        let stop = Arc::new(AtomicBool::new(false));
-        let stopping = Arc::clone(&stop);
-        let thread = thread::spawn(move || {
-            while !stopping.load(Ordering::SeqCst) {
-                let input = match event::poll(KEY_POLL).and_then(|ready| ready.then(event::read).transpose()) {
-                    Ok(Some(Event::Key(key))) if key.kind == KeyEventKind::Press => Input::Key(key),
-                    Ok(Some(Event::Resize(..))) => Input::Resized,
-                    Ok(_) => continue,
-                    Err(e) => Input::Failed(Error::Other(format!("cannot read the terminal: {e}"))),
-                };
-                let failed = matches!(input, Input::Failed(_));
-                if inputs.send(input).is_err() || failed {
-                    return;
-                }
-            }
-        });
-        KeyReader { stop, thread: Some(thread) }
-    }
-}
-
-impl Drop for KeyReader {
-    fn drop(&mut self) {
-        self.stop.store(true, Ordering::SeqCst);
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
-    }
 }
 
 /// Run `task` on a worker thread and send what it returns. A panic becomes
@@ -209,14 +184,14 @@ fn event_loop<B: Backend>(
     terminal: &mut Terminal<B>,
     mut app: App,
     work: Arc<dyn Work>,
-    clock: &impl Clock,
-    (tx, rx): (Sender<Input>, Receiver<Input>),
+    events: &impl Events,
     exit_after_draw: bool,
 ) -> Result<Option<String>> {
+    let (tx, rx) = mpsc::channel();
     // One load at a time; a job's result asks for another one right after.
-    let (mut loading, mut reload, mut next_refresh, mut jobs) = (false, true, clock.now().instant, 0);
+    let (mut loading, mut reload, mut next_refresh, mut jobs) = (false, true, events.now().instant, 0);
     loop {
-        app.now = clock.now();
+        app.now = events.now();
         if !loading && (reload || app.now.instant >= next_refresh) {
             (loading, reload) = (true, false);
             let work = Arc::clone(&work);
@@ -232,8 +207,8 @@ fn event_loop<B: Backend>(
         let refresh = (!loading).then_some(next_refresh);
         let deadline = refresh.into_iter().chain(app.message.as_ref().map(|m| m.until)).min();
         let deadline = deadline.unwrap_or(app.now.instant + Duration::from_secs(3600));
-        let input = clock.wait(&rx, deadline, loading || jobs > 0);
-        app.now = clock.now();
+        let input = events.next(&rx, deadline, loading || jobs > 0);
+        app.now = events.now();
         let action = match input {
             None | Some(Input::Resized) => Action::None,
             Some(Input::Key(key)) => app.on_key(key),
@@ -267,18 +242,18 @@ fn alone<B: Backend>(
     terminal: &mut Terminal<B>,
     mut screen: Screen,
     tz: &TimeZone,
-    clock: &impl Clock,
-    inputs: &Receiver<Input>,
+    events: &impl Events,
 ) -> Result<Option<Action>> {
+    let (_none, results) = mpsc::channel(); // no workers here
     loop {
-        let now = clock.now();
+        let now = events.now();
         terminal.draw(|frame| draw::draw_alone(frame, &screen, tz, now.epoch)).context(|| "cannot draw".into())?;
-        let key = match clock.wait(inputs, now.instant + Duration::from_secs(3600), false) {
+        let key = match events.next(&results, now.instant + Duration::from_secs(3600), false) {
             Some(Input::Key(key)) => key,
             Some(Input::Failed(e)) => return Err(e),
             _ => continue,
         };
-        match screen.on_key(key, &ScreenContext { tz, now: clock.now().epoch }) {
+        match screen.on_key(key, &ScreenContext { tz, now: events.now().epoch }) {
             Outcome::Stay => {}
             Outcome::Close => return Ok(None),
             Outcome::CloseAnd(action) => return Ok(Some(action)),
@@ -296,7 +271,7 @@ mod tests {
     use std::cell::{Cell, RefCell};
     use std::collections::VecDeque;
     use std::sync::Mutex;
-    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     enum Step {
         Key(KeyEvent),
@@ -327,17 +302,17 @@ mod tests {
         }
     }
 
-    impl Clock for Script {
+    impl Events for Script {
         fn now(&self) -> Moment {
             let elapsed = self.elapsed.get();
             Moment { instant: self.start + elapsed, epoch: NOW + elapsed.as_secs() as i64 }
         }
 
-        fn wait(&self, inputs: &Receiver<Input>, deadline: Instant, busy: bool) -> Option<Input> {
+        fn next(&self, results: &Receiver<Input>, deadline: Instant, busy: bool) -> Option<Input> {
             if busy {
-                return Some(inputs.recv_timeout(Duration::from_secs(10)).expect("a worker never answered"));
+                return Some(results.recv_timeout(Duration::from_secs(10)).expect("a worker never answered"));
             }
-            if let Ok(input) = inputs.try_recv() {
+            if let Ok(input) = results.try_recv() {
                 return Some(input);
             }
             let step = self.steps.borrow_mut().pop_front().expect("the switcher wanted more input than the script has");
@@ -386,7 +361,7 @@ mod tests {
         let clock = Script::new(steps);
         let app = App::new(View::Inbox, Paths::under("/r".as_ref()), TimeZone::UTC, clock.now());
         let work = Arc::clone(work) as Arc<dyn Work>;
-        let result = event_loop(&mut terminal, app, work, &clock, mpsc::channel(), exit_after_draw);
+        let result = event_loop(&mut terminal, app, work, &clock, exit_after_draw);
         (result, format!("{}", terminal.backend()))
     }
 
@@ -479,8 +454,7 @@ mod tests {
         let dialog = || Screen::Snooze(SnoozeDialog::new("task-a".into(), "A".into(), presets.clone()));
         let chosen = |steps: Vec<Step>| {
             let mut terminal = Terminal::new(TestBackend::new(70, 18)).unwrap();
-            let (clock, (_, inputs)) = (Script::new(steps), mpsc::channel());
-            match alone(&mut terminal, dialog(), &TimeZone::UTC, &clock, &inputs).unwrap() {
+            match alone(&mut terminal, dialog(), &TimeZone::UTC, &Script::new(steps)).unwrap() {
                 Some(Action::Run(Job::Snooze { session, until, .. })) => Some((session, until)),
                 None => None,
                 other => panic!("{other:?}"),

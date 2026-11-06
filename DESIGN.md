@@ -739,15 +739,18 @@ The switcher and its dialogs follow these principles.
     help later) are a stack (`tui/screen.rs`): only the top one gets keys,
     so list keys never act on the task behind a dialog, and Esc closes only
     the top. A new screen is a new `Screen` variant.
-  - The loop waits on one channel: keys from a reader thread, results from
-    workers; the 2 s refresh and a message's expiry are deadlines of that
-    wait, so nothing polls. One load runs at a time, and a job's result
-    asks for a load. A worker that panics still sends a result, so a
-    refresh always ends.
-  - The key reader stops before the terminal is given back: a reader still
-    blocked on the terminal would take keys meant for the
-    `herdr session attach` that follows a switch.
-  - Time, input and work are injected (`Clock`, `Work`, the backend), so
+  - The loop waits for a key, a worker's result (over a channel) or a
+    deadline (the 2 s refresh, a message's expiry). Idle, it blocks on the
+    terminal until the deadline; while a worker runs it looks at the
+    results every 10 ms. One load runs at a time, and a job's result asks
+    for a load. A worker that panics still sends a result, so a refresh
+    always ends.
+  - Keys are read on the loop's thread, only while it waits, never by a
+    thread of their own: crossterm reads input while it polls, so a reader
+    left running after the switcher closed would take keys meant for the
+    `herdr session attach` that follows a switch, and it cannot be stopped
+    at once (joining one cost 50 ms on every exit).
+  - Time, keys and work are injected (`Events`, `Work`, the backend), so
     tests run the loop itself on ratatui's `TestBackend` with a scripted
     clock.
   - `itm snooze` without a time (R4.1) runs the snooze screen alone; Esc

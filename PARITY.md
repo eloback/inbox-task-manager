@@ -76,7 +76,7 @@ Last updated: milestone 1 (foundation).
 | R10.5 | `itm project add-workspace` (`prefix+shift+a`) | missing | | |
 | N1 | where state lives; older files read as is; `kind` dropped | partial | `paths.rs`, `store.rs` `upgrade` | `store::a_file_written_by_python_is_read_and_rewritten_as_python_would`, `store::odd_project_lists_read_as_none`, cross-check (old format rewritten the same). Missing: `config.toml` (R10.4) |
 | N2 | Linux and macOS; pip, Nix (package, overlay, home-manager module) | partial | `system.rs` | `system::every_process_table_reads_command_lines_children_and_endings`, `system::ps_output_is_read_into_command_lines`. Missing: any build or run on macOS; a Nix package for the Rust itm (the standoff's `package.nix` was not brought over) |
-| N3 | first draw fast; status from the cache; 2 s refresh keeping the highlight | done | `tui/mod.rs`, `tui/app.rs` `rebuild` | `tui::the_list_refreshes_every_two_seconds`, `tui::app::moving_skips_headers_and_a_refresh_keeps_the_highlighted_task`, `scripts/measure.sh` (2–3 ms in the standoff) |
+| N3 | first draw fast; status from the cache; 2 s refresh keeping the highlight | done | `tui/mod.rs`, `tui/app.rs` `rebuild` | `tui::the_list_refreshes_every_two_seconds`, `tui::app::moving_skips_headers_and_a_refresh_keeps_the_highlighted_task`, `scripts/measure.sh` (milestone 1, release build: first draw 1.7 ms, `list` 1.1 ms, `status` 1.3 ms, daemon 0.033% of a core and 4.2 MB; the Python itm on the same state: 55 ms, 49 ms, 0.75% and 24.7 MB) |
 | N4 | never touches sessions without the prefix | done | `tasks.rs` `adopt_sessions`, `itm.rs` | `tasks::only_prefixed_sessions_are_adopted`, `tasks::next_active_prefers_waiting_then_recent_else_default` |
 
 ## DESIGN.md section 2: rules that must stay true
