@@ -440,8 +440,7 @@ fn connect(socket: &Path, timeout: Duration, refusers: Option<&LiveRefusers>) ->
             }
             Err(Errno::AGAIN) => {}
             Err(Errno::CONNREFUSED)
-                if let Some(refusers) = refusers
-                    && *alive.get_or_insert_with(|| refusers.alive(socket)) => {}
+                if refusers.is_some_and(|refusers| *alive.get_or_insert_with(|| refusers.alive(socket))) => {}
             Err(e) => return Err(e.into()),
         }
         // The backlog is full.

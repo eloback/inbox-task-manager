@@ -320,6 +320,8 @@ pub mod tests {
     pub fn itm() -> (tempfile::TempDir, Itm) {
         // Socket paths must stay under ~108 bytes: /tmp, or the Nix build's /build.
         let base = if std::path::Path::new("/tmp").is_dir() { "/tmp".into() } else { std::env::temp_dir() };
+        // Resolved, as itm stores folders: on macOS /tmp is a link to /private/tmp (DESIGN.md section 6).
+        let base = base.canonicalize().unwrap_or(base);
         let tmp = tempfile::Builder::new().prefix("itm").tempdir_in(base).unwrap();
         let itm = Itm::under(tmp.path(), FakeProcs::default());
         (tmp, itm)

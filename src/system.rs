@@ -493,10 +493,11 @@ pub mod tests {
     #[test]
     fn ignored_signals_are_read_from_the_process_table() {
         let sigpipe = 1 << (13 - 1);
-        assert!(ignored_signals().is_some_and(|mask| mask & sigpipe != 0));
-        if Ps::run(&["-o", "sigignore=", "-p", &std::process::id().to_string()]).is_some() {
-            let ps = Ps::run(&["-o", "sigignore=", "-p", &std::process::id().to_string()]).unwrap();
-            assert!(signal_mask(&ps).is_some_and(|mask| mask & sigpipe != 0), "{ps}");
+        let ps = Ps::run(&["-o", "sigignore=", "-p", &std::process::id().to_string()]);
+        let read = ignored_signals();
+        assert!(read.is_some_and(|mask| mask & sigpipe != 0), "read {read:x?}; ps printed {ps:?}");
+        if let Some(ps) = ps {
+            assert!(signal_mask(&ps).is_some_and(|mask| mask & sigpipe != 0), "{ps:?}");
         }
         assert_eq!(signal_mask("\t0000000000001000\n"), Some(sigpipe));
         assert_eq!(signal_mask(" 1000"), Some(sigpipe), "ps pads with spaces");
