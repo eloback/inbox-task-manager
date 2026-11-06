@@ -155,7 +155,7 @@ Herdr upgrade.
   The loop reads `.next` after the child exits. Without `.next` the loop ends,
   which is a normal detach.
 - SIGHUP (the terminal closed), SIGTERM and SIGINT end the loop like a
-  detach (Rust): it detaches its attach child as a hand-off would, follows
+  detach: it detaches its attach child as a hand-off would, follows
   no `.next`, and removes its markers, instead of leaving them until a
   later check finds the pid stale.
 - The loop claims `.next` by renaming it before reading it, and never deletes
@@ -171,36 +171,39 @@ Herdr upgrade.
   A marker whose process is alive but whose command line cannot be read
   (`ps` failed) is neither a client nor stale: it is skipped, not deleted.
   Retry finding the attach child briefly, because the loop may be between
-  two attaches. The process table comes from `system.py`: `/proc` on Linux,
-  `ps -ww` elsewhere. `ps` joins the arguments with spaces, so there a
+  two attaches. The process table comes from `system.rs` (`process_table`):
+  `/proc` on Linux, `ps -ww` elsewhere. `ps` joins the arguments with spaces, so there a
   `herdr` path containing a space is not recognized as an attach child.
 - Snoozing, archiving or deleting a task moves every itm client on it to the
   next task: one with waiting agents first, then the most recently used, else
   `default`.
 - Stopping a session that may host the caller (archive, delete of the current
-  task) happens after the hand-off, from a detached process
-  (`start_new_session=True`, `/bin/sh`). The Rust itm sends `server.stop`
-  over the session's socket instead: Herdr answers before it stops (section
-  4, 2026-11-06). Deleting then has Herdr delete the session (`herdr session
+  task) happens after the hand-off, as a `server.stop` request: Herdr
+  answers before it stops, so the caller may be inside that session
+  (section 1). Deleting then has Herdr delete the session (`herdr session
   delete`, which refuses a running one and has no socket method) from a
   detached `/bin/sh` in a session of its own (`itm setsid`), which tries
-  again every 0.5 s until the server is gone (at most 15 s).
+  again every 0.5 s until the server is gone (at most 15 s). (The Python
+  itm ran `herdr session stop` and `delete` once from a detached `/bin/sh`.)
 - A popup that moved its own client away exits right away. Otherwise it stays
   open in the old session (see the popup facts above) and is still there when
   you come back.
 - Clients started with plain `herdr` cannot be switched. Say so in the error.
-- The process name is part of the protocol: `is_itm_process` accepts a
-  marker only if an argument of the process's command line contains
-  `inbox-task-manager` or `inbox_task_manager`, or is a file named `itm`
-  (the console script pip installs: `python …/bin/itm attach`). A new entry
-  point or module layout must keep one of these names, or every marker looks
-  stale and is deleted.
+- The process name is part of the protocol: `is_itm_process`
+  (`switching.rs`) accepts a marker only if an argument of the process's
+  command line contains `inbox-task-manager` or `inbox_task_manager`, or is
+  a file named `itm`: the binary (`[[bin]] name = "itm"`; the Nix wrapper
+  keeps argv[0], `…/bin/itm`), and the Python itm's console scripts
+  (`python …/bin/itm attach`), so an attach loop of the Python itm still
+  running during an upgrade is no stale marker. Renaming the binary breaks
+  this: every marker would look stale and be deleted.
 
 ### Data safety
 - Every read-modify-write of `tasks.json` happens under an exclusive `flock`
   with an atomic write (temp file, fsync, rename). Re-resolve the task inside
   the locked edit: it may have been deleted in the meantime.
-- Raising inside `Store.edit()` cancels the write. The daemon relies on this.
+- An error returned inside `Store::edit` cancels the write. The daemon
+  relies on this.
 - Never hold the store lock while waiting for the user (a prompt or a dialog):
   the daemon and every other command would block behind it.
 - A deleted task leaves a tombstone until its session is gone, so adoption of
@@ -208,21 +211,24 @@ Herdr upgrade.
 - The daemon marks a wait as notified only after the store update succeeded.
   It forgets a wait once the agent is no longer blocked, and keeps the waits
   of sessions it could not poll.
-- A missing `herdr` or `git` is an `ItmError` (`needs`), never a traceback:
-  pip installs bring neither. Only a missing program of that name is
-  caught, so other missing files still surface. `itm attach` checks for
+- A missing `herdr` or `git` is `Error::Missing` ("herdr not found;
+  install it or add it to PATH"), never a panic: `cargo install` brings
+  neither. Only a missing program of that name becomes it (`missing_herdr`,
+  `missing_git`), so other missing files still surface. `itm attach` checks for
   `herdr` before it saves anything, so a failed attach leaves no task. The
   daemon logs a repeated error once, not every pass. The switcher says
   "Herdr not answering" when the session list fails, instead of showing
   every task as not started.
-- Every Herdr query and notification call has a timeout. `herdr session
-  attach`, the detached stop/delete and the headless `herdr server` of a
-  first start run without one on purpose (the server is detached; waiting
-  for it is bounded by `SESSION_START_TIMEOUT`). One failed
-  daemon pass must never stop the daemon.
+- Every Herdr query and notification has a timeout: 1 s to connect (a
+  non-blocking connect, section 4, 2026-11-06) and 10 s for the answer.
+  `herdr session attach`, the detached delete and the headless `herdr
+  server` of a first start run without one on purpose (the server is
+  detached; waiting for it to answer is bounded by `SERVER_START`, 5 s).
+  One failed daemon pass, even one that panics, must never stop the daemon
+  (`catch_unwind` around each pass).
 - The status cache is ignored when older than 15 s. A UI must then say the
   daemon is not running instead of showing zero waiting agents.
-- Snooze times are in the future and at most 10 years away; `apply_snooze`
+- Snooze times are in the future and at most 10 years away; `Task::snooze`
   checks this for every caller (a preset can pass while a dialog is open).
 - A snooze without a timer ("until an agent needs me") must be able to end:
   it is refused for a new task and for a session that is not running or
@@ -234,9 +240,10 @@ Herdr upgrade.
 - Without a session list (Herdr not answering), nothing is adopted and no
   tombstone expires: every tombstone would look expired and a session being
   deleted would come back.
-- Short store reads (`Store.load`) on the UI thread are accepted (the daemon
-  holds the lock for milliseconds); writes, Herdr calls and hand-offs run in
-  workers.
+- Short store reads (`Store::load`) on the UI thread are accepted (the
+  daemon holds the lock for milliseconds); writes, Herdr calls, git, folder
+  listings and hand-offs run in workers. The switcher's refresh runs in a
+  worker too.
 
 ### Projects
 - Projects are keyed by a stable random id; the name is a field. Tasks store
@@ -246,27 +253,27 @@ Herdr upgrade.
   `project_id`.
 - A task has a list of project ids (`projects`); the first is where its
   session starts. A `tasks.json` with the older single `project` is
-  converted when read (`Store._read`), so every reader sees `projects`.
+  converted when read (`store.rs` `upgrade`), so every reader sees `projects`.
 - A task's session gets its project workspaces on the first start only;
   Herdr restores them afterwards. The attach loop asks Herdr whether the
   session exists (`first_start`); when it does not and the task has projects
   with folders, it starts the session headless and opens one workspace per
   project, named after the project, before attaching (`prepare_first_start`,
-  `start_with_workspaces`, section 1). This runs under a lock per session in
+  section 1). This runs under a lock per session in
   `<runtime>/starting/`, checking `first_start` again inside: two clients
   handed to the same new task must not both build it; and a session that
   turns out to have workspaces gets none. The server gets no `HERDR_*`
   variables but `HERDR_SESSION`; one that exits with an error is not waited
-  for (`SESSION_START_TIMEOUT` bounds the wait). A failure is printed and the
+  for (`SERVER_START` bounds the wait). A failure is printed and the
   attach goes on (Herdr then starts the session as usual). The server runs
   in its own session (setsid), so closing the terminal does not hang it up;
-  std can only call setsid in an `unsafe` `pre_exec`, so the Rust itm runs
-  itself as the hidden `itm setsid herdr server`, which calls setsid and
-  becomes `herdr server`, and reaps it in a thread once it was started. Projects can
-  still change at any time (`edit_task`): a session that never started will
-  start with them, a running one gets a named workspace per added project
-  (`herdr workspace create --cwd --label`, the first focused when it is the
-  caller's own task), and a stopped one keeps its workspaces. Edits report
+  std can only call setsid in an `unsafe` `pre_exec`, so itm runs itself as
+  the hidden `itm setsid herdr server`, which calls setsid and becomes
+  `herdr server`, and reaps it in a thread once it was started. Projects
+  can still change at any time (`edit_task`): a session that never started
+  will start with them, a running one gets a named workspace per added
+  project (`workspace.create` with `cwd` and `label`, the first focused when
+  it is the caller's own task), and a stopped one keeps its workspaces. Edits report
   which of these happened. The edit is saved first; the session list is read
   only afterwards and only when a project was added, so a Herdr failure
   (listing or opening a workspace) becomes a note and never undoes or blocks
@@ -280,23 +287,24 @@ Herdr upgrade.
   that names a project (even one already there) takes it out of
   `found_projects`, making it the user's. `itm project add-workspace` adds
   its project as found while sync is on (closing that workspace removes it),
-  else by hand (`edit_task(found=True)`).
-- A project is `{name, url?, path?, added_at, last_used_at}`. Its kind is
-  not stored: `project_kind` reads `git` (a URL; its `path` is always itm's
-  clone), `dir` (a folder) or `name` (neither). A repository project without
-  its clone does not exist, so duplicate repositories are still found by
-  clone path, and nothing in the daemon calls `repo_key`. `Store._read`
-  drops a stored `kind`; older itm binaries read `project["kind"]` and fail
+  else by hand (`Edit::found`).
+- A project is `{name, url?, path?, added_at, last_used_at}` (`store.rs`
+  `Project`; fields it does not know are kept). Its kind is not stored:
+  `Project::kind` reads `Git` (a URL; its `path` is always itm's clone),
+  `Dir` (a folder) or `Name` (neither). A repository project without its
+  clone does not exist, so duplicate repositories are still found by clone
+  path, and nothing in the daemon calls `repo_key`. `upgrade` drops a
+  stored `kind`; itm binaries older than this format read `kind` and fail
   on a file this version wrote, so itm is upgraded everywhere at once (the
   daemon restarted), as for the `project` → `projects` change.
-- Code never indexes `project["path"]` without knowing there is one: it
-  asks `project_folder` (None for a name), `project_where` (URL, else
-  folder, else "no folder"), or skips projects without `path`
-  (`project_roots`, `task_folders`, `project_change_messages`,
-  `deletable_clone`). The TUI keeps `Snapshot.missing`, the ids whose folder
-  is set and absent; a name-only project is never "missing" (a map from id
-  to "folder exists" read with a default of true once made the preview index
-  a name-only project's `path`).
+- A project's folder is an `Option` (`Project::folder`), so no code can use
+  one without asking whether there is one; `Paths::place` says where a
+  project is (URL, else folder, else "no folder"), and `project_roots`,
+  `task_folders`, `project_change_messages` and `deletable_clone` skip
+  projects without one. The TUI keeps `Snapshot.missing`, the ids whose
+  folder is set and absent; a name-only project is never "missing" (in the
+  Python itm, a map from id to "folder exists" read with a default of true
+  once made the preview index a name-only project's `path`).
 - A folder belongs to at most one project, nesting allowed
   (`check_project_free` on add and on `set`). `set_project_folder` (`itm
   project set`) is for projects without a repository only: a repository's
@@ -318,20 +326,21 @@ Herdr upgrade.
   the project still has none. When it cannot be given, the project is still
   named on the workspace and added to the task; in a popup, why is printed
   to stderr and kept on screen 2.5 s, like an error. A project removed while
-  the question is open ends the command with an error, not a traceback.
+  the question is open ends the command with an error, not a panic.
 - The project finder's "+ New project" row is the last row and opens the
   add dialog on its Name tab: one Enter on a typo saves nothing. Searching
   never matches "no folder" (display text).
 - Workspace sync (`poll_once`, when `projects_from_workspaces` is on): for
   each running task session the daemon reads the workspaces' folders from
-  `herdr api snapshot` (`session_workspaces`) and maps each workspace to a
-  project (`workspace_project`): a workspace named after a saved project
-  (its label is not just its folder's name, which is what an unnamed
-  workspace shows) is in that project wherever its first pane went;
+  one `session.snapshot` (`observe`, with the agents) and maps each
+  workspace to a project (`workspace_project`): a workspace named after a
+  saved project (its label is not just its folder's name, which is what an
+  unnamed workspace shows) is in that project wherever its first pane went;
   otherwise the innermost saved project holding its folder
-  (`folder_project`). Project folders are resolved once per pass
-  (`project_roots`), outside the store lock. The projects found are added
-  to the task (`sync_task_projects`) and recorded in `workspace_projects`.
+  (`folder_project`). The matching runs before the store lock is taken,
+  with the project folders resolved once per pass (`project_roots`). The
+  projects found are added to the task (`Task::sync_projects`) and
+  recorded in `workspace_projects`.
   With `remove_projects_without_workspace`, a found project that was in
   that record and is not open now is removed, but only on a trusted pass:
   not when a workspace's folder is unknown, and not for a session the
@@ -340,12 +349,8 @@ Herdr upgrade.
   An untrusted pass only adds and keeps the record, so a workspace that
   closed meanwhile is noticed on the next trusted pass. A session with no
   workspaces at all is skipped. Archived tasks are left alone. The sync
-  writes no notes (the daemon never does). The Rust daemon asks each
-  running task session once per pass, `session.snapshot`, which has the
-  agents and the workspaces' tabs, layouts and panes (`observe`); the
-  matching runs before the store lock is taken, with the projects' folders
-  resolved once per pass (`project_roots`), and `Task::sync_projects` is
-  `sync_task_projects`.
+  writes no notes (the daemon never does). When the snapshot fails, neither
+  agents nor workspaces are read for that session on that pass.
 - `workspace_projects` is only true while the daemon reads the session: the
   daemon drops it for a task whose session is not running, and for every
   task while sync is off; archiving drops it at once. Unnamed workspaces
@@ -362,11 +367,11 @@ Herdr upgrade.
   (Herdr's worktrees live under `~/.herdr/worktrees`, outside the
   project), and another checkout is in the one saved project whose
   checkout has the same `origin` remote (normalized as for duplicates,
-  R8.4); with two such projects, in neither. `repository` asks git (`rev-parse
-  --git-common-dir`, `ls-remote --get-url origin`: no network, a timeout,
-  stdin closed) and caches the answer per folder for 5 minutes in the
-  process, so the daemon's pass does not run git every 2 s. Missing git
-  means no repository.
+  R8.4); with two such projects, in neither. `Git::repository` asks git
+  (`rev-parse --git-common-dir`, `ls-remote --get-url origin`: no network, a
+  timeout, stdin closed) and `Repositories` caches the answer per folder
+  for 5 minutes in the process, so the daemon's pass does not run git
+  every 2 s. Missing git means no repository.
 - Only saved projects are matched. The home folder, where tasks without
   projects start, is in no project unless it is itself saved; a project
   inside it does not claim it (a test keeps this true).
@@ -376,7 +381,8 @@ Herdr upgrade.
   would add it back. Closing the workspace is the user's call. The form
   shows this before saving for a running session.
 - `itm project add-workspace` refuses the home folder, a folder above it
-  and `task_dir()`: saved, such a folder would hold every workspace under
+  and the folder tasks without projects start in (`paths.task_dir`,
+  `ITM_TASK_DIR`): saved, such a folder would hold every workspace under
   it and sync would add it to every task. `itm project add dir` still
   saves them. It finds the workspace from `HERDR_ACTIVE_WORKSPACE_ID` (a
   popup), else the focused one, never a pane's `HERDR_WORKSPACE_ID`, which
@@ -393,23 +399,22 @@ Herdr upgrade.
   as a folder project.
 - A clone goes to a hidden folder next to its target and is renamed into
   place. A failed or interrupted clone removes the hidden folder and the
-  empty host/owner folders it created. `exit_on_signals` turns SIGHUP (popup
-  closed), SIGTERM and SIGINT into a clean exit for this, and ignores further
-  signals while cleaning up. Signals already ignored when the clone starts
-  (`nohup`) stay ignored. In Rust, `ExitSignals` catches them (signal-hook)
-  until the cleanup is done, and then lets them end itm again (signal-hook
-  alone would leave them ignored once its last action goes); git gets
-  SIGTERM, then SIGKILL after 10 s, and itm exits with 128 + the signal
-  (`Error::Exit`). Which signals are ignored
-  is read from `/proc/self/status` (`SigIgn`), else `ps -o sigignore=`: no
-  safe call asks for a signal's disposition.
-- Python installs signal handlers only in the main thread. A TUI must not
-  call `clone_repo` from a worker thread; it runs
-  `inbox-task-manager project add …` as a child process, which keeps the
-  cleanup above. The Rust TUI runs the same child (`Itm::clone_child`:
-  `ITM_SELF`, else the running binary, through `itm setsid`; `--name=<name>
-  -- <url>`, so a name or URL starting with "-" is no option), from a
-  worker (`tui/clones.rs`, section 4). That child:
+  empty host/owner folders it created. SIGHUP (popup closed), SIGTERM and
+  SIGINT become a clean exit for this: `ExitSignals` (`system.rs`) catches
+  them (signal-hook) until the cleanup is done, ignoring further ones
+  meanwhile, and then lets them end itm again (signal-hook alone would
+  leave them ignored once its last action goes); git gets SIGTERM, then
+  SIGKILL after 10 s, and itm exits with 128 + the signal (`Error::Exit`).
+  Signals already ignored when the clone starts (`nohup`) stay ignored;
+  which ones are is read from `/proc/self/status` (`SigIgn`), else `ps -o
+  sigignore=`: no safe call asks for a signal's disposition.
+- A TUI does not clone in its own process: the clone must have no
+  controlling terminal (a password or host-key prompt would draw over the
+  TUI or hang it), and its cleanup on signals belongs to the process that
+  made the hidden folder. It runs a child `itm project add git` instead
+  (`Itm::clone_child`: `ITM_SELF`, else the running binary, through `itm
+  setsid`; `--name=<name> -- <url>`, so a name or URL starting with "-" is
+  no option), from a worker (`tui/clones.rs`, section 4). That child:
   - gets `git clone --progress` (git prints no progress when its output is
     captured);
   - must not prompt: `stdin` closed, `GIT_TERMINAL_PROMPT=0`, ssh in batch
@@ -418,8 +423,8 @@ Herdr upgrade.
     a message to run `itm project add` in a terminal;
   - runs without `ITM_POPUP` (which would delay every error by 2.5 s);
   - is started with SIGTERM not ignored, since an already ignored signal
-    stays ignored during the clone and cancel would then not stop it (Rust:
-    `itm setsid` catches SIGTERM before it execs, which exec resets to the
+    stays ignored during the clone and cancel would then not stop it (`itm
+    setsid` catches SIGTERM before it execs, which exec resets to the
     default; std cannot reset a signal without `unsafe`);
   - is stopped with SIGTERM on cancel and whenever the TUI exits, because in
     its own session it no longer gets the popup's SIGHUP.
@@ -447,10 +452,10 @@ Herdr upgrade.
   store lock. A failure to write them never fails or undoes the task change:
   creating ignores it (the notes start later), an edit reports it.
 - Notes are started by writing a temp file in full and hard-linking it into
-  place (`os.link` fails if notes exist), so racing writers start them once,
-  existing notes are never overwritten, and an append never lands before the
-  header. Without hard links (some FUSE or network filesystems) it falls
-  back to an exclusive create (`open(path, "x")`). An edit of a task
+  place (`fs::hard_link` fails if notes exist), so racing writers start
+  them once, existing notes are never overwritten, and an append never
+  lands before the header. Without hard links (some FUSE or network
+  filesystems) it falls back to an exclusive create (`create_new`). An edit of a task
   without notes starts them from the task as it was before the edit, then
   appends. Appends are one write each in append mode.
 - Only real changes are appended (stripped values compared): title,
@@ -459,38 +464,35 @@ Herdr upgrade.
   entry (nvim warns that the file changed). Accepted.
 
 ### Settings
-- `config.toml` is read on every use (`load_config`): the daemon every pass,
+- `config.toml` is read on every use (`Itm::settings`): the daemon every pass,
   so a toggle in the switcher applies without a restart. A missing file is
   the defaults. Unknown settings and values that are not booleans are
   errors, so a typo does not silently do nothing.
-- `set_config` changes one `key = value` line in its section (or adds it),
-  keeps everything else, and checks that the result parses with the new
-  value before writing (atomically). A file it cannot follow (dotted keys,
-  inline tables) is refused with "edit it by hand" and left unchanged.
-  The Rust itm (`config.rs`, `change_setting`) edits the TOML document
-  instead (toml_edit): comments stay, the one after the changed value too
+- `change_setting` (`config.rs`) edits the TOML document (toml_edit) and
+  writes it atomically: comments stay, the one after the changed value too
   (its decor is copied onto the new value), a new key goes after the last
   one of its table, and a missing `[herdr]` table goes after the file's
-  comments and one blank line, as the Python itm writes it. It follows
-  quoted keys, dotted keys and inline tables, which Python refuses. It
-  still checks that the result reads back with the new value, and refuses
-  with "edit it by hand" otherwise (a file with a mistake in it, a key that
-  is a table). A TOML syntax error is said on one line ("… is not valid
-  TOML: <what> (at line L, column C)").
+  comments and one blank line. It follows quoted keys, dotted keys and
+  inline tables (the Python itm changed one `key = value` line and refused
+  those). It checks that the result reads back with the new value before
+  writing, and refuses with "edit it by hand" otherwise (a file with a
+  mistake in it, a key that is a table), leaving the file unchanged. A TOML
+  syntax error is said on one line ("… is not valid TOML: <what> (at line
+  L, column C)").
 - A broken file (also one that is not UTF-8) never stops the daemon: it
   logs it once and runs without workspace sync (the safe choice: nothing is
   added or removed) until the file is fixed. Everything else treats it as
   off too (`follows_workspaces`); the Settings screen and the edit form show
   the error.
-- `set_config` holds `.config.lock` next to the file, writes through a
+- `change_setting` holds `.config.lock` next to the file, writes through a
   symlink to its target (home-manager, stow), and turns a failed write into
-  an `ItmError`; the Settings screen saves one toggle at a time and shows
-  any failure.
+  an error; the Settings screen saves one toggle at a time and shows any
+  failure.
 
 ### Notifications
 - Herdr's own toasts cover the attached session; the daemon notifies only for
   other sessions. Delivery order: Herdr toast in an attached session, else a
-  desktop notification (`system.notify_command`): `$ITM_NOTIFY_COMMAND` with
+  desktop notification (`system::notify_command`): `$ITM_NOTIFY_COMMAND` with
   the title and body as arguments, else `osascript` on macOS (the text goes
   in as arguments, never into the script), else `notify-send`. Only
   `notify-send` offers the Open action. With none of them the daemon logs
@@ -541,82 +543,13 @@ The switcher and its dialogs follow these principles.
     `herdr session list --json`, takes about 2 ms.
   - All keys listed in section 1 arrive.
   - The closure grows by about 27 MiB.
-- **Rules for the TUI** (the Python switcher's; the Rust switcher keeps
-  them in its own terms, see 2026-11-06):
-  - Only the TUI imports Textual, lazily. The CLI and the daemon stay
-    standard-library only, so they start in milliseconds and the daemon stays
-    small.
-  - Keys that act on the task list must be inactive whenever a dialog or
-    another screen is on top: put them on the main screen, or disable them
-    in `check_action`. Enter, Ctrl+A or arrows in a dialog once opened or
-    archived the task behind it. Test every dialog and screen with
-    `App.run_test()`.
-  - Calls that can block (Herdr calls, the store lock, `handoff`, which waits
-    up to 2 s) run in a worker, never on the event loop.
-  - A periodic refresh keeps the highlighted task by its id, and writes the
-    store only when there is a session to adopt or a tombstone to expire.
-  - Switching happens after the app has exited (`App.exit(("switch", name))`
-    and the CLI calls `switch_to`), so the attach loop gets the terminal back
-    and a hand-off never runs on the event loop.
-  - Actions that move the TUI's own client away (snooze, archive, delete of
-    the current task) exit the app afterwards.
-  - Ctrl+A is both archive and a common Herdr prefix (`prefix = "ctrl+a"`;
-    Herdr's default is Ctrl+B), so archiving a task whose session runs asks
-    first; a stray key after the prefix does nothing.
-  - A clone runs as an asyncio child process in its own session; the app
-    resets an ignored SIGTERM before starting (an ignored signal stays ignored
-    during a clone), stops children on Esc, on exit, on SIGHUP and at exit.
-  - User text reaches markup only through `$variables` (titles may contain
-    `[`).
-  - Textual drops any binding for a key the focused `Input` would type. A
-    printable key (like `?` for help) works only if the input declines it
-    (`SearchInput.check_consume_key`), which it does only while empty.
-  - Folder listings for completion (`FolderLister`) are read in daemon
-    threads, once per folder while a dialog is open, and filtered in memory
-    on every key. Not `asyncio.to_thread` or thread workers: a scan blocked
-    on NFS, autofs or a cold /nix/store would hold asyncio's executor (store
-    loads and core calls stop) and `asyncio.run` waits for it when the app
-    exits, so Esc or a switch would hang. A listing that arrives late
-    triggers a rebuild from what is typed then, or nothing once the dialog
-    closed. While a folder is being read the list is empty, so Enter and Tab
-    never act on rows left from earlier text. Symlinked folders are resolved
-    in the reading thread, so a saved folder reached through a link is found.
-  - Fuzzy matching is `core.fuzzy_match` (standard library, linear time),
-    for projects and folders alike. Textual's `FuzzySearch` takes seconds on
-    long names with repeated letters, and `Matcher.highlight` parses the
-    candidate as markup.
-  - Ghost text (`Input.suggester`) must start with exactly what was typed:
-    Input draws `suggestion[len(value):]` and → replaces the value with it.
-    The default `Suggester` casefolds and caches; the folder suggester does
-    neither, offers nothing after a trailing "/" (Tab would otherwise keep
-    going down into the first subfolder), and checks again after waiting for a
-    listing. A kind switch clears the ghost by posting `SuggestionReady`
-    with an empty suggestion (Textual 8.2.6).
-  - An input opened by a typed key needs `select_on_focus=False`, or the next
-    key replaces the first. Keys that reach the project field before its
-    picker is up go into that picker (`ProjectField.picker`), never into a
-    second one; a paste opens it too.
-  - A screen callback must not return `dismiss()`'s awaitable (a `lambda`
-    that does): Textual awaits what a callback returns, and awaiting a
-    dismiss from that screen's own handler raises `ScreenError`.
-  - The editor for notes (Ctrl+O) is the one blocking call on the event
-    loop: the app is suspended (`App.suspend()`) and draws nothing while the
-    editor owns the terminal. No lock is held around it. `App.suspend` does
-    not resume when an exception leaves its block, so everything inside is
-    caught, `KeyboardInterrupt` too (Ctrl+C reaches itm when the editor,
-    like `code -w`, leaves the terminal alone); the headless test driver
-    raises `SuspendNotSupported`. Reading the end of a notes file for the
-    preview on the UI thread is accepted, like `Store.load`.
-- **Layout as built.** Core, CLI and daemon stay in one module,
-  `inbox_task_manager/__init__.py`; the screens are
-  `inbox_task_manager/tui.py`, and operating-system differences
-  `inbox_task_manager/system.py` (see the portability decision below).
-  Splitting core further was considered, but the tests patch functions on
-  the core module, and a split would make those patches miss callers in
-  other modules.
-  The TUI calls core only as `core.<name>` for the same reason. The lazy
-  import helper is `screens()`: a function named `tui` would shadow the
-  submodule in `from inbox_task_manager import tui`.
+- **Superseded** by the Rust switcher (2026-11-06, ratatui): its rules for
+  the TUI are there, and say where they come from. Textual's own rules
+  (lazy imports, `check_action`, `App.run_test()`, `$variables` in markup,
+  `check_consume_key`, `select_on_focus`, awaiting `dismiss()`,
+  `App.suspend()`) and the Python layout (core, CLI and daemon in
+  `inbox_task_manager/__init__.py`, the screens in `tui.py`, the OS layer
+  in `system.py`) went with the Python itm.
 - **Popup sizes** (`contrib/herdr-keys.toml`): switcher 80% × 80%, task form 70% × 26
   rows, snooze 60% × 18, notes 80% × 80%, workspace as project 70% × 18 (the
   add dialog), jump and last 60% × 4 (only an error is ever shown).
@@ -643,27 +576,26 @@ The switcher and its dialogs follow these principles.
 ### 2026-11-05: portability beyond Linux
 - **Why.** itm first assumed Linux and Nix: `/proc`, `notify-send`, GNU
   `date -d`, `bash`, and a Nix wrapper that put every tool on `PATH`.
-- **`system.py`** holds what differs between operating systems: the process
-  table (`process_argv`, `child_processes`), the runtime folder, the
-  notification command and finding a `date` that reads `-d`. Standard
-  library only. `ps` gets one `-o` per column: FreeBSD reads everything
-  after the first `=` of an `-o` list as the header. The core keeps its
-  functions (`is_itm_process`, `attach_children`, `runtime_dir`,
-  `desktop_notify`), so tests that patch them still reach every caller; only
-  the OS calls moved.
-- **Snooze phrases.** `_day_and_clock` reads clock times (`14:30`, `5pm`),
+- **`system.rs`** (in the Python itm, `system.py`) holds what differs
+  between operating systems: the process table (`Processes`: `/proc`, else
+  `ps`), notification commands and finding a `date` that reads `-d`; the
+  runtime folder is `paths.rs`. `ps` gets one `-o` per column: FreeBSD
+  reads everything after the first `=` of an `-o` list as the header. Which
+  one runs is chosen at run time, not compile time, so every path is built
+  and tested on Linux too (section 4, 2026-11-06).
+- **Snooze phrases.** `snooze.rs` (`day_and_clock`) reads clock times (`14:30`, `5pm`),
   `today`, `tomorrow`, weekdays, `next <weekday>` and ISO dates the way GNU
   `date -d` does (a weekday is today when it matches; a day without a clock
   starts at midnight, except `tomorrow`, which keeps the time of day). A
   clock alone rolls over to tomorrow once it passed, as `14:30` always did.
   Anything else still goes to a `date` that reads `-d` (GNU's, `gdate` on
-  macOS, or uutils'), found by trying a relative phrase
-  (`1970-01-01 +1 day`) rather than by its version text: BusyBox `date`
-  reads only absolute times.
-- **Packaging.** `pyproject.toml` installs `inbox-task-manager` and `itm`
-  with pip, pipx or uv. The flake has the package (`nix/package.nix`), an
-  overlay, a home-manager module (`nix/home-module.nix`: the package and the
-  daemon as a systemd or launchd user service) and checks that run the tests.
+  macOS, or uutils'; `system::date_reads`), found by trying a relative
+  phrase (`1970-01-01 +1 day`) rather than by its version text: BusyBox
+  `date` reads only absolute times.
+- **Packaging** (now section 7). The flake has the package
+  (`nix/package.nix`), an overlay, a home-manager module
+  (`nix/home-module.nix`: the package and the daemon as a systemd or
+  launchd user service) and checks that run the tests.
   Service managers do not read the shell profile, so the module gives the
   daemon a `PATH` that starts with the user's profile (their herdr wins) and
   the `XDG_CONFIG_HOME` (Herdr's sockets), `XDG_STATE_HOME` and
@@ -752,7 +684,7 @@ The switcher and its dialogs follow these principles.
   and write the same files byte for byte, so either can run on the other's
   state; `scripts/cross-check.sh` checks it. `PARITY.md` lists every
   requirement and every rule of section 2 with its status in Rust, where it
-  lives and the test that pins it.
+  lives and the test that pins it. (The cutover, below, ended this.)
 - **Herdr over its socket API.** Every query and change goes to the
   session's socket (one JSON line each way per connection, documented with a
   JSON Schema by `herdr api schema`), 10–20 times faster than the CLI and
@@ -808,14 +740,25 @@ The switcher and its dialogs follow these principles.
     `Cargo.lock` to releases at least two weeks old (winnow 1.0.4,
     toml_writer 1.1.3, toml_datetime 1.1.2), not the newest;
   - insta (tests only): screen snapshots on ratatui's `TestBackend`.
-- **The switcher in Rust** keeps the Textual rules (2026-11-04 above,
-  which the Python switcher follows) in its own terms:
+- **Rules for the TUI** (the switcher and every screen; they replace the
+  Textual switcher's rules of 2026-11-04, and keep what those were for):
   - The app (`tui/app.rs`) holds state and turns keys into actions with no
     I/O and no clock; the event loop (`tui/mod.rs`) says what time it is,
     draws, and runs anything that can block (Herdr, the store lock, git, a
-    hand-off, a folder listing) in a thread of its own. There is nothing to
-    import lazily: the TUI is part of the one binary and costs nothing
-    until it runs.
+    hand-off, which waits up to 2 s, a folder listing) in a thread of its
+    own, never on the loop. There is nothing to import lazily: the TUI is
+    part of the one binary and costs nothing until it runs.
+  - A periodic refresh (every 2 s) keeps the highlighted task by its id,
+    and writes the store only when there is a session to adopt or a
+    tombstone to expire (`Work::load`).
+  - Switching happens after the switcher has closed (`tui::run` returns the
+    session, and the CLI calls `switch_to`), so the attach loop gets the
+    terminal back and a hand-off never runs on the loop.
+  - Actions that move the switcher's own client away (snooze, archive,
+    delete of the current task) close it afterwards (`App::done`).
+  - Ctrl+A is both archive and a common Herdr prefix (`prefix = "ctrl+a"`;
+    Herdr's default is Ctrl+B), so archiving a task whose session runs asks
+    first; a stray key after the prefix does nothing.
   - Screens over the list (dialogs, the New task and edit form, its project
     finder, the add, rename and remove dialogs, Projects, Settings, help)
     are a stack (`tui/screen.rs`): only the top one gets keys, so list keys
@@ -825,9 +768,7 @@ The switcher and its dialogs follow these principles.
     opens another over itself (`Open`); a screen that closes with an action
     (`CloseAnd`: the finder's projects, the add dialog's new project, a
     question's answer) hands it to the screen below (`Screen::returned`),
-    like a Textual dismiss callback, and with none below the switcher acts
-    on it. Nothing awaits a callback, so Textual's rule about returning
-    `dismiss()` has no counterpart.
+    like a dialog's result, and with none below the switcher acts on it.
   - A job's result goes to the screen that asked for it (`Screen::takes`):
     the add dialog's saves, checks and clones, the Settings screen's
     toggles, the Projects screen's renames and removals. When the user went
@@ -857,19 +798,21 @@ The switcher and its dialogs follow these principles.
     `herdr session attach` that follows a switch, and it cannot be stopped
     at once (joining one cost 50 ms on every exit). Keys are handled one at
     a time, in order, so a key that opens the finder (typed on the form's
-    project field) is followed by the next key in the finder: Textual's
-    rules about keys that arrive before a picker is up, and about
-    `select_on_focus`, have no counterpart. A paste (bracketed paste) is
+    project field) is followed by the next key in the finder, and no key
+    reaches a picker before it is up (which the Textual switcher had to
+    guard against). A paste (bracketed paste) is
     fed as keys, its whitespace (newlines too) one space each, so a pasted
     URL opens the finder like typing does and never presses Enter; the
     form's description, the one field with several lines, takes it as it is.
   - The main list's keys are matched before the search box gets a key,
     except `?`, which opens the help only while the search is empty and is
-    typed otherwise (Textual's `check_consume_key` rule). F1 opens it
+    typed otherwise. F1 opens it
     always. The footer shows seven keys (`?` among them); the help lists
     the rest (Ctrl+U, Ctrl+A, Ctrl+D, Ctrl+O, Ctrl+S, Alt+1…9, Esc).
   - Text is drawn as ratatui spans, never parsed as markup, so a title or
-    project name with `[` styles nothing (Textual's `$variables` rule).
+    project name with `[` styles nothing. Colors are the terminal's named
+    ANSI colors (`tui/draw.rs`), so the switcher follows the terminal's
+    (and Herdr's) theme; the Textual switcher's `ITM_THEME` is gone.
   - Time, keys and work are injected (`Events`, `Work`, the backend), so
     tests run the loop itself on ratatui's `TestBackend` with a scripted
     clock, folder listings read in real threads, and clones as real child
@@ -890,15 +833,15 @@ The switcher and its dialogs follow these principles.
     typed for "Other time…"); Enter in the title (or a time) saves, Ctrl+S
     saves from any field, and Esc asks first when something was typed (for
     an edit: also when the projects changed). The description is a
-    ratatui-textarea (Enter adds a line, Tab moves on). Textual's snooze
-    `Select` became a field whose choice ←/→ change; typing on it picks
-    "Other time…" and types the time there. Below the fields the form says
+    ratatui-textarea (Enter adds a line, Tab moves on). The snooze (a
+    drop-down `Select` in Textual) is a field whose choice ←/→ change;
+    typing on it picks "Other time…" and types the time there. Below the fields the form says
     what saving does, worked out from the projects' folders as the last
     refresh saw them (`Saved`: which folders are missing, and each saved
     folder resolved).
   - The project finder (`tui/finder.rs`) and the add dialog (`tui/add.rs`)
-    complete folders as Textual's `FolderLister` and `FolderSuggester` did
-    (`tui/completion.rs`): each screen keeps the listings it asked for
+    complete folders (`tui/completion.rs`) as the Textual switcher's
+    `FolderLister` and `FolderSuggester` did: each screen keeps the listings it asked for
     while it is open, each folder read once in a plain thread that is never
     joined (a scan blocked on NFS, autofs or a cold /nix/store holds up
     neither the loop nor the exit), and filters them in memory on every
@@ -984,6 +927,68 @@ The switcher and its dialogs follow these principles.
   next to the code; `tests/switching.rs` runs the switching protocol with
   real processes and signals.
 
+### 2026-11-06: the Rust itm replaces the Python itm (the cutover)
+- **Why.** The Go-versus-Rust standoff (an MVP of the core in each, from
+  one brief, the Python itm as the incumbent; three reviewers scoring
+  maintainability 40%, focus 30% and potential 30%) gave Rust 7.95, Go
+  7.25 and Python 6.35, and every reviewer ranked Rust first and Python
+  last. Their reasons for Rust: a typed domain (task states, `Until {Time,
+  Agent}`, `Option` for folders, which turns the optional-folder rules of
+  section 2 into compile errors), designed test seams (the `Itm` context,
+  the `Processes` trait, the daemon split into `observe` and a pure
+  `poll_once`, the switcher as a pure state machine with snapshot tests),
+  byte-for-byte compatibility with the Python itm's files (it alone
+  tracked the format change made during the standoff), and speed where
+  users feel it. Against Python: a 3,034-line core that its 244
+  `mock.patch` sites kept from being split, untyped dicts, no type checker
+  or linter, and Textual's import as a floor under the switcher's first
+  frame. Go read best and built fastest, but rewrote Python's state in the
+  old format. Their advice, followed: an incremental rewrite with the
+  Python itm as the reference until parity (2026-11-06 above), then this.
+- **Measured** (the standoff's method, `scripts/measure.sh`: a sandbox with
+  5 tasks, 3 with running headless sessions, one with a blocked fake agent;
+  `itm list` and `itm status` the median of 20 runs; the switcher's first
+  frame with the tasks the median of 10 runs of `itm ui` with
+  `ITM_EXIT_AFTER_DRAW=1` in a 120×40 tmux pane; the daemon's CPU, its own
+  and its children's from `/proc/<pid>/stat`, and peak RSS over 60 s;
+  release build, Herdr 0.9.3, on the same machine):
+
+  |                       | `itm list` | `itm status` | first draw | daemon CPU | daemon RSS |
+  |-----------------------|-----------:|-------------:|-----------:|-----------:|-----------:|
+  | Python 0.2.0          | 52.3 ms    | 60.0 ms      | ≈175 ms*   | 0.78%      | 24.5 MB    |
+  | Rust MVP (standoff)   | 1.0–1.4 ms | 1.1 ms       | 2.2–2.5 ms | 0.033%     | 4 MB       |
+  | Rust at the cutover   | 1.31 ms    | 1.61 ms      | 2.64 ms    | 0.050%     | 5.1 MB     |
+
+  \* The Python switcher has no `ITM_EXIT_AFTER_DRAW`; 175 ms is the
+  standoff's measurement of its first frame with tasks, on the user's
+  machine with real data (Python start 17 ms, Textual import about 105 ms). The full product costs the Rust itm
+  little over the MVP: the binary is 3.7 MB, `itm status` reads the same
+  cache, and the daemon's extra work is one `session.snapshot` per running
+  session per pass (workspaces as well as agents) and the settings file.
+- **Size.** Rust: 10,380 lines of product and 7,110 of tests (281 unit
+  tests, 14 real-process tests in `tests/switching.rs`, 21 screen
+  snapshots), 14 direct dependencies (138 crates in `Cargo.lock`); a
+  release build of the crate takes about 45 s (LTO, one codegen unit),
+  more from clean. Python 0.2.0: 5,594 lines of product and 3,997 of tests
+  (280 tests), one dependency (Textual).
+- **What changed at the cutover.** The Python package, its tests and
+  `pyproject.toml` left the tree (commit cb07b9d has them); the Nix
+  package, the flake's checks and CI build the crate (section 7); the
+  version went to 0.3.0, after the Python 0.2.0; `PARITY.md` lists every
+  requirement and rule with its status, where it lives and the test that
+  pins it. The cross-check still runs a pinned build of the Python itm
+  (section 6), and the smoke run passes against Herdr 0.9.3 and 0.9.5.
+- **Deliberate differences** from the Python itm are listed in
+  `PARITY.md` ("Known differences"); the ones a user sees: one command,
+  `itm` (no `inbox-task-manager`); no `ITM_THEME` (the terminal's
+  colors); the Settings screen edits dotted keys and inline tables;
+  errors from the system read as Rust words them; the form's snooze is a
+  field, not a drop-down; no mouse.
+- **Not done.** No macOS build has linked or run (CI's macOS job is
+  written; the code type-checks for macOS and FreeBSD, section 6), the
+  BSDs are untested, and the oldest Rust it claims (1.89) is checked only
+  by CI.
+
 ## 5. Known gaps
 
 - **Agent titles.** The text shown for an agent is its terminal title (for
@@ -992,13 +997,13 @@ The switcher and its dialogs follow these principles.
   recently attached client, whichever session it is in.
 - **Short terminals.** The fixed 26-row form popup has not been tried on a
   terminal shorter than that.
-- **Workspace folder after a pane swap.** `session_workspaces` takes the
-  first pane in layout order; whether Herdr's identity pane follows a
+- **Workspace folder after a pane swap.** `Layout::workspaces` (`herdr.rs`)
+  takes the first pane in layout order; whether Herdr's identity pane follows a
   `pane swap` (position) or keeps the pane (its root) was not checked.
 - **First start, end to end.** The headless start with several named
   workspaces was checked by hand against Herdr 0.9.3 (attach adds none); the
-  attach loop's use of it is covered by unit tests only. While it runs (up
-  to `SESSION_START_TIMEOUT`), the loop's marker already names the new task
+  attach loop's use of it is covered by unit tests and the smoke run. While
+  it runs (up to `SERVER_START`), the loop's marker already names the new task
   but no attach child exists, so a hand-off in that window (which waits
   2 s) is dropped.
 - **Repositories by remote** compare `origin` only; a checkout whose
@@ -1009,9 +1014,29 @@ The switcher and its dialogs follow these principles.
   are assumed to arrive the same way.
 - **Ignored signals on macOS and the BSDs** come from `ps -o sigignore=`,
   which was run on Linux's `ps` only.
-- **macOS and the BSDs.** The `ps` paths, `osascript` and the launchd agent
-  are covered by unit tests and CI, not by end-to-end runs with Herdr. The
-  BSDs are untested. The Rust itm has not been built on macOS at all.
+- **macOS and the BSDs.** The `ps` paths and `osascript` are covered by
+  unit tests run on Linux, not by end-to-end runs with Herdr. itm
+  type-checks and passes clippy for `aarch64-apple-darwin` and
+  `x86_64-unknown-freebsd` (section 6), but it has not been linked or run
+  on either: CI's macOS job (build and tests) and the launchd agent are
+  written and have not run yet. The BSDs are untested.
+- **The Rust switcher's loop** wakes every 100 ms while a clone runs, to look
+  for signals, and redraws each time; while a worker runs it looks at the
+  results every 10 ms. Neither is measurable in the daemon's or the
+  switcher's numbers (section 4), but an idle switcher with a clone running
+  is not idle.
+- **Help scroll.** The help screen learns how far it can scroll when it is
+  drawn (a `Cell` set while drawing), so before its first draw ↓ may go up
+  to the number of lines.
+- **The attach loop's signals.** On SIGHUP, SIGTERM or SIGINT between two
+  attaches, the loop's signal thread looks for an attach child to detach
+  for up to 2 s (20 times, 0.1 s apart, as a hand-off does), and the loop
+  waits for it before it ends.
+- **`Itm.repositories`** (the 5-minute cache of which repository a folder
+  is in) is never pruned; the daemon keeps one entry per workspace folder
+  it has seen.
+- **`Error::Other`** carries every error callers do not tell apart, as a
+  sentence; matching on its text would be a bug.
 - **Open action on macOS.** `osascript` notifications cannot run an action,
   so the Open action exists only with `notify-send`.
 - **Socket path length on macOS.** Herdr puts a session's sockets in
@@ -1024,22 +1049,30 @@ The switcher and its dialogs follow these principles.
 
 ## 6. Testing
 
-- Tests: `python3 -m unittest discover -s tests` (with Textual installed, or
-  in `nix develop`); the Nix build runs them too (`installCheckPhase`), and
-  CI runs them on Linux and macOS. Fixtures resolve their temp folder:
-  macOS temp folders sit behind a symlink (`/private`) and itm stores
-  resolved paths.
-  `test_inbox_task_manager.py` for core, CLI and daemon, `test_notes.py` for
-  notes and folder completion, `test_system.py` for the OS layer (both
-  process-table readers run where they exist: `/proc`, and `ps` when it
-  takes BSD-style options, which BusyBox's does not),
-  missing programs and the snooze phrases itm reads itself,
-  `test_tui.py` for the screens with `App.run_test()` against a temporary
-  home. Every fixture sets `XDG_CONFIG_HOME` to its temporary folder too, so
-  no test reads or writes the real `config.toml`. Clones are tested with a fake child (`self_command` patched to a small
-  script), including cancel and a failure that needs a password.
-- In `buildPythonApplication`, `doCheck = true` is what runs
-  `installCheckPhase`; `doInstallCheck` alone is overridden.
+- Tests: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`
+  and `cargo test` must pass at every commit (`nix develop` has the
+  toolchain; `nix flake check` runs all three in Nix's build sandbox, and
+  CI on Linux and macOS, section 7). Unit tests sit at the end of each
+  module (`#[cfg(test)] mod tests`) and need no Herdr: a fake session is a
+  unix socket answering canned JSON (`herdr::fake`), the process table a
+  `FakeProcs`, the folders a temporary root (`Itm::under`: every folder of
+  itm's under it, the settings too, so no test reads or writes the real
+  `config.toml`). Tests never change the test process's environment
+  (tests run in parallel threads): what varies is injected. Both
+  process-table readers run where they exist (`/proc`, and `ps` when it
+  takes BSD-style options). Screens are drawn on ratatui's `TestBackend`,
+  some pinned as insta snapshots in `src/tui/snapshots/` (`INSTA_UPDATE=always
+  cargo test` rewrites them after an intended change; review the diff). A
+  test that pins a requirement names it (`R4.1` in its name or a comment).
+  The Python itm's tests (`tests/*.py` until the cutover) were the most
+  precise spec; their cases were ported as Rust tests (`PARITY.md`).
+- Other systems are type-checked on Linux, every `cfg` path compiled
+  without linking or running, with the standard library built for the
+  target from nixpkgs' `rustPlatform.rustLibSrc` (the variable is cargo's
+  own, for its tests):
+  `RUSTC_BOOTSTRAP=1 __CARGO_TESTS_ONLY_SRC_ROOT=<rust-lib-src> cargo clippy
+  --target aarch64-apple-darwin -Zbuild-std=std,panic_abort --all-targets
+  -- -D warnings` (and `x86_64-unknown-freebsd`).
 - Manual end-to-end checks run in a sandbox, never against real sessions:
   - separate `XDG_CONFIG_HOME` (short path: symlink it under
     `$XDG_RUNTIME_DIR`, see the socket path limit), `XDG_STATE_HOME` and
@@ -1065,17 +1098,6 @@ The switcher and its dialogs follow these principles.
   process whose environment names the sandbox (`ITM_SANDBOX`, which a
   sandboxed Herdr passes on to its popups; `smoke.sh` `sandbox_pids`).
 - Non-trivial changes get a review before they are merged.
-- **The Rust itm.** `cargo fmt --check`, `cargo clippy --all-targets -- -D
-  warnings` and `cargo test` must pass at every commit. Unit tests sit at the
-  end of each module (`#[cfg(test)] mod tests`) and need no Herdr: a fake
-  session is a unix socket answering canned JSON (`herdr::fake`), the
-  process table a `FakeProcs`, the folders a temporary root (`Itm::under`).
-  Tests never change the test process's environment (tests run in parallel
-  threads): what varies is injected. Screens are drawn on ratatui's
-  `TestBackend`, some pinned as insta snapshots in `src/tui/snapshots/`
-  (`INSTA_UPDATE=always cargo test` rewrites them after an intended change;
-  review the diff). A test that pins a requirement names it (`R4.1` in its
-  name or a comment).
 - `tests/switching.rs` checks the switching protocol with real processes
   and signals: the built `itm`, and the test binary itself playing `herdr`
   (symlinked under that name: an attached client that a signal detaches,
@@ -1094,13 +1116,16 @@ The switcher and its dialogs follow these principles.
   `scripts/measure.sh`, both run through
   `scripts/sandbox.sh <name>` (no `HERDR_*` variables, private XDG folders
   under `/tmp/itm-<name>`, notifications to a log).
-- `scripts/cross-check.sh` runs the Python itm (the reference; a pinned
-  build) and the Rust itm on shared state in a sandbox: the same commands
+- `scripts/cross-check.sh` runs the Python itm (the reference: 0.2.0, the
+  Rust rewrite's base, built from that commit's flake as the script's
+  header says) and the Rust itm on shared state in a sandbox: the same commands
   write the same `tasks.json` byte for byte (timestamps masked) and print
   the same output and errors; each lists the other's state as the other
   does; an edit of the other's file (the old single-project format too)
-  changes nothing it should not; a Rust edit waits for the lock. Each
-  milestone adds its commands to it. Its git projects run the Python
+  changes nothing it should not; a Rust edit waits for the lock. A change
+  that touches the files both read adds its commands to it, so the Rust
+  itm keeps reading and writing what 0.2.0 does (a user may still run
+  both during an upgrade). Its git projects run the Python
   build's inner entry point (`.itm-wrapped`: the wrapper puts its own git
   first on `PATH`) with a git whose clone makes an empty checkout of the
   URL, so no network is needed; where each side adds its own projects,

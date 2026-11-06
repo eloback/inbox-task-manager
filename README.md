@@ -20,24 +20,24 @@ switches between them in place.
 - **Switch in place.** From a Herdr popup, the switcher moves your terminal to
   another task without nesting clients.
 
-Binary: `inbox-task-manager`, alias `itm`. Run `itm` for the task switcher.
+Binary: `itm`. Run `itm` for the task switcher.
 
 ## Requirements
 
 - Linux or macOS (the BSDs should work but are untested).
 - [Herdr](https://herdr.dev) 0.9.3 or later.
-- Python 3.11 or later (Textual is installed with itm).
 - `git`, for repository projects.
+- To build it: Rust 1.89 or later (`cargo`; CI checks that version), or Nix.
 - Optional: `notify-send` (Linux) for desktop notifications; macOS uses
   `osascript`. GNU `date` (`gdate` from coreutils on macOS) for snooze phrases
   beyond the ones itm reads itself (see [Snooze times](#snooze-times)).
 
 ## Install
 
-With pipx or uv, from a clone of this repository:
+With cargo, from a clone of this repository (itm goes to `~/.cargo/bin`):
 
 ```sh
-pipx install .        # or: uv tool install .
+cargo install --locked --path .
 ```
 
 With Nix, the flake has a package, an overlay and a home-manager module:
@@ -63,6 +63,13 @@ your shell. The package puts git, GNU `date` and (on Linux) `notify-send` on
 itm's `PATH`, and adds Herdr only as a fallback after yours: the Herdr client
 must match the running server's version. The flake builds for x86_64-linux,
 aarch64-linux and aarch64-darwin; elsewhere use its overlay.
+
+**Upgrading from the Python itm** (0.2.0): the Rust itm reads and writes
+the same files, so tasks, projects, notes and settings carry over.
+Uninstall the Python one (`pipx uninstall inbox-task-manager`, or `uv tool
+uninstall`), install this one, and restart the daemon. The command is
+`itm` only: scripts that ran `inbox-task-manager` need `itm`. The
+switcher draws with your terminal's colors (`ITM_THEME` is gone).
 
 ## Setup
 
@@ -214,7 +221,6 @@ move; Enter chooses; Esc goes back without changing the project.
 | `ITM_PROJECTS_DIR`   | where repositories are cloned (default `$XDG_DATA_HOME/inbox-task-manager/projects`) |
 | `ITM_TASK_DIR`       | where a task without a project starts (default `$HOME`)                   |
 | `ITM_NOTIFY_COMMAND` | desktop notification command; gets the title and body as arguments       |
-| `ITM_THEME`          | Textual theme of the switcher (default `catppuccin-mocha`)                |
 | `ITM_POPUP`          | set in Herdr popups: errors stay on screen for 2.5 s                      |
 | `VISUAL`, `EDITOR`   | the editor for notes (else nvim, vim, vi or nano)                         |
 
@@ -243,11 +249,15 @@ Files:
 ## Development
 
 ```sh
-nix develop                                   # Python with Textual, git, Herdr
-python3 -m unittest discover -s tests         # or: nix flake check
+nix develop                                   # the Rust toolchain, git, tmux, socat, Herdr
+cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
+nix flake check                               # the same, in Nix's build sandbox
 ```
 
-Without Nix, install Textual (`pip install -e .`) and run the same command.
+Without Nix, any Rust toolchain from 1.89 with clippy and rustfmt works (CI
+uses 1.95.0). The end-to-end checks against a real headless Herdr run in a
+sandbox, never against your sessions: `cargo build --release`, then
+`scripts/sandbox.sh e2e scripts/smoke.sh` (DESIGN.md section 6).
 Read [DESIGN.md](DESIGN.md) before changing itm: it records the Herdr facts
 itm depends on, the rules that keep switching and task data safe, the UX
 principles, and how to test without touching your real sessions.

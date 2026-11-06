@@ -1,6 +1,6 @@
 [package]
 name = "inbox-task-manager"
-version = "0.1.0"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.89" # std File::lock
 description = "An inbox for Herdr task sessions"

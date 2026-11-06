@@ -18,7 +18,12 @@
 #
 # ITM (default target/release/itm) and ITM_PYTHON (default the pinned
 # Python build at /tmp/itm-standoff-cache/python-ref/bin/itm) choose the
-# binaries. The Nix build of the Python itm puts its own git first on PATH,
+# binaries. The Python itm left the tree at the cutover; its last version
+# (0.2.0, the Rust rewrite's base) builds from that commit's flake:
+#
+#   nix build -o /tmp/itm-standoff-cache/python-ref \
+#     "git+file://$PWD?rev=cb07b9ddf34f82a012d3aa2147a2f663d9780cc5"
+# The Nix build of the Python itm puts its own git first on PATH,
 # so git projects run its inner entry point, `.itm-wrapped` next to it
 # (ITM_PYTHON_BARE), with a git whose clone makes an empty checkout of the
 # URL instead of fetching it (no network). Herdr workspaces (R10) need

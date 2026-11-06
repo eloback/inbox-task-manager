@@ -1,9 +1,11 @@
 # Parity: the Rust itm against the Python itm
 
-Where the Rust version (the crate at the repository root) stands against
+Where the Rust itm (the crate at the repository root) stands against
 every requirement in `REQUIREMENTS.md` and every rule in `DESIGN.md`
-section 2. The Python itm (`inbox_task_manager/`, `tests/*.py`) is the
-behavior reference until the cutover; `scripts/cross-check.sh` runs both on
+section 2. The Python itm 0.2.0 was the behavior reference: its package
+and tests (`inbox_task_manager/`, `tests/*.py`) left the tree at the
+cutover (milestone 5) and are at commit cb07b9d, the rewrite's base;
+`scripts/cross-check.sh` runs a pinned build of it and the Rust itm on
 shared state. Updated with every change that moves a row.
 
 Status: **done** (behaves like the Python itm, pinned by a test), **partial**
@@ -11,9 +13,10 @@ Status: **done** (behaves like the Python itm, pinned by a test), **partial**
 `module::test` for unit tests in `src/`, `switching::test` for the
 real-process tests in `tests/switching.rs`, and `cross-check`, `smoke` for
 the scripts in `scripts/` (run in a sandbox against the Python build and a
-real headless Herdr).
+real headless Herdr; at milestone 5, cross-check 434 of 434, smoke 128 of
+128 with Herdr 0.9.3 and with 0.9.5).
 
-Last updated: milestone 4 (the switcher's screens and dialogs).
+Last updated: milestone 5 (parity audit and cutover).
 
 ## Requirements
 
@@ -75,8 +78,8 @@ Last updated: milestone 4 (the switcher's screens and dialogs).
 | R10.4 | settings in `config.toml` (`[herdr]` `projects_from_workspaces`, `remove_projects_without_workspace`); the Settings screen (Ctrl+S) toggles and writes them through a symlink, keeping the rest (comments too), and says why a write failed; an unknown setting, a value that is not a boolean or an unreadable file is an error shown there, workspaces are not followed, and the daemon logs it once | done | `config.rs` (`parse`, `change_setting`), `daemon.rs` `pass_settings`, `tui/screen.rs` `SettingsScreen`, `tui/app.rs` (Ctrl+S, `Snapshot.settings`) | `config::r10_4_*` (defaults, comments kept, the file created, mistakes, odd files, a symlink and a write that fails), `daemon::r10_4_the_daemon_goes_on_with_a_broken_file`, `tui::app::r10_4_ctrl_s_toggles_the_settings_one_at_a_time`, `tui::tests::r10_4_settings_are_saved_by_a_worker`, `tui::draw::the_settings_screen`, `tui::draw::the_settings_screen_with_a_mistake_in_the_file`, cross-check (both daemons log an unknown setting and a value that is not a boolean the same way, once), smoke (Ctrl+S toggles and writes config.toml; a broken file is logged once and shown), `tui::form::r5_4_a_project_with_an_open_workspace_stays` (the edit form's "settings ignored" line). A TOML syntax error is worded as toml_edit says it |
 | R10.5 | `itm project add-workspace [--name N]` saves the workspace's folder (a popup's, else the focused one) through the add dialog (no dialog with `--name` or without a terminal); a folder in a saved project, or a workspace named after one, is that project; the home folder, above it and `ITM_TASK_DIR` refused; the workspace named after the project, which is added to the task (found while following); a project without a folder named after or like it offered the folder (y, n, Esc; no question without a terminal or with `--name`), not when it may not get it; a popup keeps what went wrong on screen | done | `workspaces.rs` `add_workspace` (and `current_workspace`, `check_workspace_folder`, `named_like`, `folder_problem`, `give_folder`, `offer_folder`, `add_workspace_project`), `herdr.rs` `rename_workspace`, `cli.rs` (AddWorkspace, `Dialogs`, `POPUP_PAUSE`), `tui::add_folder_dialog`, `tui::confirm_folder` | `workspaces::r10_5_*` (15 tests, after Python's AddWorkspaceTest and GiveFolderTest), `tui::tests::r10_5_the_folder_question_alone`, `tui::tests::r10_5_the_add_dialog_alone_saves_the_folder`, `tui::draw::the_add_dialog`, `tui::draw::the_folder_question`, cross-check (every case without a terminal, byte for byte, on real Herdr sessions), smoke (the dialog and the question in a pane, `prefix+shift+a` in a popup, `HERDR_ACTIVE_WORKSPACE_ID`, the home folder). The 2.5 s pause in a popup is not run by a test (which lines it keeps is: `Added::warnings`). `prefix+shift+a` is Herdr's configuration (README) |
 | N1 | where state lives (tasks.json, clones and notes under `$XDG_DATA_HOME`, settings under `$XDG_CONFIG_HOME`); older files read as is; `kind` dropped | done | `paths.rs`, `store.rs` `upgrade`, `config.rs` | `store::a_file_written_by_python_is_read_and_rewritten_as_python_would`, `store::odd_project_lists_read_as_none`, `config::r10_4_a_change_creates_the_file`, cross-check (old format rewritten the same; clones in the same places; each side's config.toml) |
-| N2 | Linux and macOS; pip, Nix (package, overlay, home-manager module) | partial | `system.rs`, `nix/package.nix`, `flake.nix`, `nix/home-module.nix`, `contrib/`, `.github/workflows/ci.yml` | `system::every_process_table_reads_command_lines_children_and_endings`, `system::ps_output_is_read_into_command_lines`, `nix build` and `nix flake check` (the package runs every test in its check phase; clippy and rustfmt checks), the home-manager module evaluated to `…/bin/itm daemon`, `cargo clippy --all-targets -D warnings` for `aarch64-apple-darwin` and `x86_64-unknown-freebsd` (build-std on Linux, DESIGN.md section 6). Missing: a build that links and a run on macOS (CI's macOS job is written, not yet run); pip is replaced by `cargo install` |
-| N3 | first draw fast; status from the cache; 2 s refresh keeping the highlight | done | `tui/mod.rs`, `tui/app.rs` `rebuild` | `tui::the_list_refreshes_every_two_seconds`, `tui::app::moving_skips_headers_and_a_refresh_keeps_the_highlighted_task`, `scripts/measure.sh` (milestone 4, release build: first draw 2.48 ms (2.6 ms in milestone 3), `list` 1.23 ms, `status` 1.25 ms, daemon 0.050% of a core (0.03 s in 60 s) and 5.2 MB (4.7 MB in milestone 3; the binary is 3.7 MB with the new screens); the Python itm on the same state: `list` 52.5 ms, `status` 47.3 ms, 0.78% and 24.4 MB) |
+| N2 | Linux and macOS, one binary; cargo, Nix (package, overlay, home-manager module) | partial | `system.rs`, `nix/package.nix`, `flake.nix`, `nix/home-module.nix`, `contrib/`, `.github/workflows/ci.yml` | `system::every_process_table_reads_command_lines_children_and_endings`, `system::ps_output_is_read_into_command_lines`, `nix build` and `nix flake check` (the package runs every test in its check phase; clippy and rustfmt checks), the home-manager module evaluated to `…/bin/itm daemon`, the wrapped itm reading `next week` with an empty `PATH` (its `gdate`), `cargo clippy --all-targets -D warnings` for `aarch64-apple-darwin` and `x86_64-unknown-freebsd` (build-std on Linux, DESIGN.md section 6). Missing: a build that links and a run on macOS (CI's macOS job is written and has not run: no macOS machine here); the BSDs untested; Rust 1.89 (the `rust-version`) checked only by CI's msrv job, not run yet |
+| N3 | first draw fast; status from the cache; 2 s refresh keeping the highlight | done | `tui/mod.rs`, `tui/app.rs` `rebuild` | `tui::the_list_refreshes_every_two_seconds`, `tui::app::moving_skips_headers_and_a_refresh_keeps_the_highlighted_task`, `scripts/measure.sh` (milestone 5, release build, the standoff's method: first draw 2.64 ms, `list` 1.31 ms, `status` 1.61 ms, daemon 0.050% of a core (0.03 s in 60 s) and 5.1 MB, binary 3.7 MB; the Python itm 0.2.0 on the same state: `list` 52.3 ms, `status` 60.0 ms, daemon 0.78% and 24.5 MB). The numbers are in DESIGN.md section 4 (the cutover) |
 | N4 | never touches sessions without the prefix | done | `tasks.rs` `adopt_sessions`, `itm.rs` | `tasks::only_prefixed_sessions_are_adopted`, `tasks::next_active_prefers_waiting_then_recent_else_default` |
 
 ## DESIGN.md section 2: rules that must stay true
@@ -103,7 +106,7 @@ Last updated: milestone 4 (the switcher's screens and dialogs).
 | stopping a session that may host the caller happens after the hand-off (Rust: `server.stop` over the socket; delete then has a detached `/bin/sh` run `herdr session delete` until the server is gone) | done | `itm.rs` `archive_task`, `delete_task`, `herdr.rs` `stop`, `delete_detached` | `itm::wake_archive_and_reopen`, `switching::deleting_a_task_stops_its_session_and_has_herdr_delete_it`, smoke (archiving the task a client is on; deleting a running task) |
 | a popup that moved its own client away exits | done | `tui/app.rs` `done` | `tui::app::archiving_the_task_this_switcher_runs_in_closes_it` |
 | plain `herdr` clients cannot be switched, and the error says so | done | `switching.rs` `switchable_session` | `switching::switching_inside_herdr_needs_an_itm_client_on_a_known_session` (unit), `switching::a_task_is_not_saved_when_switching_to_it_cannot_work` |
-| the process name is part of the protocol (`itm`, `inbox-task-manager`, `inbox_task_manager`) | done | `switching.rs` `is_itm_process`, `Cargo.toml` (`[[bin]] itm`) | `switching::process_names_that_count_as_itm` (unit) |
+| the process name is part of the protocol (`itm`, `inbox-task-manager`, `inbox_task_manager`) | done | `switching.rs` `is_itm_process`, `Cargo.toml` (`[[bin]] itm`), `nix/package.nix` (`wrapProgram` keeps argv[0]) | `switching::process_names_that_count_as_itm` (unit; the Python itm's command lines count too), smoke (the attach loop of the release build) |
 
 ### Data safety
 
@@ -235,3 +238,12 @@ Last updated: milestone 4 (the switcher's screens and dialogs).
 - The Settings screen shows the settings as each 2 s refresh read them, so
   a file fixed meanwhile shows; Python reads them when the screen opens
   and after each save.
+- One command, `itm`; the Python package also installed it as
+  `inbox-task-manager`. Both names still count for the process-name rule.
+- No `ITM_THEME`: the switcher draws with the terminal's named colors
+  (Textual themes have no counterpart).
+- A snooze time only GNU `date` reads, typed in the snooze dialog or the
+  form, is read by a worker; keys typed in those milliseconds are dropped.
+  The Python switcher ran `date` on its event loop, which queued them.
+- `itm --version` says 0.3.0: the first Rust release follows the Python
+  0.2.0, so packages do not look like a downgrade.

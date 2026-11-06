@@ -8,7 +8,8 @@
 #   scripts/sandbox.sh e2e scripts/smoke.sh; rm -rf /tmp/itm-e2e
 #
 # ITM (default target/release/itm) and ITM_PYTHON (the Python itm that
-# reads the state at the end; skipped when missing) choose the binaries.
+# reads the state at the end; skipped when missing; see cross-check.sh for
+# how to build it) choose the binaries.
 #
 # It starts Herdr servers, fake agents (a pane running `sleep` that reports
 # itself blocked over the socket API; no real agent), the daemon and an

@@ -98,8 +98,8 @@ explicitly.
 
 ### Non-functional
 - N1 Task and project metadata lives in `$XDG_STATE_HOME/inbox-task-manager/tasks.json`; clones (R8.6) and notes (R9.1) live under `$XDG_DATA_HOME`; settings (R10.4) under `$XDG_CONFIG_HOME`; Herdr remains the source of truth for layouts and agents. A `tasks.json` from before tasks had several projects is read as is (`project` becomes `projects`), and a stored project `kind` is dropped (it is read off the fields). Older itm binaries cannot read a file written by this version: upgrade itm everywhere at once and restart the daemon.
-- N2 Runs on Linux and macOS (the BSDs are untested) with Python 3.11+ and Textual. Installs with pip, pipx or uv, or with Nix (a flake with a package, an overlay and a home-manager module that runs the daemon as a user service). Herdr's key bindings stay in the user's Herdr config.
-- N3 The switcher first draws in about 250 ms; it reads agent state from the daemon's status cache instead of querying every session, and refreshes every 2 s in the background, keeping the highlighted task. The CLI and the daemon do not load Textual.
+- N2 Runs on Linux and macOS (the BSDs are untested), as one binary, `itm`. Installs with cargo (`cargo install --locked`), or with Nix (a flake with a package, an overlay and a home-manager module that runs the daemon as a user service). Herdr's key bindings stay in the user's Herdr config.
+- N3 The switcher draws its first frame with the tasks within a few milliseconds (2.6 ms measured with 5 tasks, 3 of them running, `scripts/measure.sh`; the Python itm took about 175 ms); it reads agent state from the daemon's status cache instead of querying every session, and refreshes every 2 s in the background, keeping the highlighted task. `itm list` and `itm status` take under 2 ms (1.3 ms and 1.6 ms measured), and the daemon about 0.05% of a core and 5 MB.
 - N4 Never touches sessions without the task prefix, except attaching to them when asked.
 
 ### Out of scope

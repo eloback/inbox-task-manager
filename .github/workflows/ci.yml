@@ -23,6 +23,14 @@ jobs:
       - run: cargo test --locked
       - run: cargo run --locked --quiet -- --help
 
+  msrv:
+    name: builds with the oldest Rust it claims (Cargo.toml rust-version)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.89.0
+      - run: cargo check --locked --all-targets
+
   nix:
     name: nix build and flake check (Linux)
     runs-on: ubuntu-latest
