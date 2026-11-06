@@ -6,23 +6,28 @@
 //! per running task session, over its socket), and [`Itm::poll_once`]
 //! decides and records, so tests can describe what Herdr shows.
 
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::ops::ControlFlow;
+use std::panic::{self, AssertUnwindSafe};
 use std::process::Command;
-use std::sync::Arc;
+use std::sync::{Arc, Once};
 use std::thread;
 use std::time::Duration;
 
-use crate::error::{Context, Result};
+use crate::error::{Context, Error, Result};
 use crate::herdr::{Agent, Sessions};
 use crate::itm::Itm;
 use crate::status::{AgentState, AgentStatus, Cache, SessionStatus};
 use crate::store::{State, python_json, write_atomic};
-use crate::system::notify_command;
+use crate::system::{notify_command, output_within};
 use crate::tasks::{self, is_task_session};
 use crate::times;
 
 pub const POLL: Duration = Duration::from_secs(2);
+/// How long a desktop notification offering Open is waited for (Python's limit).
+const NOTIFY_WAIT: Duration = Duration::from_secs(3600);
 
 /// Blocked agents already reported: wait key → when the daemon first saw
 /// the wait (`notified.json`). A key is a session, pane and state change,
@@ -180,42 +185,93 @@ impl Itm {
             Err(e) => return eprintln!("{e}: {}", notice.title),
         };
         let (itm, task) = (Arc::clone(self), notice.task.clone());
-        thread::spawn(move || match Command::new(&command.argv[0]).args(&command.argv[1..]).output() {
-            Ok(out) if command.offers_open && String::from_utf8_lossy(&out.stdout).trim() == "open" => {
-                if let Err(e) = itm.handoff(&task, None, true) {
-                    eprintln!("could not open {task}: {e}");
+        thread::spawn(move || {
+            let mut run = Command::new(&command.argv[0]);
+            match output_within(run.args(&command.argv[1..]), NOTIFY_WAIT) {
+                Ok(Some((_, said))) if command.offers_open && said.trim() == "open" => {
+                    if let Err(e) = itm.handoff(&task, None, true) {
+                        eprintln!("could not open {task}: {e}");
+                    }
                 }
+                Ok(_) => {} // closed, or still open after NOTIFY_WAIT
+                Err(e) => eprintln!("notification failed: {e}"),
             }
-            Ok(_) => {}
-            Err(e) => eprintln!("notification failed: {e}"),
         });
     }
 
-    /// The daemon's loop. One failed pass never stops it; a repeated error is logged once.
-    pub fn run_daemon(self: Arc<Self>) -> ! {
+    /// The daemon's loop: a pass every [`POLL`], forever.
+    pub fn run_daemon(self: Arc<Self>) -> Result<()> {
         let mut notified: Notified = fs::read_to_string(self.paths.notified_file())
             .ok()
             .and_then(|t| serde_json::from_str(&t).ok())
             .unwrap_or_default();
-        let mut last_error = None;
-        loop {
-            let pass = self.observe().and_then(|seen| {
-                for notice in self.poll_once(&mut notified, &seen, times::now())? {
-                    self.deliver(&notice, &seen);
-                }
-                Ok(())
-            });
-            match pass {
-                Ok(()) => last_error = None,
-                Err(e) if last_error.as_ref() != Some(&e) => {
-                    eprintln!("poll failed: {e}");
-                    last_error = Some(e);
-                }
-                Err(_) => {}
+        let pass = || {
+            let seen = self.observe()?;
+            for notice in self.poll_once(&mut notified, &seen, times::now())? {
+                self.deliver(&notice, &seen);
             }
+            Ok(())
+        };
+        let sleep = || {
             thread::sleep(POLL);
+            ControlFlow::Continue(())
+        };
+        keep_polling(pass, |line| eprintln!("{line}"), sleep);
+        Ok(())
+    }
+}
+
+/// Run `pass`, then `wait`, until `wait` breaks (the daemon's never does).
+/// One failed pass never stops the daemon, not even one that panics; an
+/// error is logged once while it repeats (DESIGN.md section 2).
+fn keep_polling(
+    mut pass: impl FnMut() -> Result<()>,
+    mut log: impl FnMut(&str),
+    mut wait: impl FnMut() -> ControlFlow<()>,
+) {
+    let mut last_error = None;
+    loop {
+        match guarded(&mut pass) {
+            Ok(()) => last_error = None,
+            Err(e) if last_error.as_ref() != Some(&e) => {
+                log(&format!("poll failed: {e}"));
+                last_error = Some(e);
+            }
+            Err(_) => {}
+        }
+        if wait().is_break() {
+            return;
         }
     }
+}
+
+thread_local! {
+    /// Whether this thread runs a pass: its panics are logged by
+    /// [`keep_polling`] (once while they repeat), not by the default hook.
+    static IN_PASS: Cell<bool> = const { Cell::new(false) };
+    /// Where and why the pass panicked, as the panic hook describes it.
+    static PANICKED: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
+/// One pass, with a panic turned into an error.
+fn guarded(pass: impl FnOnce() -> Result<()>) -> Result<()> {
+    static HOOK: Once = Once::new();
+    HOOK.call_once(|| {
+        let default = panic::take_hook();
+        panic::set_hook(Box::new(move |info| match IN_PASS.get() {
+            true => PANICKED.set(Some(info.to_string().replace('\n', " "))),
+            false => default(info),
+        }));
+    });
+    IN_PASS.set(true);
+    let outcome = panic::catch_unwind(AssertUnwindSafe(pass));
+    IN_PASS.set(false);
+    outcome.unwrap_or_else(|payload| {
+        let said =
+            payload.downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| payload.downcast_ref::<String>().cloned());
+        let what = PANICKED.take().or_else(|| said.map(|s| format!("panicked: {s}"))).unwrap_or("panicked".into());
+        Err(Error::Other(format!("the pass {what}")))
+    })
 }
 
 #[cfg(test)]
@@ -390,6 +446,31 @@ mod tests {
         let notices = itm.poll_once(&mut Notified::new(), &seen, NOW).unwrap();
         assert!(!titles(&notices).contains(&"Needs input · A"));
         assert_eq!(itm.store().load().unwrap().tasks["task-new"].title, "new");
+    }
+
+    #[test]
+    fn a_failed_or_panicking_pass_never_stops_the_daemon_and_is_logged_once() {
+        let (mut passes, mut logged) = (0, vec![]);
+        let pass = || {
+            passes += 1;
+            match passes {
+                1 | 2 => panic!("boom"),
+                4 | 5 => Err(Error::Other("herdr not found".into())),
+                _ => Ok(()),
+            }
+        };
+        let mut waits = 0;
+        let wait = || {
+            waits += 1;
+            if waits < 6 { ControlFlow::Continue(()) } else { ControlFlow::Break(()) }
+        };
+        keep_polling(pass, |line| logged.push(line.to_string()), wait);
+        assert_eq!(passes, 6);
+        assert_eq!(logged.len(), 2, "{logged:?}");
+        assert!(
+            logged[0].starts_with("poll failed: the pass panicked at src/daemon.rs:") && logged[0].ends_with("boom")
+        );
+        assert_eq!(logged[1], "poll failed: herdr not found");
     }
 
     #[test]

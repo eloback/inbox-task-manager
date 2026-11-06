@@ -5,8 +5,12 @@
 
 use std::env;
 use std::fs;
+use std::io::{self, Read};
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
+use std::process::{Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use rustix::process::{Pid, Signal, kill_process, test_kill_process};
 
@@ -71,6 +75,38 @@ fn parent_of(pid: u32) -> Option<u32> {
     stat[stat.rfind(')')? + 1..].split_whitespace().nth(1)?.parse().ok()
 }
 
+/// Run `command` to its end and return what it printed, or kill it after
+/// `timeout` (None). Its output is read while it runs, so a long one cannot
+/// fill the pipe and stall it.
+pub fn output_within(
+    command: &mut Command,
+    timeout: Duration,
+) -> io::Result<Option<(std::process::ExitStatus, String)>> {
+    let mut child = command.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn()?;
+    let mut stdout = child.stdout.take().expect("piped");
+    let reader = thread::spawn(move || {
+        let mut text = String::new();
+        stdout.read_to_string(&mut text).map(|_| text)
+    });
+    let deadline = Instant::now() + timeout;
+    let mut nap = Duration::from_millis(5);
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break Some(status);
+        }
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            let _ = child.kill();
+            let _ = child.wait();
+            break None;
+        }
+        thread::sleep(nap.min(left));
+        nap = (nap * 2).min(Duration::from_secs(1));
+    };
+    let text = reader.join().unwrap_or_else(|_| Ok(String::new()))?;
+    Ok(status.map(|status| (status, text)))
+}
+
 /// The first executable called `program` on `PATH`.
 pub fn which(program: &str) -> Option<PathBuf> {
     env::split_paths(&env::var_os("PATH")?)
@@ -125,6 +161,22 @@ mod tests {
         child.wait().unwrap();
         assert_eq!(Proc.argv(child.id()), None);
         assert!(!Proc.alive(child.id()));
+    }
+
+    #[test]
+    fn a_command_runs_to_its_end_or_is_killed_at_the_timeout() {
+        let (status, text) =
+            output_within(Command::new("sh").args(["-c", "echo open"]), Duration::from_secs(5)).unwrap().unwrap();
+        assert!(status.success());
+        assert_eq!(text, "open\n");
+        let started = Instant::now();
+        assert_eq!(output_within(Command::new("sleep").arg("5"), Duration::from_millis(100)).unwrap(), None);
+        assert!(started.elapsed() < Duration::from_secs(2));
+        // More than a pipe holds: read while it runs, or it would wait for the timeout.
+        let (_, text) = output_within(Command::new("head").args(["-c", "300000", "/dev/zero"]), Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        assert_eq!(text.len(), 300_000);
     }
 
     #[test]
