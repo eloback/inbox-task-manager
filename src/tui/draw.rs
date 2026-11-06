@@ -608,11 +608,9 @@ pub fn field_line<'a>(
     let scroll = input.visual_scroll(room.saturating_sub(1).max(1)); // a column for the cursor at the end
     match input.value() {
         "" => spans.push(muted(placeholder.to_string())),
-        value if focus == FieldFocus::Selected => {
-            spans.push(Span::styled(skip_columns(value, scroll), Style::new().reversed()))
-        }
         value => {
-            spans.push(Span::raw(skip_columns(value, scroll)));
+            let selected = if focus == FieldFocus::Selected { Style::new().reversed() } else { Style::new() };
+            spans.push(Span::styled(skip_columns(value, scroll), selected));
             if let Some(rest) = ghost.and_then(|g| g.strip_prefix(value)) {
                 spans.push(muted(rest.to_string()));
             }
@@ -1175,6 +1173,16 @@ mod tests {
             field_line("Name", 8, &tui_input::Input::new("api".into()), "", None, FieldFocus::Focused, 20);
         assert_eq!((line.spans[1].content.as_ref(), cursor), ("api", 11));
         assert_eq!(skip_columns("日本語abc", 4), "語abc", "wide characters take two columns");
+    }
+
+    /// A selected value shows its ghost text too: Tab and → take it.
+    #[test]
+    fn a_selected_value_keeps_its_ghost_text() {
+        let input = tui_input::Input::new("~/code/api".into());
+        let (line, _) = field_line("Source", 8, &input, "", Some("~/code/api/"), FieldFocus::Selected, 40);
+        let shown: Vec<&str> = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(shown, ["Source  ", "~/code/api", "/"]);
+        assert!(line.spans[1].style.add_modifier.contains(Modifier::REVERSED), "drawn selected");
     }
 
     /// R1.6: many projects give way to the field's hint, counted as "+n".

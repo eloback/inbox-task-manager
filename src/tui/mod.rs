@@ -399,7 +399,8 @@ fn event_loop<B: Backend>(
     let (tx, rx) = mpsc::channel();
     let clones = Clones::default();
     let _stop_clones = CloseOnDrop(clones.clone()); // on every way out
-    // While a clone runs, a closing popup (SIGHUP) or a kill must stop it first.
+    // While a clone or a job that must finish runs, a closing popup (SIGHUP)
+    // or a kill ends the loop like Esc: the clone stops, the job finishes.
     let mut signals: Option<ExitSignals> = None;
     // One load at a time; a job's result asks for another one right after.
     let (mut loading, mut reload, mut next_refresh) = (false, !app.alone, events.now().instant);
@@ -426,7 +427,10 @@ fn event_loop<B: Backend>(
                         });
                     }
                     Need::Job(job) => {
-                        finishing += usize::from(job.must_finish());
+                        if job.must_finish() {
+                            finishing += 1;
+                            signals = signals.or_else(|| ExitSignals::catch().ok());
+                        }
                         start(job, &work, &tx, &clones)
                     }
                 }
@@ -434,9 +438,11 @@ fn event_loop<B: Backend>(
         }
         app.expire_message();
         let shown = app.now.epoch;
-        let drawn = terminal.draw(|frame| draw::draw(frame, &mut app, shown));
-        if leaving.is_none() {
-            drawn.context(|| "cannot draw".into())?; // leaving, the terminal may be gone: the jobs finish anyway
+        let drawn = terminal.draw(|frame| draw::draw(frame, &mut app, shown)).context(|| "cannot draw".into());
+        if leaving.is_none()
+            && let Err(e) = drawn
+        {
+            leaving = Some(Err(e)); // the terminal is gone: what must finish still does
         }
         if exit_after_draw && app.snapshot.is_some() {
             return Ok(None);
@@ -455,7 +461,7 @@ fn event_loop<B: Backend>(
             // Wake for the next refresh (unless one runs), for the message to go, for a screen's
             // check, and while a clone runs, often enough to see a signal soon.
             let refresh = (!loading && !app.alone).then_some(next_refresh);
-            let watch = (cloning > 0).then(|| app.now.instant + SIGNAL_POLL);
+            let watch = (cloning > 0 || finishing > 0).then(|| app.now.instant + SIGNAL_POLL);
             let deadline =
                 [refresh, app.message.as_ref().map(|m| m.until), app.due(), watch].into_iter().flatten().min();
             let deadline = deadline.unwrap_or(app.now.instant + Duration::from_secs(3600));
@@ -488,14 +494,12 @@ fn event_loop<B: Backend>(
             Some(Input::Done(job, result)) => {
                 running -= 1;
                 finishing -= usize::from(job.must_finish());
-                if matches!(job, Job::Clone { .. }) {
-                    cloning -= 1;
-                    if cloning == 0 {
-                        signals = None; // they end itm again
-                    }
+                cloning -= usize::from(matches!(job, Job::Clone { .. }));
+                if cloning == 0 && finishing == 0 {
+                    signals = None; // they end itm again
                 }
                 reload |= job.changes_tasks();
-                let failed = result.is_err();
+                let failed = result.is_err() && job.must_finish(); // what the loop waits for
                 let action = app.done(job, result);
                 // The switcher stays to show what went wrong (a screen alone has nothing left to show it on).
                 if failed && !app.alone && matches!(leaving, Some(Ok(_))) {
@@ -527,12 +531,12 @@ fn event_loop<B: Backend>(
                         reload = true; // the preview shows the notes as they are now
                     }
                     Action::Run(job) => {
-                        if matches!(job, Job::Clone { .. }) {
-                            cloning += 1;
+                        cloning += usize::from(matches!(job, Job::Clone { .. }));
+                        finishing += usize::from(job.must_finish());
+                        if cloning > 0 || finishing > 0 {
                             signals = signals.or_else(|| ExitSignals::catch().ok());
                         }
                         running += 1;
-                        finishing += usize::from(job.must_finish());
                         start(job, &work, &tx, &clones);
                     }
                 }
@@ -670,9 +674,13 @@ mod tests {
         notes: Mutex<Vec<String>>,
         /// How the last clone child ended.
         clone_ended: Mutex<Option<std::process::ExitStatus>>,
-        /// The tasks whose delete was done (a delete takes 300 ms, so keys can come meanwhile).
+        /// The tasks whose delete was done (a delete takes 300 ms, or
+        /// `delete_takes`, so keys can come meanwhile).
         deleted: Mutex<Vec<String>>,
         delete_fails: bool,
+        delete_takes: Option<Duration>,
+        /// Load the snapshot with projects; a removal plan fails after this long.
+        plan_fails_after: Option<Duration>,
     }
 
     fn new_project(name: &str, path: Option<&str>) -> Project {
@@ -692,6 +700,7 @@ mod tests {
             match self.fails.iter().find(|(at, _)| *at == n) {
                 Some((_, "panic")) => panic!("load {n} panicked"),
                 Some((_, error)) => Err(Error::Other(error.to_string())),
+                None if self.plan_fails_after.is_some() => Ok(super::app::tests::with_projects()),
                 None => Ok(snapshot()),
             }
         }
@@ -702,8 +711,12 @@ mod tests {
             }
             match job {
                 Job::Create { .. } => Ok(Reply::Created("task-new".into())),
+                Job::RemovalPlan { .. } if self.plan_fails_after.is_some() => {
+                    thread::sleep(self.plan_fails_after.unwrap_or_default());
+                    Err(Error::Other("cannot read the clone".into()))
+                }
                 Job::Delete { session, .. } => {
-                    thread::sleep(Duration::from_millis(300));
+                    thread::sleep(self.delete_takes.unwrap_or(Duration::from_millis(300)));
                     self.deleted.lock().unwrap().push(session.clone());
                     match self.delete_fails {
                         true => Err(Error::Other(format!("deleted, but {session}'s session did not stop"))),
@@ -783,13 +796,32 @@ mod tests {
         assert!(shown.contains("Finishing first…"), "{shown}");
     }
 
-    /// The same when the terminal goes (a popup closed) during the delete.
+    /// The same when the terminal cannot be read any more during the delete.
     #[test]
     fn a_terminal_gone_during_a_delete_waits_for_it() {
         let work = Arc::new(FakeWork::default());
         let (ended, _) = switcher(vec![Step::Key(ctrl('d')), press(KeyCode::Char('y')), Step::Gone], &work, false);
         assert_eq!(ended, Err(Error::Other("the terminal is gone".into())));
         assert_eq!(*work.deleted.lock().unwrap(), ["task-fix-login"]);
+    }
+
+    /// Only a job the closing waits for keeps the switcher open when it
+    /// fails: another one failing meanwhile (a project's removal plan,
+    /// which only reads) leaves the Esc as it was.
+    #[test]
+    fn a_failure_the_closing_does_not_wait_for_keeps_the_esc() {
+        let work = Arc::new(FakeWork {
+            delete_takes: Some(Duration::from_millis(1500)),
+            plan_fails_after: Some(Duration::from_millis(800)),
+            ..FakeWork::default()
+        });
+        let mut steps = vec![Step::Key(ctrl('d')), press(KeyCode::Char('y'))];
+        // Meanwhile: the Projects screen, a removal (its plan runs), then Esc twice.
+        steps.extend([ctrl('p'), ctrl('d'), key(KeyCode::Esc), key(KeyCode::Esc)].map(Step::Meanwhile));
+        let (ended, _) = switcher(steps, &work, false);
+        assert_eq!(ended, Ok(None), "closed once the delete was done, without another key");
+        assert_eq!(*work.deleted.lock().unwrap(), ["task-fix-login"]);
+        assert!(jobs(&work).iter().any(|job| matches!(job, Job::RemovalPlan { .. })), "the plan ran meanwhile");
     }
 
     /// DESIGN.md section 3, errors stay visible: a delete that fails while

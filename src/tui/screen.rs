@@ -282,7 +282,6 @@ impl SettingsScreen {
     }
 }
 
-/// Up and down in a list: ↑↓, and Ctrl+K / Ctrl+J as in vim; 0 for any other key.
 /// Typing into a one-line field as the Python itm's Textual Input did
 /// (select on focus): while `selected`, which focusing a field with text
 /// in it sets ([`selects`]), a character replaces the text and Backspace
@@ -317,6 +316,7 @@ pub fn selects(input: &mut Input) -> bool {
     !input.value().is_empty()
 }
 
+/// Up and down in a list: ↑↓, and Ctrl+K / Ctrl+J as in vim; 0 for any other key.
 pub fn moves(key: KeyEvent) -> isize {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     match key.code {

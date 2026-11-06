@@ -703,8 +703,13 @@ The switcher and its dialogs follow these principles.
   socket, `herdr-client.sock` (`refused_by_a_live_server`): a stuck server
   still listens on it, while a session that stopped removed both sockets,
   and one whose server crashed left both with nothing listening (checked
-  against Herdr 0.9.3 on Linux; the macOS path has its unit test but has
-  not run on macOS yet).
+  against Herdr 0.9.3 on Linux; the macOS path has its unit tests but has
+  not run on macOS yet). Each check queues a connection the stuck server
+  never takes, so a process remembers a session found running that way
+  for a minute (`LiveRefusers`): with a check a minute from each itm that
+  runs (the daemon, an open switcher) and one per CLI command, the client
+  socket's backlog (128 on macOS) lasts an hour or more of a hang, after
+  which the session looks stopped, as it does to `herdr session list`.
 - **Stopping a session** is a `server.stop` request, not a detached
   `/bin/sh herdr session stop`: Herdr answers before it shuts down, so the
   caller may run inside the session it stops (archiving the current task).
@@ -799,14 +804,17 @@ The switcher and its dialogs follow these principles.
     it looks at the results every 10 ms. One load runs at a time, and a
     job that can change tasks asks for a load once done. A worker that
     panics still sends a result, so a refresh always ends.
-  - The loop ends (Esc, a switch, a screen alone closing, the terminal
-    gone, a signal during a clone) only once the jobs that change state are
-    done (`Job::must_finish`): a delete, an archive or a project removal
-    stopped halfway leaves a session running unseen or a clone half
-    deleted (Textual joined its workers too). Meanwhile it reads no keys and
-    says "Finishing first…"; a failure among those jobs keeps the switcher
-    open to show it (UX principle 11). A clone is not waited for (it stops
-    on the way out and keeps nothing, R8.8), nor is a folder listing.
+  - The loop ends (Esc, a switch, a screen alone closing, the terminal no
+    longer read or drawn, SIGHUP, SIGTERM or SIGINT) only once the jobs that
+    change state are done (`Job::must_finish`): a delete, an archive or a
+    project removal stopped halfway leaves a session running unseen or a
+    clone half deleted (Textual joined its workers too). So while a clone or
+    such a job runs, itm catches those signals (`ExitSignals`; a closing
+    popup sends SIGHUP) and they end the loop like Esc. Meanwhile it reads
+    no keys and says "Finishing first…"; a failure of a job it waits for
+    keeps the switcher open to show it (UX principle 11). A clone is not
+    waited for (it stops on the way out and keeps nothing, R8.8), nor is a
+    folder listing.
   - Keys are read on the loop's thread, only while it waits, never by a
     thread of their own: crossterm reads input while it polls, so a reader
     left running after the switcher closed would take keys meant for the
@@ -822,10 +830,14 @@ The switcher and its dialogs follow these principles.
   - A one-line field focused with text in it has that text selected, as
     Textual's `Input` had (`select_on_focus`): a character replaces it,
     Backspace or Delete clears it, Left or Home goes to its start, and any
-    other key unselects it (`screen::type_into`, drawn reversed). So a field
-    that opens filled in (the rename dialog, the edit form's title, `itm new
-    -i "<title>"`, the add dialog `add-workspace` fills in) takes a new value
-    without being cleared first. The finder's query is never selected (the
+    other key unselects it (`screen::type_into`, drawn reversed, its ghost
+    text still shown). So a field that opens filled in (the rename dialog,
+    the edit form's title, `itm new -i "<title>"`, the add dialog
+    `add-workspace` fills in) takes a new value without being cleared first.
+    Only moving the focus selects: focus that stays where it is (a name
+    taken, said after Enter on the name; a switch to a name only while the
+    name is typed) leaves what is being typed as it is, as Textual's
+    `focus()` on the focused input did. The finder's query is never selected (the
     key that opened it must not be replaced by the next), and a snooze time
     that could not be read puts the cursor back in it unselected, so typing
     goes on.

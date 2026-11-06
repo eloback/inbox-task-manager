@@ -169,7 +169,7 @@ impl TaskForm {
         paths: &Paths,
     ) -> TaskForm {
         let projects: Vec<String> = projects.into_iter().filter(|id| saved.projects.contains_key(id)).collect();
-        let form = TaskForm {
+        let mut form = TaskForm {
             editing: None,
             title: Input::new(title.into()),
             description: description(""),
@@ -186,14 +186,15 @@ impl TaskForm {
             cannot_switch: None,
             task_dir: paths.display(&paths.task_dir),
         };
-        form.focused_on(Part::Title)
+        form.selected = selects(&mut form.title);
+        form
     }
 
     pub fn edit(task: &Task, saved: Saved, editing: Editing) -> TaskForm {
         let projects: Vec<String> =
             task.projects.iter().filter(|id| saved.projects.contains_key(*id)).cloned().collect();
         let text = task.description.clone().unwrap_or_default();
-        let form = TaskForm {
+        let mut form = TaskForm {
             editing: Some(editing),
             title: Input::new(task.title.clone()),
             description: description(&text),
@@ -210,16 +211,16 @@ impl TaskForm {
             cannot_switch: None,
             task_dir: String::new(),
         };
-        form.focused_on(Part::Title)
+        form.selected = selects(&mut form.title);
+        form
     }
 
-    fn focused_on(mut self, part: Part) -> TaskForm {
-        self.focus_on(part);
-        self
-    }
-
-    /// Focus `part`; a one-line field gets its text selected (as in the Python itm).
+    /// Focus `part`. Moving to a one-line field selects its text, as in the
+    /// Python itm; focus already there leaves what is being typed as it is.
     fn focus_on(&mut self, part: Part) {
+        if self.focus == part {
+            return;
+        }
         self.focus = part;
         self.selected = match part {
             Part::Title => selects(&mut self.title),

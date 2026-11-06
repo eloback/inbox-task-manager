@@ -84,7 +84,7 @@ impl AddDialog {
             kind,
             source: Input::new(source.into()),
             name: Input::new(name.into()),
-            focus,
+            focus: if kind == ProjectKind::Name { Field::Name } else { focus },
             selected: false,
             folders: Folders::default(),
             check: None,
@@ -93,14 +93,21 @@ impl AddDialog {
             busy: None,
             said: None,
         };
-        dialog.focus_on(if kind == ProjectKind::Name { Field::Name } else { focus });
+        dialog.selected = dialog.select_focused();
         dialog
     }
 
-    /// Focus `field`, its text selected (as in the Python itm).
+    /// Focus `field`. Moving there selects its text, as in the Python itm;
+    /// focus already there leaves what is being typed as it is.
     fn focus_on(&mut self, field: Field) {
-        self.focus = field;
-        self.selected = selects(if field == Field::Source { &mut self.source } else { &mut self.name });
+        if self.focus != field {
+            self.focus = field;
+            self.selected = self.select_focused();
+        }
+    }
+
+    fn select_focused(&mut self) -> bool {
+        selects(if self.focus == Field::Source { &mut self.source } else { &mut self.name })
     }
 
     /// Filled with a workspace's folder and name (R10.5), ready on the name.
@@ -386,6 +393,10 @@ mod tests {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
 
+    fn typed(text: &str) -> Vec<KeyEvent> {
+        text.chars().map(|c| key(KeyCode::Char(c))).collect()
+    }
+
     fn press(dialog: &mut AddDialog, keys: &[KeyEvent], at: Instant) -> Outcome {
         let paths = Paths::under("/r".as_ref());
         let cx = Context { tz: &TimeZone::UTC, now: Moment { instant: at, epoch: 0 }, paths: &paths };
@@ -442,6 +453,32 @@ mod tests {
     }
 
     /// R8.8: Esc during a clone stops it once and keeps the dialog; when it
+    /// R8.5: focus that does not move leaves the name being typed as it is
+    /// (Textual's focus on the focused input does nothing): a name taken,
+    /// said after Enter on the name, and a switch to a name only while
+    /// typing it keep it unselected. Moving to the name selects it.
+    #[test]
+    fn r8_5_focus_that_stays_keeps_what_is_typed() {
+        let now = Instant::now();
+        let mut dialog = AddDialog::new(ProjectKind::Dir, "~/code/api", "", Field::Name);
+        press(&mut dialog, &typed("api"), now);
+        let Outcome::Act(Action::Run(add)) = press(&mut dialog, &[key(KeyCode::Enter)], now) else { panic!() };
+        dialog.done(&add, Err(Error::ProjectNameTaken { name: "api".into(), place: "~/code/old".into() }));
+        press(&mut dialog, &typed("2"), now);
+        assert_eq!(dialog.name.value(), "api2");
+
+        let mut dialog = AddDialog::new(ProjectKind::Git, "", "", Field::Name);
+        press(&mut dialog, &typed("ap"), now);
+        press(&mut dialog, &[KeyEvent::new(KeyCode::Left, KeyModifiers::CONTROL)], now);
+        press(&mut dialog, &typed("i"), now);
+        assert_eq!((dialog.kind, dialog.name.value()), (ProjectKind::Name, "api"));
+
+        let mut dialog = AddDialog::new(ProjectKind::Dir, "~/code/api", "api", Field::Source);
+        press(&mut dialog, &[key(KeyCode::Tab)], now);
+        press(&mut dialog, &typed("web"), now);
+        assert_eq!(dialog.name.value(), "web", "Tab to the name selected it");
+    }
+
     /// ended, the dialog says it kept nothing, and Esc closes it.
     #[test]
     fn r8_8_esc_stops_a_clone_and_keeps_the_dialog() {
