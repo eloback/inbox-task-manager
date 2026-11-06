@@ -295,6 +295,20 @@ fn deleting_a_task_stops_its_session_and_has_herdr_delete_it() {
     assert!(!world.tasks().contains("task-doomed"), "{}", world.tasks());
 }
 
+/// R4.7: deleting the task a client is on moves it to the next task, as
+/// snoozing and archiving do.
+fn deleting_the_task_a_client_is_on_moves_it_to_the_next_task() {
+    let world = World::new();
+    world.itm(&["new", "Next", "--no-switch"]);
+    world.itm(&["new", "Doomed", "--no-switch"]);
+    let mut attach = world.attach("task-doomed");
+    let client = world.attached(&attach, "task-doomed");
+    world.itm(&["delete", "doomed", "--yes"]);
+    world.attached(&attach, "task-next");
+    assert!(!alive(client), "the client on the deleted task was detached");
+    world.stop(&mut attach);
+}
+
 /// The tests, each with its name.
 macro_rules! named {
     ($($test:ident),* $(,)?) => { [$((stringify!($test), $test as fn())),*] };
@@ -314,6 +328,7 @@ fn run_tests() {
         a_clone_child_has_its_own_session_and_can_always_be_cancelled,
         a_clone_is_saved_once,
         deleting_a_task_stops_its_session_and_has_herdr_delete_it,
+        deleting_the_task_a_client_is_on_moves_it_to_the_next_task,
     ];
     // `cargo test <filter>` passes the filter on; options are for libtest, which this is not.
     let filters: Vec<String> = env::args().skip(1).filter(|a| !a.starts_with('-')).collect();

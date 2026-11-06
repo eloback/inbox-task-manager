@@ -145,7 +145,10 @@ Verified against Herdr 0.9.3. Re-check them after a Herdr upgrade.
   task) happens after the hand-off, from a detached process
   (`start_new_session=True`, `/bin/sh`). The Rust itm sends `server.stop`
   over the session's socket instead: Herdr answers before it stops (section
-  4, 2026-11-06).
+  4, 2026-11-06). Deleting then has Herdr delete the session (`herdr session
+  delete`, which refuses a running one and has no socket method) from a
+  detached `/bin/sh` in a session of its own (`itm setsid`), which tries
+  again every 0.5 s until the server is gone (at most 15 s).
 - A popup that moved its own client away exits right away. Otherwise it stays
   open in the old session (see the popup facts above) and is still there when
   you come back.
@@ -352,11 +355,16 @@ Verified against Herdr 0.9.3. Re-check them after a Herdr upgrade.
   empty host/owner folders it created. `exit_on_signals` turns SIGHUP (popup
   closed), SIGTERM and SIGINT into a clean exit for this, and ignores further
   signals while cleaning up. Signals already ignored when the clone starts
-  (`nohup`) stay ignored.
+  (`nohup`) stay ignored. In Rust, `ExitSignals` catches them (signal-hook)
+  until the cleanup is done; git gets SIGTERM, then SIGKILL after 10 s, and
+  itm exits with 128 + the signal (`Error::Exit`). Which signals are ignored
+  is read from `/proc/self/status` (`SigIgn`), else `ps -o sigignore=`: no
+  safe call asks for a signal's disposition.
 - Python installs signal handlers only in the main thread. A TUI must not
   call `clone_repo` from a worker thread; it runs
   `inbox-task-manager project add …` as a child process, which keeps the
-  cleanup above. That child:
+  cleanup above. The Rust TUI runs the same child (`Itm::clone_child`:
+  `ITM_SELF`, else the running binary, through `itm setsid`). That child:
   - gets `git clone --progress` (git prints no progress when its output is
     captured);
   - must not prompt: `stdin` closed, `GIT_TERMINAL_PROMPT=0`, ssh in batch
@@ -365,7 +373,9 @@ Verified against Herdr 0.9.3. Re-check them after a Herdr upgrade.
     a message to run `itm project add` in a terminal;
   - runs without `ITM_POPUP` (which would delay every error by 2.5 s);
   - is started with SIGTERM not ignored, since an already ignored signal
-    stays ignored during the clone and cancel would then not stop it;
+    stays ignored during the clone and cancel would then not stop it (Rust:
+    `itm setsid` catches SIGTERM before it execs, which exec resets to the
+    default; std cannot reset a signal without `unsafe`);
   - is stopped with SIGTERM on cancel and whenever the TUI exits, because in
     its own session it no longer gets the popup's SIGHUP.
 - Removing a project is refused while any task has it, archived ones
@@ -705,8 +715,10 @@ The switcher and its dialogs follow these principles.
   caller may run inside the session it stops (archiving the current task).
 - **Errors** are an enum (`error.rs`) whose messages are the Python itm's.
   Its variants are the errors callers tell apart (which Herdr failure, a
-  missing task or project, a folder already saved versus a name taken,
-  R8.4 and R8.5); everything else is a sentence written where it happens.
+  missing `herdr` or `git`, a missing task or project, a folder already
+  saved versus a name taken, R8.4 and R8.5, and `Exit`: an exit status
+  said by nothing else, for a no to a question and a signal that stopped a
+  clone); everything else is a sentence written where it happens.
 - **Dependencies**, each pinned exactly (`=x.y.z`, released at least two
   weeks before it was added):
   - clap: arguments and help, with subcommands, aliases and repeated
@@ -754,7 +766,14 @@ The switcher and its dialogs follow these principles.
     tests run the loop itself on ratatui's `TestBackend` with a scripted
     clock.
   - `itm snooze` without a time (R4.1) runs the snooze screen alone; Esc
-    is `cancelled` (exit 1, and no delay in a popup).
+    is `cancelled` (exit 1, and no delay in a popup). So do `itm delete`'s
+    question (no is exit 1 and says nothing, like the Python itm) and `itm
+    project remove`'s clone dialog.
+  - The editor for notes (Ctrl+O) is the one blocking call on the loop's
+    thread: the terminal is given back first (`Events::suspended`: raw mode
+    off, main screen), taken back after, and drawn again in full; nothing
+    reads keys meanwhile, and no lock is held. The preview's notes are read
+    by the load worker with the rest of the snapshot, so drawing stays pure.
 - **Other systems.** `system.rs` keeps `system.py`'s split: the process
   table from `/proc`, else `ps -ww` with one `-o` per column (bounded by a
   5 s timeout), and notifications through `osascript` on macOS (title and
@@ -771,7 +790,8 @@ The switcher and its dialogs follow these principles.
   `herdr.rs`, `switching.rs`, `daemon.rs` (`observe` asks Herdr,
   `poll_once` decides and records), `status.rs`, `projects.rs`, `notes.rs`,
   `system.rs` (what differs between operating systems), `paths.rs`,
-  `times.rs`, `error.rs` and `tui/` (`app.rs` state and keys without I/O,
+  `times.rs`, `error.rs`, `git.rs` (URL normalization, `insteadOf`, checkouts,
+  local work, the clone) and `tui/` (`app.rs` state and keys without I/O,
   `screen.rs` the screens over the list, `draw.rs` rendering, `mod.rs` the
   event loop and its workers). Tests sit
   next to the code; `tests/switching.rs` runs the switching protocol with
@@ -800,6 +820,8 @@ The switcher and its dialogs follow these principles.
 - **Settings files** are rewritten with LF line endings.
 - **Alt+3…9.** Alt+1, Alt+2 and Alt+5 were sent to a Herdr popup; the others
   are assumed to arrive the same way.
+- **Ignored signals on macOS and the BSDs** come from `ps -o sigignore=`,
+  which was run on Linux's `ps` only.
 - **macOS and the BSDs.** The `ps` paths, `osascript` and the launchd agent
   are covered by unit tests and CI, not by end-to-end runs with Herdr. The
   BSDs are untested. The Rust itm has not been built on macOS at all.
@@ -863,8 +885,13 @@ The switcher and its dialogs follow these principles.
 - `tests/switching.rs` checks the switching protocol with real processes
   and signals: the built `itm`, and the test binary itself playing `herdr`
   (symlinked under that name: an attached client that a signal detaches,
-  or a headless server answering on its socket). It has its own `main`
-  (`harness = false` in `Cargo.toml`); its tests run one after another.
+  a headless server answering on its socket, `session delete`) and `git`
+  (a clone that waits for a signal or fails as one that may not ask for a
+  password), so clones are stopped by real signals, under `nohup` and as
+  a TUI's `itm setsid` child. It has its own `main` (`harness = false` in
+  `Cargo.toml`); its tests run one after another. Unit tests fake git with
+  a small `sh` script (`projects::tests::fake_git`), run as `sh <script>`
+  rather than executed, which no parallel test's fork can make busy.
 - End to end, against a real headless Herdr with tmux as the terminal:
   `scripts/smoke.sh` (fake agents report themselves blocked over the socket
   API, no real agent runs) and `scripts/measure.sh`, both run through
@@ -876,7 +903,11 @@ The switcher and its dialogs follow these principles.
   the same output and errors; each lists the other's state as the other
   does; an edit of the other's file (the old single-project format too)
   changes nothing it should not; a Rust edit waits for the lock. Each
-  milestone adds its commands to it.
+  milestone adds its commands to it. Its git projects run the Python
+  build's inner entry point (`.itm-wrapped`: the wrapper puts its own git
+  first on `PATH`) with a git whose clone makes an empty checkout of the
+  URL, so no network is needed; where each side adds its own projects,
+  their random ids are replaced by names before comparing.
 
 ## 7. Packaging
 
