@@ -67,7 +67,9 @@ aarch64-linux and aarch64-darwin; elsewhere use its overlay.
 **Upgrading from the Python itm** (0.2.0): the Rust itm reads and writes
 the same files, so tasks, projects, notes and settings carry over.
 Uninstall the Python one (`pipx uninstall inbox-task-manager`, or `uv tool
-uninstall`), install this one, and restart the daemon. The command is
+uninstall inbox-task-manager`), install this one, and restart the daemon
+(an `itm attach` loop of the Python itm still counts as an itm client
+until you close it). The command is
 `itm` only: scripts that ran `inbox-task-manager` need `itm`. The
 switcher draws with your terminal's colors (`ITM_THEME` is gone).
 

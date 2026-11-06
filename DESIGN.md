@@ -961,10 +961,11 @@ The switcher and its dialogs follow these principles.
 
   \* The Python switcher has no `ITM_EXIT_AFTER_DRAW`; 175 ms is the
   standoff's measurement of its first frame with tasks, on the user's
-  machine with real data (Python start 17 ms, Textual import about 105 ms). The full product costs the Rust itm
-  little over the MVP: the binary is 3.7 MB, `itm status` reads the same
-  cache, and the daemon's extra work is one `session.snapshot` per running
-  session per pass (workspaces as well as agents) and the settings file.
+  machine with real data (Python start 17 ms, Textual import about 105
+  ms). The full product costs the Rust itm little over the MVP: the
+  binary is 3.7 MB, and its daemon reads a whole `session.snapshot` of
+  each running session (the workspaces as well as the agents) and the
+  settings file on every pass.
 - **Size.** Rust: 10,380 lines of product and 7,110 of tests (281 unit
   tests, 14 real-process tests in `tests/switching.rs`, 21 screen
   snapshots), 14 direct dependencies (138 crates in `Cargo.lock`); a
