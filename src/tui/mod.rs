@@ -56,6 +56,8 @@ use clones::{Clones, CloseOnDrop};
 const REFRESH: Duration = Duration::from_secs(2);
 /// While a worker runs, how long to wait for a key before looking for its result.
 const BUSY_POLL: Duration = Duration::from_millis(10);
+/// While a clone runs, how often the loop looks for a signal (a closing popup) to stop it.
+const SIGNAL_POLL: Duration = Duration::from_millis(100);
 
 /// What wakes the loop.
 #[derive(Debug)]
@@ -425,9 +427,11 @@ fn event_loop<B: Backend>(
         if let Some(signal) = signals.as_mut().and_then(ExitSignals::arrived) {
             return Err(Error::Exit(128 + signal as u8)); // the clones stop on the way out
         }
-        // Wake for the next refresh (unless one runs), for the message to go, and for a screen's check.
+        // Wake for the next refresh (unless one runs), for the message to go, for a screen's
+        // check, and while a clone runs, often enough to see a signal soon.
         let refresh = (!loading && !app.alone).then_some(next_refresh);
-        let deadline = [refresh, app.message.as_ref().map(|m| m.until), app.due()].into_iter().flatten().min();
+        let watch = (cloning > 0).then(|| app.now.instant + SIGNAL_POLL);
+        let deadline = [refresh, app.message.as_ref().map(|m| m.until), app.due(), watch].into_iter().flatten().min();
         let deadline = deadline.unwrap_or(app.now.instant + Duration::from_secs(3600));
         let input = events.next(&rx, deadline, loading || running > 0);
         app.now = events.now();

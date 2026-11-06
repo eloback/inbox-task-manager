@@ -59,6 +59,11 @@ marker() { cat "$runtime"/clients/[0-9]* 2>/dev/null | head -1; }
 # Predicates for wait_for, which runs its command again until it succeeds.
 marker_is() { test "$(marker)" = "$1"; }
 marker_is_not() { test -n "$(marker)" && test "$(marker)" != "$1"; }
+sandbox_pids() { # sandbox_pids <command line>: the processes with exactly it, of this sandbox only
+  for pid in $(pgrep -fx "$1"); do
+    tr '\0' '\n' <"/proc/$pid/environ" 2>/dev/null | grep -qx "ITM_SANDBOX=$root" && echo "$pid"
+  done
+}
 file_is() { test "$(cat "$1" 2>/dev/null)" = "$2"; }
 no_markers() { test -z "$(ls "$runtime/clients")"; }
 pane() { tmux -S "$tmux_sock" capture-pane -p -t e2e; }
@@ -90,10 +95,11 @@ trap cleanup EXIT
 # Herdr's popups (contrib/herdr-keys.toml, its keys; not its toast setting,
 # which would change where the checks below find notifications) run `itm`
 # from the server's PATH, with the server's EDITOR. Every server reads it
-# when it starts, so it goes in first.
-mkdir -p "$root/bin-itm" "$XDG_CONFIG_HOME/herdr"
+# when it starts, so it goes in first. $root/bin gets a fake git below: a
+# clone in a popup never reaches the network.
+mkdir -p "$root/bin-itm" "$root/bin" "$XDG_CONFIG_HOME/herdr"
 ln -sf "$itm" "$root/bin-itm/itm"
-export PATH="$root/bin-itm:$PATH"
+export PATH="$root/bin-itm:$root/bin:$PATH"
 sed '/^\[ui.toast\]/,$d' "$repo/contrib/herdr-keys.toml" >"$XDG_CONFIG_HOME/herdr/config.toml"
 printf '#!/bin/sh\necho "written in the editor" >>"$1"\n' >"$root/editor.sh"
 chmod +x "$root/editor.sh"
@@ -408,11 +414,42 @@ keys C-b S
 check "prefix+shift+s: the switcher" wait_for 5 shows '? all keys'
 keys Escape
 check "Esc closes it" wait_for 5 gone '? all keys'
+keys C-b S
+wait_for 5 shows '? all keys'
+keys C-p
+wait_for 5 shows 'repositories and folders'
+keys C-n
+keys -l "https://example.com/acme/slow2.git"
+keys Enter
+check "a clone runs in the popup's switcher" wait_for 10 shows 'Cloning… Receiving objects'
+popup_itm=$(sandbox_pids itm)
+# What closing the popup sends; the clone child, in a session of its own, gets nothing.
+[ -n "$popup_itm" ] && kill -HUP $popup_itm
+# Nothing of it: no process, no clone, no hidden folder (acme/ holds tool2, cloned above).
+clone_gone() { ! pgrep -f '[p]roject add git -- https://example.com/acme/slow2' >/dev/null && ! ls -a "$XDG_DATA_HOME/inbox-task-manager/projects/example.com/acme" | grep -q slow2; }
+check "SIGHUP during a clone stops it, keeping nothing (R8.8)" wait_for 10 clone_gone
+# A signal is no error: nothing is said, so the popup does not stay to show it.
+check "the switcher ends on the signal, not on a terminal error" sh -c "! tmux -S '$tmux_sock' capture-pane -p -t e2e | grep -q 'cannot read the terminal'"
+check "and the popup closes" wait_for 5 gone 'repositories and folders'
+# A form alone (prefix+t) has no 2 s refresh to wake it: the signal is still seen at once.
+keys C-b t
+wait_for 5 shows 'enter create'
+keys Tab Tab
+keys -l "https://example.com/acme/slow3.git"
+keys Enter
+wait_for 5 shows 'Clones to'
+keys Enter
+check "a clone runs from the New task form in its popup" wait_for 10 shows 'Cloning… Receiving objects'
+[ -n "$(sandbox_pids 'itm new')" ] && kill -HUP $(sandbox_pids 'itm new')
+slow3_gone() { ! pgrep -f '[p]roject add git -- https://example.com/acme/slow3' >/dev/null && ! ls -a "$XDG_DATA_HOME/inbox-task-manager/projects/example.com/acme" | grep -q slow3; }
+check "SIGHUP stops it within a second, keeping nothing" wait_for 1 slow3_gone
+wait_for 5 gone 'enter create'
 keys C-b t
 check "prefix+t: the New task form" wait_for 5 shows 'enter create'
 keys -l "Popup task"
 keys Enter
 check "Enter in the title creates the task and switches to it" wait_for 10 marker_is task-popup-task
+ready
 keys C-b Z
 check "prefix+shift+z: the snooze dialog for the current task" wait_for 5 shows 'Snooze “Popup task”'
 keys Enter
