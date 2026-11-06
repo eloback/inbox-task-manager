@@ -697,7 +697,14 @@ The switcher and its dialogs follow these principles.
   which hung the daemon in the standoff. A session whose socket exists but
   does not take a connection in time counts as running (stuck), so its
   requests time out instead of it looking stopped, which would wake tasks
-  snoozed until an agent asks.
+  snoozed until an agent asks. Linux refuses a connection to a full backlog
+  with EAGAIN; macOS and the BSDs refuse it with ECONNREFUSED, as they
+  refuse a socket nobody listens on. There itm asks the session's other
+  socket, `herdr-client.sock` (`refused_by_a_live_server`): a stuck server
+  still listens on it, while a session that stopped removed both sockets,
+  and one whose server crashed left both with nothing listening (checked
+  against Herdr 0.9.3 on Linux; the macOS path has its unit test but has
+  not run on macOS yet).
 - **Stopping a session** is a `server.stop` request, not a detached
   `/bin/sh herdr session stop`: Herdr answers before it shuts down, so the
   caller may run inside the session it stops (archiving the current task).
