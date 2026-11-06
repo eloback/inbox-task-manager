@@ -730,6 +730,28 @@ The switcher and its dialogs follow these principles.
     drop combining marks);
   - shlex: `$ITM_NOTIFY_COMMAND` and `$EDITOR` split like `shlex.split`;
   - insta (tests only): screen snapshots on ratatui's `TestBackend`.
+- **The switcher in Rust** keeps the Textual rules' intent in its own terms:
+  - The app (`tui/app.rs`) holds state and turns keys into actions with no
+    I/O and no clock; the event loop (`tui/mod.rs`) says what time it is,
+    draws, and runs anything that can block (Herdr, the store lock, a
+    hand-off) in a worker thread.
+  - Screens over the list (dialogs now; the form, Projects, Settings and
+    help later) are a stack (`tui/screen.rs`): only the top one gets keys,
+    so list keys never act on the task behind a dialog, and Esc closes only
+    the top. A new screen is a new `Screen` variant.
+  - The loop waits on one channel: keys from a reader thread, results from
+    workers; the 2 s refresh and a message's expiry are deadlines of that
+    wait, so nothing polls. One load runs at a time, and a job's result
+    asks for a load. A worker that panics still sends a result, so a
+    refresh always ends.
+  - The key reader stops before the terminal is given back: a reader still
+    blocked on the terminal would take keys meant for the
+    `herdr session attach` that follows a switch.
+  - Time, input and work are injected (`Clock`, `Work`, the backend), so
+    tests run the loop itself on ratatui's `TestBackend` with a scripted
+    clock.
+  - `itm snooze` without a time (R4.1) runs the snooze screen alone; Esc
+    is `cancelled` (exit 1, and no delay in a popup).
 - **Layout.** One crate, binary `itm` (the process-name rule): `cli.rs`
   (arguments and output), `itm.rs` (the `Itm` context: folders, Herdr, the
   process table and the time zone of one run, and the task operations the
@@ -738,7 +760,8 @@ The switcher and its dialogs follow these principles.
   `poll_once` decides and records), `status.rs`, `projects.rs`, `notes.rs`,
   `system.rs` (what differs between operating systems), `paths.rs`,
   `times.rs`, `error.rs` and `tui/` (`app.rs` state and keys without I/O,
-  `draw.rs` rendering, `mod.rs` the event loop and its workers). Tests sit
+  `screen.rs` the screens over the list, `draw.rs` rendering, `mod.rs` the
+  event loop and its workers). Tests sit
   next to the code; `tests/switching.rs` runs the switching protocol with
   real processes and signals.
 

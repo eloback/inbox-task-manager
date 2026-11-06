@@ -56,7 +56,7 @@ enum Command {
         #[arg(long)]
         no_switch: bool,
     },
-    /// Hide a task until a time: snooze [task] [when]
+    /// Hide a task until a time: snooze [task] [when]; without a time, a dialog
     Snooze {
         /// The task to snooze, when the first word should not be read as one
         #[arg(long)]
@@ -189,11 +189,20 @@ pub fn run(cli: Cli, itm: Itm) -> Result<()> {
             if switch { itm.switch_to(&name) } else { Ok(()) }
         }
         Command::Snooze { task, until_agent, words } => {
-            let (name, when) = split_snooze_args(&itm, &itm.store().load()?, task.as_deref(), &words)?;
+            let data = itm.store().load()?;
+            let (name, when) = split_snooze_args(&itm, &data, task.as_deref(), &words)?;
             let until = match (until_agent, when) {
                 (true, _) => Until::Agent,
                 (false, Some(when)) => Until::parse(&when, now, &itm.tz)?,
-                (false, None) => bail!("say when: itm snooze [task] <when> (2h, tomorrow 9:00, …) or --until-agent"),
+                // R4.1: without a time, the snooze dialog.
+                (false, None) => {
+                    if !(std::io::stdin().is_terminal() && std::io::stdout().is_terminal()) {
+                        bail!("this needs a terminal; pass the missing values as options");
+                    }
+                    let agent = Itm::agent_snooze_problem(&name, &itm.herdr.sessions()?, &itm.status()).is_none();
+                    let title = data.tasks.get(&name).map_or(name.as_str(), |t| t.title.as_str());
+                    tui::snooze_dialog(&name, title, agent, &itm.tz)?.ok_or(Error::Cancelled)?
+                }
             };
             itm.snooze_task(&name, until)?;
             println!("{name} snoozed {}", until.describe(now, &itm.tz));

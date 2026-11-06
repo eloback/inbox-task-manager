@@ -1,7 +1,8 @@
-//! The switcher's state and keys. No terminal and no threads here: keys
-//! come in, [`Action`]s go out, and the runner (`tui/mod.rs`) does the I/O.
-//! Only the dialog on top gets keys, so list keys can never act on the
-//! task behind a dialog.
+//! The switcher's state and keys. No terminal, no threads and no clock
+//! here: keys come in, [`Action`]s go out, and the event loop
+//! (`tui/mod.rs`) does the I/O and says what time it is. Only the screen on
+//! top of the stack gets keys, so list keys can never act on the task
+//! behind a dialog.
 
 use std::time::{Duration, Instant};
 
@@ -12,6 +13,7 @@ use ratatui::widgets::ListState;
 use tui_input::Input;
 use tui_input::backend::crossterm::EventHandler;
 
+use super::screen::{Context, Outcome, Screen, SnoozeDialog};
 use crate::error::Error;
 use crate::herdr::Sessions;
 use crate::itm::Itm;
@@ -20,7 +22,6 @@ use crate::snooze::{self, Until};
 use crate::status::Status;
 use crate::store::{Data, State, Task};
 use crate::tasks::inbox_order;
-use crate::times;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum View {
@@ -74,68 +75,17 @@ pub enum Row {
     Create,
 }
 
-#[derive(Debug, Clone)]
-pub enum Dialog {
-    /// Archiving stops a running session, and Ctrl+A is also a common Herdr
-    /// prefix: ask first.
-    Archive {
-        session: String,
-        title: String,
-    },
-    Snooze(SnoozeDialog),
+/// When the switcher acts: an instant for its timers, and the epoch second
+/// for what it shows ("in 2h", snooze presets).
+#[derive(Debug, Clone, Copy)]
+pub struct Moment {
+    pub instant: Instant,
+    pub epoch: i64,
 }
 
-/// Presets in time order, or a time typed (R4.1, UX principle 9).
-#[derive(Debug, Clone)]
-pub struct SnoozeDialog {
-    pub session: String,
-    pub title: String,
-    pub typed: Input,
-    pub presets: Vec<(&'static str, Until)>,
-    pub selected: usize,
-    pub error: Option<String>,
-}
-
-impl Dialog {
-    /// Keys go to the dialog on top only. Returns the dialog while it stays open.
-    fn on_key(self, key: KeyEvent, tz: &TimeZone) -> (Option<Dialog>, Action) {
-        match self {
-            Dialog::Archive { session, title } => match key.code {
-                KeyCode::Char('y') => (None, Action::Run(Job::Archive { session, title })),
-                KeyCode::Char('n') | KeyCode::Esc => (None, Action::None),
-                _ => (Some(Dialog::Archive { session, title }), Action::None),
-            },
-            Dialog::Snooze(mut dialog) => {
-                let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-                let last = dialog.presets.len().saturating_sub(1);
-                match key.code {
-                    KeyCode::Esc => return (None, Action::None),
-                    KeyCode::Up => dialog.selected = dialog.selected.saturating_sub(1),
-                    KeyCode::Char('k') if ctrl => dialog.selected = dialog.selected.saturating_sub(1),
-                    KeyCode::Down => dialog.selected = (dialog.selected + 1).min(last),
-                    KeyCode::Char('j') if ctrl => dialog.selected = (dialog.selected + 1).min(last),
-                    KeyCode::Enter => {
-                        let typed = dialog.typed.value().trim();
-                        let until = match typed {
-                            "" => Ok(dialog.presets[dialog.selected].1),
-                            typed => Until::parse(typed, times::now(), tz),
-                        };
-                        match until {
-                            Ok(until) => {
-                                let SnoozeDialog { session, title, .. } = dialog;
-                                return (None, Action::Run(Job::Snooze { session, title, until }));
-                            }
-                            Err(e) => dialog.error = Some(e.to_string()), // free text keeps working; say why not
-                        }
-                    }
-                    _ => {
-                        dialog.typed.handle_event(&Event::Key(key));
-                        dialog.error = None;
-                    }
-                }
-                (Some(Dialog::Snooze(dialog)), Action::None)
-            }
-        }
+impl Moment {
+    pub fn now() -> Moment {
+        Moment { instant: Instant::now(), epoch: crate::times::now() }
     }
 }
 
@@ -160,7 +110,7 @@ pub enum Action {
 pub struct Message {
     pub text: String,
     pub error: bool,
-    until: Instant,
+    pub until: Instant,
 }
 
 pub struct App {
@@ -170,24 +120,28 @@ pub struct App {
     pub snapshot: Option<Snapshot>,
     pub rows: Vec<Row>,
     pub list: ListState,
-    pub dialog: Option<Dialog>,
+    /// Screens over the list, the top one last.
+    pub screens: Vec<Screen>,
     pub message: Option<Message>,
     pub paths: Paths,
     pub tz: TimeZone,
+    /// The time the event loop last said it is.
+    pub now: Moment,
 }
 
 impl App {
-    pub fn new(view: View, paths: Paths, tz: TimeZone) -> App {
+    pub fn new(view: View, paths: Paths, tz: TimeZone, now: Moment) -> App {
         App {
             view,
             search: Input::default(),
             snapshot: None,
             rows: vec![],
             list: ListState::default(),
-            dialog: None,
+            screens: vec![],
             message: None,
             paths,
             tz,
+            now,
         }
     }
 
@@ -212,11 +166,11 @@ impl App {
 
     pub fn flash(&mut self, text: impl Into<String>, error: bool) {
         let shown_for = Duration::from_secs(if error { 8 } else { 4 });
-        self.message = Some(Message { text: text.into(), error, until: Instant::now() + shown_for });
+        self.message = Some(Message { text: text.into(), error, until: self.now.instant + shown_for });
     }
 
     pub fn expire_message(&mut self) {
-        self.message.take_if(|m| Instant::now() >= m.until);
+        self.message.take_if(|m| self.now.instant >= m.until);
     }
 
     /// A refresh arrived: show it, keeping the highlighted task (N3).
@@ -267,10 +221,17 @@ impl App {
     }
 
     pub fn on_key(&mut self, key: KeyEvent) -> Action {
-        if let Some(dialog) = self.dialog.take() {
-            let action;
-            (self.dialog, action) = dialog.on_key(key, &self.tz);
-            return action;
+        if let Some(top) = self.screens.last_mut() {
+            let cx = Context { tz: &self.tz, now: self.now.epoch };
+            match top.on_key(key, &cx) {
+                Outcome::Stay => {}
+                Outcome::Close => drop(self.screens.pop()),
+                Outcome::CloseAnd(action) => {
+                    self.screens.pop();
+                    return action;
+                }
+            }
+            return Action::None;
         }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
@@ -345,16 +306,9 @@ impl App {
     fn snooze(&mut self) {
         let (Some(snap), Some((session, task))) = (&self.snapshot, self.highlighted_task()) else { return };
         let agent = Itm::agent_snooze_problem(&session, &snap.sessions, &snap.status).is_none();
-        let presets = snooze::presets(times::now(), &self.tz, agent);
+        let presets = snooze::presets(self.now.epoch, &self.tz, agent);
         let title = task.title.clone();
-        self.dialog = Some(Dialog::Snooze(SnoozeDialog {
-            session,
-            title,
-            typed: Input::default(),
-            presets,
-            selected: 0,
-            error: None,
-        }));
+        self.screens.push(Screen::Snooze(SnoozeDialog::new(session, title, presets)));
     }
 
     fn wake(&mut self) -> Action {
@@ -373,7 +327,7 @@ impl App {
         let title = task.title.clone();
         let running = self.snapshot.as_ref().and_then(|s| s.sessions.get(&session)).is_some_and(|s| s.running);
         if running {
-            self.dialog = Some(Dialog::Archive { session, title });
+            self.screens.push(Screen::ConfirmArchive { session, title });
             return Action::None;
         }
         Action::Run(Job::Archive { session, title })
@@ -397,7 +351,7 @@ impl App {
                 if current.as_deref() == Some(&session) {
                     return Action::Quit; // its clients moved to the next task, this one included
                 }
-                self.flash(format!("Snoozed “{title}” {}.", until.describe(times::now(), &self.tz)), false);
+                self.flash(format!("Snoozed “{title}” {}.", until.describe(self.now.epoch, &self.tz)), false);
             }
             (Job::Create { title }, Ok(session)) => match problem {
                 None => return Action::Switch(session),
@@ -466,7 +420,8 @@ pub mod tests {
     }
 
     pub fn app(snap: Snapshot) -> App {
-        let mut app = App::new(View::Inbox, Paths::under(std::path::Path::new("/r")), TimeZone::UTC);
+        let now = Moment { instant: Instant::now(), epoch: NOW };
+        let mut app = App::new(View::Inbox, Paths::under(std::path::Path::new("/r")), TimeZone::UTC, now);
         app.loaded(Ok(snap));
         app
     }
@@ -557,14 +512,14 @@ pub mod tests {
     fn archiving_a_running_task_asks_first_and_the_dialog_takes_every_key() {
         let mut app = app(snapshot());
         assert_eq!(app.on_key(ctrl('a')), Action::None);
-        assert!(matches!(app.dialog, Some(Dialog::Archive { .. })));
+        assert!(matches!(app.screens[..], [Screen::ConfirmArchive { .. }]));
         // List keys do nothing behind the dialog.
         for k in [key(KeyCode::Enter), key(KeyCode::Down), ctrl('a'), key(KeyCode::Tab)] {
             assert_eq!(app.on_key(k), Action::None);
         }
         assert_eq!(app.view, View::Inbox);
         app.on_key(key(KeyCode::Esc));
-        assert!(app.dialog.is_none());
+        assert!(app.screens.is_empty());
         app.on_key(ctrl('a'));
         let archive = Job::Archive { session: "task-fix-login".into(), title: "Fix login".into() };
         assert_eq!(app.on_key(key(KeyCode::Char('y'))), Action::Run(archive));
@@ -577,10 +532,24 @@ pub mod tests {
     }
 
     #[test]
+    fn only_the_top_screen_gets_keys_and_esc_closes_only_it() {
+        let mut app = app(snapshot());
+        app.on_key(ctrl('a')); // the archive question, over the list
+        let presets = vec![("1 hour", Until::Time(NOW + 3600))];
+        app.screens.push(Screen::Snooze(SnoozeDialog::new("task-x".into(), "X".into(), presets)));
+        assert_eq!(app.on_key(key(KeyCode::Char('y'))), Action::None, "y is typed into the snooze dialog");
+        app.on_key(key(KeyCode::Esc));
+        assert!(matches!(app.screens[..], [Screen::ConfirmArchive { .. }]));
+        let archive = Job::Archive { session: "task-fix-login".into(), title: "Fix login".into() };
+        assert_eq!(app.on_key(key(KeyCode::Char('y'))), Action::Run(archive));
+        assert!(app.screens.is_empty());
+    }
+
+    #[test]
     fn the_snooze_dialog_takes_a_preset_or_a_typed_time() {
         let mut app = app(snapshot());
-        let agent_preset = |app: &App| match &app.dialog {
-            Some(Dialog::Snooze(dialog)) => dialog.presets.iter().any(|p| p.1 == Until::Agent),
+        let agent_preset = |app: &App| match &app.screens[..] {
+            [Screen::Snooze(dialog)] => dialog.presets.iter().any(|p| p.1 == Until::Agent),
             _ => panic!("no snooze dialog"),
         };
         app.on_key(ctrl('z'));
@@ -594,12 +563,12 @@ pub mod tests {
             panic!("no snooze")
         };
         assert_eq!(session, "task-write-docs");
-        assert!(app.dialog.is_none());
+        assert!(app.screens.is_empty());
 
         app.on_key(ctrl('z'));
         typed(&mut app, "soonish");
         assert_eq!(app.on_key(key(KeyCode::Enter)), Action::None);
-        let Some(Dialog::Snooze(dialog)) = &app.dialog else { panic!("the dialog stays open") };
+        let [Screen::Snooze(dialog)] = &app.screens[..] else { panic!("the dialog stays open") };
         assert_eq!(dialog.error.as_deref(), Some("cannot understand snooze time: soonish"));
         for _ in 0..7 {
             app.on_key(key(KeyCode::Backspace));

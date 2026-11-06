@@ -41,6 +41,8 @@ pub enum Error {
         name: String,
         folder: String,
     },
+    /// The user closed a dialog without choosing.
+    Cancelled,
     /// Anything else.
     Other(String),
 }
@@ -91,6 +93,7 @@ impl fmt::Display for Error {
                 shell_quote(name),
                 shell_quote(folder)
             ),
+            Error::Cancelled => f.write_str("cancelled"),
             Error::Other(message) => f.write_str(message),
         }
     }

@@ -30,8 +30,9 @@ fn main() -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("itm: {e}");
-            // A Herdr popup closes when its command exits: keep the error readable.
-            if std::env::var_os("ITM_POPUP").is_some() {
+            // A Herdr popup closes when its command exits: keep the error readable
+            // (a dialog closed on purpose needs no reading).
+            if e != error::Error::Cancelled && std::env::var_os("ITM_POPUP").is_some() {
                 std::thread::sleep(Duration::from_millis(2500));
             }
             ExitCode::FAILURE

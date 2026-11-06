@@ -2,13 +2,15 @@
 //! inbox list, a preview of the highlighted task, at most seven keys.
 //! Pure: what is drawn depends only on the app and `now`.
 
+use jiff::tz::TimeZone;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Margin, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, List, ListItem, Paragraph, Wrap};
 
-use super::app::{App, Dialog, Row, Snapshot, SnoozeDialog, View};
+use super::app::{App, Row, Snapshot, View};
+use super::screen::{Screen, SnoozeDialog};
 use crate::snooze::Until;
 use crate::status::AgentState;
 use crate::store::{State, Task};
@@ -93,9 +95,14 @@ pub fn draw(frame: &mut Frame, app: &mut App, now: i64) {
         frame.render_widget(Paragraph::new(colored(m.text.clone(), if m.error { ERROR } else { SUCCESS })), message);
     }
     frame.render_widget(Paragraph::new(hints), keys);
-    if let Some(dialog) = &app.dialog {
-        draw_dialog(frame, app, dialog, area, now);
+    for screen in &app.screens {
+        draw_screen(frame, screen, area, &app.tz, now);
     }
+}
+
+/// A screen with nothing behind it (`itm snooze` without a time).
+pub fn draw_alone(frame: &mut Frame, screen: &Screen, tz: &TimeZone, now: i64) {
+    draw_screen(frame, screen, frame.area(), tz, now);
 }
 
 /// Views are always shown with their counts (R6.1), and the inbox says
@@ -135,7 +142,7 @@ fn draw_search(frame: &mut Frame, app: &App, area: Rect) {
     let text =
         if typed.is_empty() { muted("Search tasks · or type a new title") } else { Span::raw(typed.to_string()) };
     frame.render_widget(Paragraph::new(Line::from(vec![colored("› ", ACCENT), text])), area);
-    if app.dialog.is_none() {
+    if app.screens.is_empty() {
         frame.set_cursor_position((area.x + 2 + app.search.visual_cursor() as u16, area.y));
     }
 }
@@ -372,10 +379,10 @@ fn dialog_box(frame: &mut Frame, area: Rect, height: u16) -> Rect {
     inside
 }
 
-fn draw_dialog(frame: &mut Frame, app: &App, dialog: &Dialog, area: Rect, now: i64) {
-    match dialog {
-        Dialog::Archive { title, .. } => draw_archive(frame, title, area),
-        Dialog::Snooze(snooze) => draw_snooze(frame, app, snooze, area, now),
+fn draw_screen(frame: &mut Frame, screen: &Screen, area: Rect, tz: &TimeZone, now: i64) {
+    match screen {
+        Screen::ConfirmArchive { title, .. } => draw_archive(frame, title, area),
+        Screen::Snooze(snooze) => draw_snooze(frame, snooze, area, tz, now),
     }
 }
 
@@ -400,7 +407,7 @@ fn draw_archive(frame: &mut Frame, title: &str, area: Rect) {
 }
 
 /// Presets before free text, sorted by time; free text keeps working (UX principle 9).
-fn draw_snooze(frame: &mut Frame, app: &App, dialog: &SnoozeDialog, area: Rect, now: i64) {
+fn draw_snooze(frame: &mut Frame, dialog: &SnoozeDialog, area: Rect, tz: &TimeZone, now: i64) {
     let inside = dialog_box(frame, area, dialog.presets.len() as u16 + 9);
     let [title, _, typed, _, presets, _, error, keys] = Layout::vertical([
         Constraint::Length(1),
@@ -422,7 +429,7 @@ fn draw_snooze(frame: &mut Frame, app: &App, dialog: &SnoozeDialog, area: Rect, 
     frame.set_cursor_position((typed.x + 2 + dialog.typed.visual_cursor() as u16, typed.y));
     let rows = dialog.presets.iter().enumerate().map(|(i, (label, until))| {
         let (when, color) = match until {
-            Until::Time(ts) => (day_and_clock(*ts, now, &app.tz), Color::Reset),
+            Until::Time(ts) => (day_and_clock(*ts, now, tz), Color::Reset),
             Until::Agent => ("no timer".to_string(), WARNING),
         };
         let width = presets.width as usize;
@@ -485,7 +492,7 @@ mod tests {
         let mut app = app(snapshot());
         app.on_key(key(KeyCode::Down));
         app.on_key(ctrl('z'));
-        let Some(Dialog::Snooze(dialog)) = &mut app.dialog else { panic!("no dialog") };
+        let [Screen::Snooze(dialog)] = &mut app.screens[..] else { panic!("no dialog") };
         // Fixed times, so the screen does not depend on the clock.
         dialog.presets = vec![("1 hour", Until::Time(NOW + 3600)), ("Until an agent needs me", Until::Agent)];
         insta::assert_snapshot!(screen(&mut app));
@@ -533,7 +540,8 @@ mod tests {
 
     #[test]
     fn before_the_first_load() {
-        let mut app = App::new(View::Inbox, crate::paths::Paths::under("/r".as_ref()), jiff::tz::TimeZone::UTC);
+        let now = super::super::app::Moment { instant: std::time::Instant::now(), epoch: NOW };
+        let mut app = App::new(View::Inbox, crate::paths::Paths::under("/r".as_ref()), TimeZone::UTC, now);
         assert!(screen(&mut app).contains("Loading…"));
     }
 }
