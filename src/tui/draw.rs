@@ -300,10 +300,14 @@ fn preview(app: &App, now: i64) -> (Vec<Line<'static>>, Option<&'static str>) {
         _ => return (vec![], None),
     };
     let mut lines = vec![Line::from(Span::styled(task.title.clone(), Style::new().bold()))];
-    for id in &task.projects {
-        if let Some(project) = snap.data.projects.get(id) {
-            let place = app.paths.place(project);
-            lines.push(Line::from(vec![colored(format!("◆ {}", project.name), PROJECT), muted(format!("  {place}"))]));
+    for (id, project) in task.projects.iter().filter_map(|id| Some((id, snap.data.projects.get(id)?))) {
+        lines.push(Line::from(vec![
+            colored(format!("◆ {}", project.name), PROJECT),
+            muted(format!("  {}", project.kind())),
+        ]));
+        lines.push(Line::from(muted(format!("  {}", app.paths.place(project)))));
+        if snap.missing.contains(id) {
+            lines.push(Line::from(colored("  Its folder is missing, so it gets no workspace.", ERROR)));
         }
     }
     if let Some(description) = &task.description {
@@ -348,7 +352,7 @@ fn preview(app: &App, now: i64) -> (Vec<Line<'static>>, Option<&'static str>) {
         let session = snap.sessions.get(name);
         lines.push(Line::from(match session {
             _ if !snap.listed => colored("Session unknown: Herdr is not answering", WARNING),
-            None => muted(format!("Not started yet · starts in {}", app.paths.display(&app.paths.task_dir))),
+            None => muted(not_started(app, snap, task)),
             Some(s) if !s.running => muted("Session stopped · opens where you left it"),
             Some(_) if snap.status.fresh => muted("No agents running"),
             Some(_) => colored("Agents unknown: the daemon is not running", WARNING),
@@ -361,6 +365,19 @@ fn preview(app: &App, now: i64) -> (Vec<Line<'static>>, Option<&'static str>) {
         State::Archived => "reopen",
     };
     (lines, Some(enter))
+}
+
+/// Where a session that never ran will start (R1.2): in its first project
+/// whose folder is there, with a workspace per such project, else in the
+/// task folder.
+fn not_started(app: &App, snap: &Snapshot, task: &Task) -> String {
+    let folders: Vec<&str> = (task.projects.iter())
+        .filter(|id| !snap.missing.contains(*id))
+        .filter_map(|id| snap.data.projects.get(id)?.path.as_deref())
+        .collect();
+    let folder = folders.first().map_or_else(|| app.paths.task_dir.clone(), std::path::PathBuf::from);
+    let more = if folders.len() > 1 { format!(", with {} workspaces", folders.len()) } else { String::new() };
+    format!("Not started yet · starts in {}{more}", app.paths.display(&folder))
 }
 
 /// A box of `height` rows in the middle of `area`, at most 64 columns wide;
@@ -536,6 +553,40 @@ mod tests {
         assert_eq!(Columns::fitting(50, 19), Columns { title: 19, project: 12 });
         assert_eq!(Columns::fitting(40, 19), Columns { title: 21, project: 0 });
         assert_eq!(Columns::fitting(10, 19), Columns { title: 0, project: 0 });
+    }
+
+    /// R1.2: the preview says where a session that never ran starts: its first
+    /// project whose folder is there (not a missing one, not a name only).
+    #[test]
+    fn a_task_that_never_ran_starts_in_its_first_project_with_a_folder() {
+        let mut snap = snapshot();
+        let project = |name: &str, path: Option<&str>| crate::store::Project {
+            name: name.into(),
+            path: path.map(Into::into),
+            url: None,
+            added_at: 0,
+            last_used_at: 0,
+            extra: Default::default(),
+        };
+        snap.data.projects.insert("p1".into(), project("Client X", None));
+        snap.data.projects.insert("p2".into(), project("gone", Some("/r/home/gone")));
+        snap.data.projects.insert("p3".into(), project("api", Some("/r/home/code/api")));
+        snap.data.projects.insert("p4".into(), project("web", Some("/r/home/code/web")));
+        snap.missing.insert("p2".into());
+        snap.data.tasks.get_mut("task-old-idea").unwrap().projects = vec!["p1".into(), "p2".into(), "p3".into()];
+        let mut app = app(snap.clone());
+        app.on_key(key(KeyCode::Down));
+        app.on_key(key(KeyCode::Down));
+        let shown = screen(&mut app);
+        assert!(shown.contains("◆ Client X  name") && shown.contains("no folder"), "{shown}");
+        assert!(shown.contains("Its folder is missing, so it gets"), "{shown}");
+        let starts = |snap: &Snapshot| not_started(&app, snap, &snap.data.tasks["task-old-idea"]);
+        assert_eq!(starts(&snap), "Not started yet · starts in ~/code/api");
+
+        snap.data.tasks.get_mut("task-old-idea").unwrap().projects = vec!["p3".into(), "p4".into()];
+        assert_eq!(starts(&snap), "Not started yet · starts in ~/code/api, with 2 workspaces");
+        snap.data.tasks.get_mut("task-old-idea").unwrap().projects = vec!["p1".into()];
+        assert_eq!(starts(&snap), "Not started yet · starts in ~");
     }
 
     #[test]

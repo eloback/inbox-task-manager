@@ -3,6 +3,7 @@
 //! saves folders only; git projects the Python itm saved are listed and used
 //! as they are.
 
+use std::collections::BTreeSet;
 use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -127,6 +128,13 @@ impl Itm {
         }
         Ok(())
     }
+}
+
+/// Ids of the projects whose folder is set and not there; a project
+/// without a folder has none to miss.
+pub fn missing_folders(data: &Data) -> BTreeSet<String> {
+    let missing = |p: &Project| p.path.as_ref().is_some_and(|path| !Path::new(path).is_dir());
+    data.projects.iter().filter(|(_, p)| missing(p)).map(|(id, _)| id.clone()).collect()
 }
 
 /// The id of the project named `query` (ignoring case), or with that id.

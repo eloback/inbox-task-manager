@@ -25,8 +25,10 @@ use crate::store::write_atomic;
 use crate::system::which;
 
 /// The loop may be between two attaches: look for its attach child this
-/// many times, this far apart, before giving up on it.
-const FIND_CHILD: (u32, Duration) = (20, Duration::from_millis(100));
+/// many times, this far apart, before giving up on it. Unit tests describe
+/// the process table, so they need not wait as long.
+const FIND_CHILD: (u32, Duration) =
+    if cfg!(test) { (3, Duration::from_millis(10)) } else { (20, Duration::from_millis(100)) };
 
 /// Whether a command line is an itm process. Part of the protocol: a
 /// marker whose process fails this is stale and deleted, so every entry
@@ -372,7 +374,7 @@ pub mod tests {
         let (_tmp, itm, fake) = itm_with(FakeProcs::default());
         fake.add(10, 1, &["itm", "attach"]);
         marker(&itm, 10, "task-a");
-        assert!(!itm.handoff("task-c", None, false).unwrap()); // waits FIND_CHILD (2 s) for the child
+        assert!(!itm.handoff("task-c", None, false).unwrap()); // after looking for the child FIND_CHILD times
         assert!(!itm.paths.clients().unwrap().join("10.next").exists());
     }
 

@@ -99,7 +99,8 @@ impl Work for Itm {
             true => (self.current_session(&sessions), self.switchable_session(&sessions).err().map(|e| e.to_string())),
             false => (None, None),
         };
-        Ok(Snapshot { data, sessions, status: self.status(), current, switch_problem, listed })
+        let missing = crate::projects::missing_folders(&data);
+        Ok(Snapshot { data, sessions, status: self.status(), current, switch_problem, listed, missing })
     }
 
     fn perform(&self, job: &Job) -> Result<String> {

@@ -4,6 +4,7 @@
 //! top of the stack gets keys, so list keys can never act on the task
 //! behind a dialog.
 
+use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
 
 use clap::ValueEnum;
@@ -65,6 +66,9 @@ pub struct Snapshot {
     pub switch_problem: Option<String>,
     /// False when Herdr's sessions could not be listed: they are unknown, not absent.
     pub listed: bool,
+    /// Ids of the projects whose folder is set and not there. A project
+    /// without a folder is never missing (DESIGN.md section 2, Projects).
+    pub missing: BTreeSet<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
