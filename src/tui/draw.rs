@@ -506,7 +506,9 @@ fn draw_remove(frame: &mut Frame, dialog: &RemoveDialog, area: Rect) {
         false => &[("enter", "remove"), ("esc", "cancel, nothing changes")],
     };
     lines.push(key_hints(keys));
-    let inside = dialog_box(frame, area, lines.len() as u16 + 4);
+    // Each line on as many rows as it wraps to inside the box (64 columns, less border and margin).
+    let rows: usize = lines.iter().map(|line| line.width().max(1).div_ceil(60)).sum();
+    let inside = dialog_box(frame, area, rows as u16 + 2);
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inside);
 }
 
@@ -609,6 +611,69 @@ mod tests {
         let mut app = app(snapshot());
         app.on_key(ctrl('a'));
         insta::assert_snapshot!(screen(&mut app));
+    }
+
+    #[test]
+    fn the_delete_dialog() {
+        let mut app = app(snapshot());
+        app.on_key(ctrl('d'));
+        insta::assert_snapshot!(screen(&mut app));
+    }
+
+    /// R8.7: a clean clone is offered for deleting, keeping it first.
+    #[test]
+    fn the_remove_dialog() {
+        use crate::projects::{CloneState, RemovalPlan};
+        use crate::store::Project;
+        use crate::tui::screen::RemoveDialog;
+        let project = Project {
+            name: "api".into(),
+            path: Some("/r/data/projects/github.com/acme/api".into()),
+            url: Some("git@github.com:acme/api.git".into()),
+            added_at: 1,
+            last_used_at: 1,
+            extra: Default::default(),
+        };
+        let clean = Some(CloneState::Deletable { local_work: None });
+        let plan = RemovalPlan { id: "p1".into(), project, users: vec![], clone: clean };
+        let mut app = app(snapshot());
+        app.screens.push(Screen::RemoveProject(RemoveDialog::new(&plan, &app.paths)));
+        insta::assert_snapshot!(screen(&mut app));
+        let busy = RemovalPlan { users: vec!["Fix login".into()], ..plan };
+        app.screens = vec![Screen::RemoveProject(RemoveDialog::new(&busy, &app.paths))];
+        let shown = screen(&mut app);
+        assert!(
+            shown.contains("Used by 1 task(s), archived ones included:") && shown.contains("· Fix login"),
+            "{shown}"
+        );
+        assert!(shown.contains("esc back") && !shown.contains("enter remove"), "{shown}");
+    }
+
+    /// R9.5: the preview says when the notes changed and shows their last
+    /// lines, without what itm started them with.
+    #[test]
+    fn the_preview_shows_the_end_of_the_notes() {
+        use crate::tui::app::NotesTail;
+        let mut snap = snapshot();
+        let lines = [
+            "# Fix login",
+            "*Created 2026-11-05 10:00 · no project · task-fix-login*",
+            "after 5 min",
+            "## 2026-11-05 11:00 · Note",
+            "tried the cookie flag",
+            "Safari drops it",
+        ];
+        let tail = NotesTail { modified: NOW - 7200, lines: lines.map(String::from).to_vec() };
+        snap.notes.insert("task-fix-login".into(), tail);
+        let shown = screen(&mut app(snap.clone()));
+        assert!(shown.contains("Notes · edited 2h ago"), "{shown}");
+        for line in ["## 2026-11-05 11:00 · Note", "tried the cookie flag", "Safari drops it"] {
+            assert!(shown.contains(&format!("  {line}")), "{line}: {shown}");
+        }
+        assert!(!shown.contains("*Created") && !shown.contains("# Fix login"), "{shown}");
+        let started = NotesTail { modified: NOW, lines: lines[..3].iter().map(|l| l.to_string()).collect() };
+        snap.notes.insert("task-fix-login".into(), started);
+        assert!(screen(&mut app(snap)).contains("Notes · nothing written yet"), "the description is no note");
     }
 
     #[test]

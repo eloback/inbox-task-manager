@@ -653,4 +653,81 @@ pub mod tests {
         app.done(wake, Err(Error::Other("task-later is not snoozed".into())));
         assert!(app.message.as_ref().is_some_and(|m| m.error && m.text == "task-later is not snoozed"));
     }
+
+    /// R5.3: Ctrl+D always asks; only y deletes, and deleting the task this
+    /// switcher runs in closes it (R4.7).
+    #[test]
+    fn ctrl_d_asks_before_deleting() {
+        let mut snap = snapshot();
+        snap.current = Some("task-write-docs".into());
+        let mut app = app(snap);
+        assert_eq!(app.on_key(ctrl('d')), Action::None);
+        assert!(matches!(&app.screens[..], [Screen::ConfirmDelete { session, .. }] if session == "task-fix-login"));
+        assert_eq!(app.on_key(key(KeyCode::Enter)), Action::None, "only y deletes");
+        assert_eq!(app.on_key(key(KeyCode::Char('n'))), Action::None);
+        assert!(app.screens.is_empty());
+        app.on_key(ctrl('d'));
+        let delete = Job::Delete { session: "task-fix-login".into(), title: "Fix login".into() };
+        assert_eq!(app.on_key(key(KeyCode::Char('y'))), Action::Run(delete.clone()));
+        assert_eq!(app.done(delete, Ok(String::new())), Action::None);
+        assert_eq!(app.message.as_ref().map(|m| m.text.as_str()), Some("Deleted “Fix login”."));
+        let here = Job::Delete { session: "task-write-docs".into(), title: "Write docs".into() };
+        assert_eq!(app.done(here, Ok(String::new())), Action::Quit);
+    }
+
+    /// R9.4: Ctrl+O opens the highlighted task's notes, in any view.
+    #[test]
+    fn ctrl_o_opens_the_highlighted_tasks_notes_in_any_view() {
+        let mut app = app(snapshot());
+        assert_eq!(app.on_key(ctrl('o')), Action::Notes("task-fix-login".into()));
+        app.on_key(key(KeyCode::BackTab)); // All
+        app.on_key(key(KeyCode::BackTab)); // Archived
+        assert_eq!(app.view, View::Archived);
+        assert_eq!(app.on_key(ctrl('o')), Action::Notes("task-shipped".into()));
+        typed(&mut app, "nothing like it");
+        assert_eq!(app.on_key(ctrl('o')), Action::None, "the Create row has no notes");
+    }
+
+    /// R8.7: the remove dialog offers deleting only a clean clone of itm's own, keeping it first.
+    #[test]
+    fn the_remove_dialog_offers_only_what_may_happen() {
+        use crate::projects::{CloneState, RemovalPlan};
+        use crate::store::Project;
+        use crate::tui::screen::RemoveDialog;
+        let plan = |clone: Option<CloneState>, users: &[&str]| RemovalPlan {
+            id: "p1".into(),
+            project: Project {
+                name: "api".into(),
+                path: Some("/r/home/src/api".into()),
+                url: clone.as_ref().map(|_| "git@github.com:acme/api.git".into()),
+                added_at: 1,
+                last_used_at: 1,
+                extra: Default::default(),
+            },
+            users: users.iter().map(|u| u.to_string()).collect(),
+            clone,
+        };
+        let paths = Paths::under(std::path::Path::new("/r"));
+        let dialog = |plan: RemovalPlan| RemoveDialog::new(&plan, &paths);
+        let clean = || Some(CloneState::Deletable { local_work: None });
+        assert_eq!(dialog(plan(clean(), &[])).choices, [CloneChoice::Keep, CloneChoice::IfClean]);
+        let busy = Some(CloneState::Deletable { local_work: Some("stashes".into()) });
+        assert_eq!(dialog(plan(busy, &[])).choices, [CloneChoice::Keep]);
+        assert_eq!(dialog(plan(Some(CloneState::Foreign), &[])).choices, [CloneChoice::Keep]);
+        assert_eq!(dialog(plan(None, &[])).choices, [CloneChoice::Keep], "a folder is only forgotten");
+        assert_eq!(dialog(plan(clean(), &["A task"])).choices, [], "nothing while a task has it");
+        assert_eq!(dialog(plan(clean(), &[])).folder.as_deref(), Some("~/src/api"));
+
+        let mut app = app(snapshot());
+        let removed = |choice| Action::Run(Job::RemoveProject { id: "p1".into(), name: "api".into(), choice });
+        app.screens.push(Screen::RemoveProject(dialog(plan(clean(), &[]))));
+        assert_eq!(app.on_key(key(KeyCode::Enter)), removed(CloneChoice::Keep), "keeping is the default");
+        app.screens.push(Screen::RemoveProject(dialog(plan(clean(), &[]))));
+        app.on_key(key(KeyCode::Down));
+        assert_eq!(app.on_key(key(KeyCode::Enter)), removed(CloneChoice::IfClean));
+        app.screens.push(Screen::RemoveProject(dialog(plan(clean(), &["A task"]))));
+        assert_eq!(app.on_key(key(KeyCode::Enter)), Action::None, "nothing to choose");
+        assert_eq!(app.on_key(key(KeyCode::Esc)), Action::None);
+        assert!(app.screens.is_empty(), "esc changes nothing");
+    }
 }

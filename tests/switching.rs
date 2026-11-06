@@ -8,7 +8,16 @@
 //! - `herdr server` (with `HERDR_SESSION`): a headless session that logs
 //!   "server <pid> <session id> <name> <HERDR_* variables>" and each
 //!   workspace it is asked to open, and answers on its socket until
-//!   `server.stop`; for a session named `*-broken` it exits with 1 instead.
+//!   `server.stop`; for a session named `*-broken` it exits with 1 instead;
+//! - `herdr session delete <name> --json`: refused while the session
+//!   answers, else its folder goes and "deleted <name>" is logged.
+//!
+//! Put on `PATH` as `git`, it plays the git a clone runs: `git clone` logs
+//! "clone <pid> <session id> <url> <GIT_TERMINAL_PROMPT>", writes part of
+//! the checkout and progress, and then, for a URL with `slow`, waits for
+//! SIGTERM or SIGINT; for one with `password` it fails as git does when it
+//! may not ask; else it finishes the checkout. `ls-remote --get-url` and
+//! `remote get-url origin` answer as git would for such a checkout.
 //!
 //! Every process gets a temporary home and XDG folders, and no `HERDR_*`
 //! variable but the ones a test sets. The unit tests describe the process
@@ -34,6 +43,7 @@ fn main() {
     let me = env::args().next().unwrap_or_default();
     match Path::new(&me).file_name().and_then(|n| n.to_str()) {
         Some("herdr") => fake_herdr(env::args().skip(1).collect()),
+        Some("git") => fake_git(env::args().skip(1).collect()),
         _ => run_tests(),
     }
 }
@@ -186,6 +196,105 @@ fn a_failed_first_start_is_said_and_the_attach_goes_on() {
     );
 }
 
+/// R8.6, DESIGN.md section 2: a signal during a clone (SIGTERM: a cancel,
+/// SIGHUP: a popup closed) stops git and keeps nothing, not the hidden
+/// folder nor the host and owner folders; itm ends with 128 + the signal.
+fn a_clone_stopped_by_a_signal_stops_git_and_keeps_nothing() {
+    for (name, sig, status) in
+        [("SIGTERM", Signal::TERM, 143), ("SIGINT", Signal::INT, 130), ("SIGHUP", Signal::HUP, 129)]
+    {
+        let world = World::new();
+        let mut add =
+            world.spawn(Command::new(ITM).args(["project", "add", "git", "https://example.com/acme/slow.git"]));
+        let git = world.cloning();
+        signal(add.id(), sig);
+        assert_eq!(world.ended(&mut add).code(), Some(status), "{name}");
+        assert!(!alive(git), "{name}: git was left running");
+        assert!(
+            world.log().contains(&"git stopped".to_string()),
+            "{name}: git was not asked to stop: {:?}",
+            world.log()
+        );
+        assert_eq!(world.projects_left(), Vec::<String>::new(), "{name}");
+        assert!(!world.tasks().contains("example.com"), "{name}: a project was saved");
+    }
+}
+
+/// DESIGN.md section 2: signals ignored before a clone (`nohup`) stay
+/// ignored: closing the terminal does not stop it, SIGTERM still does.
+fn signals_ignored_before_a_clone_stay_ignored() {
+    let world = World::new();
+    let mut add =
+        world.spawn(Command::new("nohup").args([ITM, "project", "add", "git", "https://example.com/acme/slow.git"]));
+    let git = world.cloning();
+    signal(add.id(), Signal::HUP);
+    thread::sleep(Duration::from_millis(300));
+    assert!(alive(add.id()) && alive(git), "SIGHUP stopped a clone started with nohup");
+    signal(add.id(), Signal::TERM);
+    assert_eq!(world.ended(&mut add).code(), Some(143));
+    assert_eq!(world.projects_left(), Vec::<String>::new());
+}
+
+/// R8.8: a TUI's clone child runs in its own session through `itm setsid`,
+/// which makes sure SIGTERM can cancel it even when the TUI was started
+/// with SIGTERM ignored; a repository that needs a password fails with
+/// git's words for the TUI to read, and keeps nothing.
+fn a_clone_child_has_its_own_session_and_can_always_be_cancelled() {
+    let world = World::new();
+    // As a TUI started with SIGTERM ignored would start it.
+    let child = r#"trap '' TERM; exec "$0" setsid "$0" project add git https://example.com/acme/slow.git"#;
+    let mut add = world.spawn(Command::new("sh").args(["-c", child, ITM]).env("GIT_TERMINAL_PROMPT", "0"));
+    let git = world.cloning();
+    let clone = world.log().into_iter().find(|l| l.starts_with("clone ")).unwrap();
+    let [_, _, sid, _, prompt] = clone.split(' ').collect::<Vec<_>>()[..] else { panic!("{clone}") };
+    assert_eq!(sid, add.id().to_string(), "the clone leads its own session");
+    assert_eq!(prompt, "0");
+    signal(add.id(), Signal::TERM);
+    assert_eq!(world.ended(&mut add).code(), Some(143), "SIGTERM was ignored");
+    assert!(!alive(git));
+
+    let (ok, said) = world.try_itm(&["project", "add", "git", "https://example.com/acme/password.git"], &[]);
+    assert!(!ok, "{said}");
+    assert!(said.contains("terminal prompts disabled"), "git's words reach the output: {said}");
+    assert!(said.ends_with("itm: could not clone https://example.com/acme/password.git\n"), "{said}");
+    assert_eq!(world.projects_left(), Vec::<String>::new());
+}
+
+/// R8.2, R8.6: a clone finishes into place and is saved under the
+/// repository's name; the same repository by another URL is refused.
+fn a_clone_is_saved_once() {
+    let world = World::new();
+    let (ok, said) = world.try_itm(&["project", "add", "git", "git@example.com:acme/api.git"], &[]);
+    assert!(ok, "{said}");
+    // The name on stdout (try_itm puts it first), git's progress on stderr.
+    assert!(said.starts_with("api\n") && said.contains("Receiving objects: 100%"), "{said}");
+    let left = world.projects_left();
+    assert_eq!(left[..3], ["example.com", "example.com/acme", "example.com/acme/api"], "{left:?}");
+    let (ok, said) = world.try_itm(&["project", "add", "git", "https://example.com/acme/api"], &[]);
+    assert!(!ok && said == "itm: project already exists: api\n", "{said}");
+}
+
+/// R5.3: `itm delete` asks first (so without a terminal it needs --yes),
+/// stops the session, and Herdr deletes it once it is gone; the tombstone
+/// keeps it from coming back until then.
+fn deleting_a_task_stops_its_session_and_has_herdr_delete_it() {
+    let world = World::new();
+    world.itm(&["new", "Doomed", "--no-switch"]);
+    let (ok, said) = world.try_itm(&["delete", "doomed"], &[]);
+    assert!(!ok && said.contains("this needs a terminal; pass the missing values as options"), "{said}");
+    let mut server =
+        world.spawn(Command::new(world.root.join("bin/herdr")).arg("server").env("HERDR_SESSION", "task-doomed"));
+    assert!(wait_until(|| std::os::unix::net::UnixStream::connect(world.socket("task-doomed")).is_ok()));
+    let (ok, said) = world.try_itm(&["delete", "doomed", "--yes"], &[]);
+    assert!(ok && said == "task-doomed deleted\n", "{said}");
+    assert!(world.ended(&mut server).success(), "the session was stopped");
+    assert!(world.tasks().contains("\"deleted\": {\n    \"task-doomed\""), "a tombstone: {}", world.tasks());
+    assert!(wait_until(|| world.log().contains(&"deleted task-doomed".to_string())), "{:?}", world.log());
+    assert!(!world.socket("task-doomed").parent().unwrap().exists());
+    world.itm(&["list"]); // the session is gone: the tombstone goes too
+    assert!(!world.tasks().contains("task-doomed"), "{}", world.tasks());
+}
+
 /// The tests, each with its name.
 macro_rules! named {
     ($($test:ident),* $(,)?) => { [$((stringify!($test), $test as fn())),*] };
@@ -200,6 +309,11 @@ fn run_tests() {
         stale_markers_are_removed_and_their_processes_left_alone,
         a_first_start_runs_its_server_in_its_own_session,
         a_failed_first_start_is_said_and_the_attach_goes_on,
+        a_clone_stopped_by_a_signal_stops_git_and_keeps_nothing,
+        signals_ignored_before_a_clone_stay_ignored,
+        a_clone_child_has_its_own_session_and_can_always_be_cancelled,
+        a_clone_is_saved_once,
+        deleting_a_task_stops_its_session_and_has_herdr_delete_it,
     ];
     // `cargo test <filter>` passes the filter on; options are for libtest, which this is not.
     let filters: Vec<String> = env::args().skip(1).filter(|a| !a.starts_with('-')).collect();
@@ -246,14 +360,23 @@ impl World {
             fs::create_dir_all(root.join(dir)).unwrap();
         }
         symlink(env::current_exe().unwrap(), bin.join("herdr")).unwrap();
+        symlink(env::current_exe().unwrap(), bin.join("git")).unwrap();
         let path = format!("{}:{}", bin.display(), env::var("PATH").unwrap_or_default());
         World { home: root.join("home"), root, _tmp: tmp, path, started: Default::default() }
     }
 
     fn command(&self, args: &[&str], env: &[(&str, &str)]) -> Command {
         let mut command = Command::new(ITM);
-        command.args(args).env_clear().current_dir(&self.home);
+        command.args(args);
+        self.environment(&mut command).envs(env.iter().copied());
         command
+    }
+
+    /// Only this world's variables, in its home folder.
+    fn environment<'a>(&self, command: &'a mut Command) -> &'a mut Command {
+        command
+            .env_clear()
+            .current_dir(&self.home)
             .env("PATH", &self.path)
             .env("HOME", &self.home)
             .env("XDG_CONFIG_HOME", self.root.join("config"))
@@ -261,8 +384,48 @@ impl World {
             .env("XDG_DATA_HOME", self.root.join("data"))
             .env("XDG_RUNTIME_DIR", self.root.join("runtime"))
             .env("ITM_TEST_LOG", self.root.join("log"))
-            .envs(env.iter().copied());
-        command
+    }
+
+    /// `command` in the background in this world, its own variables kept; output dropped.
+    fn spawn(&self, command: &mut Command) -> Child {
+        let own: Vec<_> = command.get_envs().filter_map(|(k, v)| Some((k.to_owned(), v?.to_owned()))).collect();
+        self.environment(command).envs(own).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+        let child = command.spawn().unwrap();
+        self.started.borrow_mut().push(child.id());
+        child
+    }
+
+    /// Waits for the fake git to start a clone; its pid.
+    fn cloning(&self) -> u32 {
+        let mut git = None;
+        let started = wait_until(|| {
+            git = self.log().iter().find_map(|l| l.strip_prefix("clone ")?.split(' ').next()?.parse().ok());
+            git.is_some()
+        });
+        assert!(started, "no clone started: {:?}", self.log());
+        self.started.borrow_mut().push(git.unwrap());
+        git.unwrap()
+    }
+
+    /// What is under itm's projects folder, as relative paths, sorted.
+    fn projects_left(&self) -> Vec<String> {
+        let root = self.root.join("data/inbox-task-manager/projects");
+        let mut found = vec![];
+        let mut folders = vec![root.clone()];
+        while let Some(folder) = folders.pop() {
+            for entry in fs::read_dir(&folder).into_iter().flatten().flatten() {
+                found.push(entry.path().strip_prefix(&root).unwrap().display().to_string());
+                if entry.file_type().unwrap().is_dir() {
+                    folders.push(entry.path());
+                }
+            }
+        }
+        found.sort();
+        found
+    }
+
+    fn tasks(&self) -> String {
+        fs::read_to_string(self.root.join("state/inbox-task-manager/tasks.json")).unwrap_or_default()
     }
 
     fn try_itm(&self, args: &[&str], env: &[(&str, &str)]) -> (bool, String) {
@@ -398,14 +561,50 @@ fn wait_until(mut done: impl FnMut() -> bool) -> bool {
     done()
 }
 
-// ---------------------------------------------------------------- the fake herdr
+// ---------------------------------------------------------------- the fakes
+
+fn log(line: String) {
+    let path = env::var("ITM_TEST_LOG").expect("ITM_TEST_LOG");
+    let mut file = fs::OpenOptions::new().create(true).append(true).open(path).unwrap();
+    writeln!(file, "{line}").unwrap();
+}
+
+fn fake_git(args: Vec<String>) {
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    match args[..] {
+        ["clone", "--progress", "--", url, dest] => {
+            let sid = getsid(None).unwrap().as_raw_nonzero().get();
+            let prompt = env::var("GIT_TERMINAL_PROMPT").unwrap_or_else(|_| "-".into());
+            // Only what a cancel sends: an ignored SIGHUP (nohup) stays ignored.
+            let mut signals = Signals::new([SIGTERM, SIGINT]).unwrap();
+            log(format!("clone {} {sid} {url} {prompt}", process::id()));
+            fs::create_dir_all(Path::new(dest).join(".git")).unwrap();
+            fs::write(Path::new(dest).join("half-written"), "").unwrap();
+            eprint!("Cloning into '{dest}'...\nReceiving objects:  42% (21/50)\r");
+            if url.contains("password") {
+                eprintln!("fatal: could not read Username for 'https://example.com': terminal prompts disabled");
+                process::exit(128);
+            }
+            if url.contains("slow") {
+                signals.forever().next();
+                log("git stopped".into());
+                process::exit(128 + 15);
+            }
+            fs::write(Path::new(dest).join(".git/origin"), url).unwrap();
+            eprintln!("Receiving objects: 100% (50/50), done.");
+        }
+        ["ls-remote", "--get-url", url] => println!("{url}"),
+        ["-C", dir, "remote", "get-url", "origin"] => {
+            print!("{}", fs::read_to_string(Path::new(dir).join(".git/origin")).unwrap_or_default());
+        }
+        _ => {
+            eprintln!("fake git: unexpected {args:?}");
+            process::exit(2);
+        }
+    }
+}
 
 fn fake_herdr(args: Vec<String>) {
-    let log = |line: String| {
-        let path = env::var("ITM_TEST_LOG").expect("ITM_TEST_LOG");
-        let mut file = fs::OpenOptions::new().create(true).append(true).open(path).unwrap();
-        writeln!(file, "{line}").unwrap();
-    };
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     match args[..] {
         ["session", "attach", name] => {
@@ -453,11 +652,23 @@ fn fake_herdr(args: Vec<String>) {
                         ));
                         json!({})
                     }
-                    "server.stop" => process::exit(0),
+                    "server.stop" => json!({"type": "ok"}),
                     _ => json!({}),
                 };
                 let _ = writeln!(&stream, "{}", json!({"id": request["id"], "result": result}));
+                if request["method"] == "server.stop" {
+                    process::exit(0); // like Herdr: it answers, then stops
+                }
             }
+        }
+        ["session", "delete", name, "--json"] => {
+            let config = PathBuf::from(env::var("XDG_CONFIG_HOME").unwrap()).join("herdr");
+            let folder = config.join("sessions").join(name);
+            if std::os::unix::net::UnixStream::connect(folder.join("herdr.sock")).is_ok() {
+                process::exit(1); // Herdr refuses to delete a running session
+            }
+            fs::remove_dir_all(folder).unwrap();
+            log(format!("deleted {name}"));
         }
         _ => {
             eprintln!("fake herdr: unexpected {args:?}");

@@ -492,6 +492,19 @@ mod tests {
         assert!(!screen.contains("is active"), "the message went:\n{screen}");
     }
 
+    /// R9.4: Ctrl+O hands the terminal to the editor, says what went wrong,
+    /// and the preview reloads with the notes as they are now.
+    #[test]
+    fn ctrl_o_runs_the_editor_and_says_what_failed() {
+        let work = Arc::new(FakeWork::default());
+        let steps = vec![Step::Key(ctrl('o')), press(KeyCode::Tab), Step::Key(ctrl('o')), press(KeyCode::Esc)];
+        let (result, screen) = switcher(steps, &work, false);
+        assert_eq!(result, Ok(None));
+        assert_eq!(*work.notes.lock().unwrap(), ["task-fix-login", "task-later"]);
+        assert_eq!(loads(&work), 3, "a load after each editor");
+        assert!(screen.contains("no editor found; set $EDITOR"), "{screen}");
+    }
+
     #[test]
     fn the_measurement_switch_quits_on_the_first_frame_with_tasks() {
         let work = Arc::new(FakeWork::default());
