@@ -167,6 +167,14 @@ side py "$python" project add name "Client X" >/dev/null
 copy_state py rs
 both new "Two repos" -p api -p WEB -p "client x" --no-switch
 both new "Nope" -p missing --no-switch
+# The New task and edit forms need a terminal; what was given is checked first (R1.1, R5.4).
+both new --no-switch
+both new -i "Asked for" -p api --no-switch
+both new -p missing
+both new --snooze agent
+both new -i --snooze soonish
+both edit two-repos
+both edit no-such-task
 both project add dir '~/code/api'
 both project add dir '~/elsewhere/api' --name API
 both project list

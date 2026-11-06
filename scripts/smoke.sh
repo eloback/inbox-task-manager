@@ -58,6 +58,7 @@ start_server() { # a headless session, as itm's first start does
 marker() { cat "$runtime"/clients/[0-9]* 2>/dev/null | head -1; }
 # Predicates for wait_for, which runs its command again until it succeeds.
 marker_is() { test "$(marker)" = "$1"; }
+marker_is_not() { test -n "$(marker)" && test "$(marker)" != "$1"; }
 file_is() { test "$(cat "$1" 2>/dev/null)" = "$2"; }
 no_markers() { test -z "$(ls "$runtime/clients")"; }
 pane() { tmux -S "$tmux_sock" capture-pane -p -t e2e; }
@@ -85,6 +86,18 @@ cleanup() {
   for dir in "$sessions"/*/; do [ -d "$dir" ] && herdr session stop "$(basename "$dir")" >/dev/null 2>&1; done
 }
 trap cleanup EXIT
+
+# Herdr's popups (contrib/herdr-keys.toml, its keys; not its toast setting,
+# which would change where the checks below find notifications) run `itm`
+# from the server's PATH, with the server's EDITOR. Every server reads it
+# when it starts, so it goes in first.
+mkdir -p "$root/bin-itm" "$XDG_CONFIG_HOME/herdr"
+ln -sf "$itm" "$root/bin-itm/itm"
+export PATH="$root/bin-itm:$PATH"
+sed '/^\[ui.toast\]/,$d' "$repo/contrib/herdr-keys.toml" >"$XDG_CONFIG_HOME/herdr/config.toml"
+printf '#!/bin/sh\necho "written in the editor" >>"$1"\n' >"$root/editor.sh"
+chmod +x "$root/editor.sh"
+export EDITOR=$root/editor.sh
 
 echo "== tasks"
 "$itm" new "Fix login" -d "Users get logged out after 5 min" --no-switch >/dev/null
@@ -169,7 +182,7 @@ check "Ctrl+Z opens the snooze dialog with presets" wait_for 5 shows '30 minutes
 keys Enter
 check "a preset snoozes the highlighted task" wait_for 5 sh -c "'$itm' list --view snoozed | grep -q task-fix-login"
 keys Escape
-check "Esc closes the switcher" wait_for 5 gone 'esc close'
+check "Esc closes the switcher" wait_for 5 gone '? all keys'
 type_in_pane "$itm jump"
 check "itm jump opens the longest wait" wait_for 5 marker_is task-fix-login
 type_in_pane "$itm last"
@@ -210,10 +223,8 @@ keys y
 check "y deletes it, its session and its notes" wait_for 10 sh -c "! test -d '$sessions/task-old-idea' && ! test -e '$notes'"
 
 echo "== the switcher's notes and delete keys (R9.4, R9.5)"
-printf '#!/bin/sh\necho "written in the editor" >>"$1"\n' >"$root/editor.sh"
-chmod +x "$root/editor.sh"
 type_in_pane "EDITOR=$root/editor.sh $itm ui"
-wait_for 5 shows 'esc close'
+wait_for 5 shows '? all keys'
 keys -l "Two repos"
 wait_for 5 shows '› Two repos'
 keys Tab
@@ -226,12 +237,13 @@ check "Ctrl+D asks before deleting" wait_for 5 shows 'Delete “Two repos”?'
 keys n
 wait_for 5 gone 'y delete'
 keys Escape
-check "Esc closes the switcher" wait_for 5 gone 'esc close'
+check "Esc closes the switcher" wait_for 5 gone '? all keys'
 
 echo "== git projects (R8.6, R8.7), cloned without the network"
 mkdir -p "$root/bin"
 real_git=$(command -v git)
-printf '#!/bin/sh\nif [ "$1" = clone ]; then "%s" init -q "$5" && exec "%s" -C "$5" remote add origin "$4"; fi\nexec "%s" "$@"\n' \
+# A URL with "slow" in it clones until it is stopped, saying how far it got.
+printf '#!/bin/sh\nif [ "$1" = clone ]; then case "$4" in *slow*) printf "Receiving objects:  10%%%% (1/10)\\r" >&2; exec sleep 60;; esac; "%s" init -q "$5" && exec "%s" -C "$5" remote add origin "$4"; fi\nexec "%s" "$@"\n' \
   "$real_git" "$real_git" "$real_git" >"$root/bin/git"
 chmod +x "$root/bin/git"
 clone=$XDG_DATA_HOME/inbox-task-manager/projects/example.com/acme/tool
@@ -293,7 +305,7 @@ check "the home folder is refused" contains "$root/home.txt" "itm: ~ holds every
 
 config=$XDG_CONFIG_HOME/inbox-task-manager/config.toml
 type_in_pane "$itm ui"
-wait_for 5 shows 'esc close'
+wait_for 5 shows '? all keys'
 keys C-s
 check "Ctrl+S opens the settings (R10.4)" wait_for 5 shows 'Herdr integration'
 keys Down
@@ -304,20 +316,125 @@ check "and toggles back" wait_for 5 contains "$config" "remove_projects_without_
 keys Escape
 wait_for 5 gone 'Herdr integration'
 keys Escape
-check "Esc closes the settings, then the switcher" wait_for 5 gone 'esc close'
+check "Esc closes the settings, then the switcher" wait_for 5 gone '? all keys'
 printf '# mine\n[herdr\n' >"$config"
 sleep 4.5
 check "a broken settings file is logged once by the daemon" test "$(grep -c 'settings ignored:' "$root/daemon.log")" = 1
 check "with what is wrong" contains "$root/daemon.log" "config.toml is not valid TOML: unclosed table, expected \`]\` (at line 2, column 7)"
 type_in_pane "$itm ui"
-wait_for 5 shows 'esc close'
+wait_for 5 shows '? all keys'
 keys C-s
-check "the Settings screen shows the mistake" wait_for 5 shows 'valid TOML: unclosed table'
+check "the Settings screen shows the mistake" wait_for 5 shows 'is not valid TOML:'
 keys Escape
 wait_for 5 gone 'Herdr integration'
 keys Escape
-wait_for 5 gone 'esc close'
+wait_for 5 gone '? all keys'
 printf '# mine\n[herdr]\nprojects_from_workspaces = true  # keep\n' >"$config"
+
+echo "== the switcher's screens: help, @filters, Projects, the add dialog, the New task form (milestone 4)"
+"$itm" new "Filter me" -p web --no-switch >/dev/null
+"$itm" project add name "Scratch" >/dev/null
+type_in_pane "PATH=$root/bin:\$PATH $itm ui"
+wait_for 5 shows '? all keys'
+keys '?'
+check "? on an empty search shows every key" wait_for 5 shows 'Project finder'
+keys Escape
+wait_for 5 gone 'Project finder'
+keys -l "@web"
+only_web() { shows 'Filter me' && ! shows 'Fix login'; }
+check "@web shows only the tasks with the project web (R6.2)" wait_for 5 only_web
+keys BSpace BSpace BSpace BSpace
+keys C-p
+check "Ctrl+P shows the projects (R8.3)" wait_for 5 shows 'repositories and folders tasks start in'
+check "each with its tasks and last use" shows 'used now'
+keys C-r
+check "Ctrl+R renames the project highlighted, the most recent first" wait_for 5 shows 'Rename project “Scratch”'
+keys BSpace BSpace BSpace BSpace BSpace BSpace BSpace
+keys -l "Scratched"
+keys Enter
+check "the rename is saved" wait_for 5 sh -c "'$itm' project list | grep -q '^Scratched'"
+check "and said" wait_for 5 shows 'Renamed Scratch to Scratched.'
+keys C-d
+check "Ctrl+D asks before removing it (R8.7)" wait_for 5 shows 'Remove project “Scratched”?'
+keys Enter
+check "Enter forgets it" wait_for 5 sh -c "! '$itm' project list | grep -q '^Scratched'"
+keys C-n
+check "Ctrl+N adds a project, a repository first" wait_for 5 shows 'Git repository'
+keys -l "https://example.com/acme/slow.git"
+check "what is typed is checked: where the clone goes (R8.5)" wait_for 5 shows "Clones to $XDG_DATA_HOME/inbox-task-manager/projects/example.com/acme/slow"
+keys Enter
+check "a clone shows git's progress (R8.8)" wait_for 10 shows 'Cloning… Receiving objects:  10% (1/10)'
+keys Escape
+check "Esc stops the clone" wait_for 15 shows 'Stopped. Nothing of the clone was kept.'
+check "and nothing of it is left" sh -c "! test -e '$XDG_DATA_HOME/inbox-task-manager/projects/example.com/acme' && ! pgrep -f '[p]roject add git -- https://example.com/acme/slow'"
+keys C-u
+keys -l "https://example.com/acme/tool2.git"
+keys Enter
+check "a clone that ends is said on the Projects screen" wait_for 10 shows 'Project added.'
+check "and saved" sh -c "'$itm' project list | grep -q '^tool2	git'"
+keys Escape
+wait_for 5 gone 'repositories and folders'
+keys C-n
+check "Ctrl+N opens the New task form (R1.1)" wait_for 5 shows 'enter create'
+keys -l "Form task"
+keys Tab
+keys -l "from the form"
+keys Tab
+keys -l "~/code/"
+check "a path on the projects field lists its folders, saved ones named (R1.6)" wait_for 5 shows '~/code/api/  ◆ api saved'
+keys BSpace BSpace BSpace BSpace BSpace BSpace BSpace
+keys -l "wb"
+check "a project is found by its letters in order" wait_for 5 shows '◆ web '
+keys Enter
+# The form started with the first project of the task this switcher runs in (R1.6).
+check "Enter adds it after the current task's first project; the form says where it starts" wait_for 5 shows 'Workspaces new-thing · web'
+keys C-s
+check "Ctrl+S creates the task and switches to it" wait_for 10 marker_is task-form-task
+form_task() { "$itm" list --json | python3 -c 'import json,sys; r=[r for r in json.load(sys.stdin) if r["session"]=="task-form-task"][0]; print(r["description"], [p["name"] for p in r["projects"]])'; }
+check "with its description and projects" test "$(form_task)" = "from the form ['new-thing', 'web']"
+type_in_pane "$itm edit 'Form task'"
+check "itm edit without options opens the edit form (R5.4)" wait_for 5 shows 'Edit task'
+keys End
+keys -l " now"
+keys C-s
+check "Ctrl+S saves the edit" wait_for 5 sh -c "'$itm' list | grep -q '	Form task now	'"
+type_in_pane "$itm new"
+check "itm new without a title opens the form" wait_for 5 shows 'enter create'
+keys Escape
+check "Esc closes it when nothing was typed" wait_for 5 gone 'enter create'
+
+echo "== every contrib/herdr-keys.toml command in a Herdr popup"
+keys C-b S
+check "prefix+shift+s: the switcher" wait_for 5 shows '? all keys'
+keys Escape
+check "Esc closes it" wait_for 5 gone '? all keys'
+keys C-b t
+check "prefix+t: the New task form" wait_for 5 shows 'enter create'
+keys -l "Popup task"
+keys Enter
+check "Enter in the title creates the task and switches to it" wait_for 10 marker_is task-popup-task
+keys C-b Z
+check "prefix+shift+z: the snooze dialog for the current task" wait_for 5 shows 'Snooze “Popup task”'
+keys Enter
+check "a preset snoozes it and moves the client on (R4.7)" wait_for 10 marker_is_not task-popup-task
+check "it is snoozed" sh -c "'$itm' list --view snoozed | grep -q task-popup-task"
+notes_here=$("$itm" notes "$(marker)" --path)
+ready # the client was handed to another session: it drops the first keys
+keys C-b E
+check "prefix+shift+e: the current task's notes in the editor" wait_for 5 contains "$notes_here" "written in the editor"
+here=$(marker)
+mkdir -p "$HOME/code/popup"
+open_workspace "$here" "$HOME/code/popup" "" true >/dev/null
+keys C-b A
+check "prefix+shift+a: the add dialog with the workspace's folder" wait_for 5 shows 'Source  ~/code/popup'
+keys Enter
+check "Enter saves it as a project" wait_for 5 sh -c "'$itm' project list | grep -q '^popup	dir	~/code/popup'"
+wait_for 5 gone 'Source  ~/code/popup' # a popup takes every key, the prefix too, until it closed
+keys C-b Tab
+check "prefix+tab: the previous task" wait_for 10 marker_is_not "$here"
+ready
+keys C-b i
+check "prefix+i: the task waiting longest" wait_for 10 marker_is task-fix-login
 
 echo "== the Python itm reads this state"
 if [ -x "$python_itm" ]; then
