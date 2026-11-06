@@ -1,28 +1,68 @@
-# inbox-task-manager
+<div align="center">
 
-An inbox for your [Herdr](https://herdr.dev) sessions. Each task is a Herdr
-session named `task-<slug>` with its own panes and agents; `itm` lists them
-like an inbox, with the tasks whose agents are waiting for you first, and
-switches between them in place.
+# 📥 inbox-task-manager
 
-- **Inbox first.** Tasks with an agent waiting for input come first, with how
+**A blazingly fast ⚡ inbox for your [Herdr](https://herdr.dev) sessions and the agents in them, written in Rust 🦀**
+
+[![CI](https://github.com/eloback/inbox-task-manager/actions/workflows/ci.yml/badge.svg)](https://github.com/eloback/inbox-task-manager/actions/workflows/ci.yml)
+[![Rust 1.89+](https://img.shields.io/badge/rust-1.89%2B-orange?logo=rust)](Cargo.toml)
+[![Herdr 0.9.3+](https://img.shields.io/badge/herdr-0.9.3%2B-8A2BE2)](https://herdr.dev)
+[![Nix flake](https://img.shields.io/badge/nix-flake-5277C3?logo=nixos&logoColor=white)](flake.nix)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+
+<img src="docs/screenshots/inbox.png" alt="The itm switcher: two tasks whose agents wait for you, three active tasks, and the preview of the highlighted one" width="900">
+
+</div>
+
+Each task is a Herdr session named `task-<slug>` with its own panes and
+agents. `itm` lists them like an inbox, with the tasks whose agents are
+waiting for you first, and switches between them in place.
+
+## ✨ Features
+
+- ⚡ **Blazingly fast.** One small native binary: the switcher is up before
+  you have let go of the key, and `itm status` is cheap enough for a status
+  bar that asks every second. It talks to Herdr over its socket API instead
+  of starting the `herdr` CLI for every query.
+- 📥 **Inbox first.** Tasks with an agent waiting for input come first, with how
   long it has waited. A daemon notifies you when an agent gets blocked in
   another task.
-- **Snooze, archive, reopen.** Snooze a task until a time or until one of its
+- 😴 **Snooze, archive, reopen.** Snooze a task until a time or until one of its
   agents needs you; archive it to stop its session and reopen it later, with
   Herdr restoring the layout and resuming its agents.
-- **Projects.** Save git repositories (cloned for you) and folders once, and
+- 📁 **Projects.** Save git repositories (cloned for you) and folders once, and
   give a task one or more of them: its session starts with a named Herdr
   workspace per project. The daemon keeps a running task's projects in step
   with the workspaces you open and close (a setting).
-- **Notes.** Every task has a markdown file for its context, kept through
+- 📝 **Notes.** Every task has a markdown file for its context, kept through
   archive and reopen.
-- **Switch in place.** From a Herdr popup, the switcher moves your terminal to
+- 🔀 **Switch in place.** From a Herdr popup, the switcher moves your terminal to
   another task without nesting clients.
+- 🦀 **Written in Rust.** No runtime to install, `unsafe` code denied
+  crate-wide, 300+ tests, and end-to-end runs against a real Herdr.
 
 Binary: `itm`. Run `itm` for the task switcher.
 
-## Requirements
+## 📸 Screenshots
+
+<table>
+  <tr>
+    <td width="50%"><img src="docs/screenshots/new-task.png" alt="The New task form: title, description, a project picked from the fuzzy finder, snooze, and where the session will start"></td>
+    <td width="50%"><img src="docs/screenshots/snoozed.png" alt="The Snoozed view: two tasks and when each wakes"></td>
+  </tr>
+  <tr>
+    <td align="center"><b>New task</b>: one form, projects from a fuzzy finder</td>
+    <td align="center"><b>Snoozed</b>: back on a timer, or when an agent asks</td>
+  </tr>
+  <tr>
+    <td colspan="2"><img src="docs/screenshots/projects.png" alt="The Projects screen: four folder projects with their tasks"></td>
+  </tr>
+  <tr>
+    <td colspan="2" align="center"><b>Projects</b>: repositories and folders your tasks start in</td>
+  </tr>
+</table>
+
+## 📋 Requirements
 
 - Linux or macOS (the BSDs should work but are untested).
 - [Herdr](https://herdr.dev) 0.9.3 or later.
@@ -32,7 +72,7 @@ Binary: `itm`. Run `itm` for the task switcher.
   `osascript`. GNU `date` (`gdate` from coreutils on macOS) for snooze phrases
   beyond the ones itm reads itself (see [Snooze times](#snooze-times)).
 
-## Install
+## 📦 Install
 
 With cargo, from a clone of this repository (itm goes to `~/.cargo/bin`):
 
@@ -73,7 +113,7 @@ until you close it). The command is
 `itm` only: scripts that ran `inbox-task-manager` need `itm`. The
 switcher draws with your terminal's colors (`ITM_THEME` is gone).
 
-## Setup
+## 🛠️ Setup
 
 1. **Run the daemon.** It notifies about blocked agents and wakes snoozed
    tasks. The home-manager module does this for you. Otherwise use
@@ -97,7 +137,7 @@ switcher draws with your terminal's colors (`ITM_THEME` is gone).
    restored panes come back as plain shells. Codex asks once to approve new
    hooks (`/hooks`).
 
-## Usage
+## 🚀 Usage
 
 ```sh
 itm                          # the task switcher
@@ -216,7 +256,7 @@ narrows the saved projects; `~/`, `/` or `./` lists folders, Tab goes into the
 highlighted one and Enter adds it (or picks it when saved); ↑ ↓ / Ctrl+K Ctrl+J
 move; Enter chooses; Esc goes back without changing the project.
 
-## Configuration
+## ⚙️ Configuration
 
 | Variable             | Effect                                                                    |
 |----------------------|---------------------------------------------------------------------------|
@@ -238,7 +278,7 @@ Files:
   must agree on `XDG_CONFIG_HOME` (where Herdr keeps its sessions),
   `XDG_STATE_HOME`, `XDG_DATA_HOME` and `XDG_RUNTIME_DIR` when you set them.
 
-## Platform notes
+## 💻 Platform notes
 
 - **Linux** reads the process table from `/proc`; the BSDs and macOS ask `ps`.
 - **macOS** shows notifications with `osascript`, without the Open action
@@ -248,7 +288,7 @@ Files:
 - **Notifications elsewhere** (a phone, a chat): set `ITM_NOTIFY_COMMAND` to
   a program that takes the title and body as its last two arguments.
 
-## Development
+## 🧑‍💻 Development
 
 ```sh
 nix develop                                   # the Rust toolchain, git, tmux, socat, Herdr
@@ -265,6 +305,6 @@ itm depends on, the rules that keep switching and task data safe, the UX
 principles, and how to test without touching your real sessions.
 [REQUIREMENTS.md](REQUIREMENTS.md) lists what itm must do.
 
-## License
+## 📄 License
 
 [MIT](LICENSE)
