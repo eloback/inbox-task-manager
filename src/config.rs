@@ -127,8 +127,7 @@ pub fn parse(text: &str, shown: &str) -> Result<Settings> {
 /// A parse error on one line: toml_edit's own spans several, with a drawing of the line.
 fn toml_error(e: &toml_edit::TomlError, text: &str) -> String {
     let message = e.message().lines().map(str::trim).filter(|l| !l.is_empty()).collect::<Vec<_>>().join("; ");
-    let Some(span) = e.span() else { return message };
-    let before = &text[..span.start.min(text.len())];
+    let Some(before) = e.span().and_then(|span| text.get(..span.start)) else { return message };
     let line = before.matches('\n').count() + 1;
     let column = before.rsplit('\n').next().unwrap_or_default().chars().count() + 1;
     format!("{message} (at line {line}, column {column})")
@@ -276,6 +275,8 @@ mod tests {
     fn r10_4_mistakes_are_errors() {
         let error = |text: &str| parse(text, "~/c.toml").unwrap_err().to_string();
         assert_eq!(error("[herdr\n"), "~/c.toml is not valid TOML: unclosed table, expected `]` (at line 1, column 7)");
+        let err = error("# é\n[herdr]\nprojects_from_workspaces = trué\n");
+        assert!(err.starts_with("~/c.toml is not valid TOML: ") && err.ends_with("(at line 3, column 28)"), "{err}");
         assert_eq!(error("[herdr]\nnope = true\n"), "~/c.toml: unknown setting herdr.nope");
         assert_eq!(error("[other]\n"), "~/c.toml: unknown setting other");
         assert_eq!(error("herdr = 1\n"), "~/c.toml: unknown setting herdr");
