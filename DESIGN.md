@@ -402,8 +402,12 @@ Herdr upgrade.
   empty host/owner folders it created. SIGHUP (popup closed), SIGTERM and
   SIGINT become a clean exit for this: `ExitSignals` (`system.rs`) catches
   them (signal-hook) until the cleanup is done, ignoring further ones
-  meanwhile, and then lets them end itm again (signal-hook alone would
-  leave them ignored once its last action goes); git gets SIGTERM, then
+  meanwhile, and then lets them end itm again: signal-hook keeps its
+  handler once installed, which would leave them ignored, so a conditional
+  default action is registered once per signal and process and acts while
+  no catcher lives (`Catching`, held by every `ExitSignals` and by the
+  attach loop). An action registered at each catcher's end instead could
+  never be taken back and would end itm under the next catcher. git gets SIGTERM, then
   SIGKILL after 10 s, and itm exits with 128 + the signal (`Error::Exit`).
   Signals already ignored when the clone starts (`nohup`) stay ignored;
   which ones are is read from `/proc/self/status` (`SigIgn`), else `ps -o
@@ -810,8 +814,9 @@ The switcher and its dialogs follow these principles.
     project removal stopped halfway leaves a session running unseen or a
     clone half deleted (Textual joined its workers too). So while a clone or
     such a job runs, itm catches those signals (`ExitSignals`; a closing
-    popup sends SIGHUP) and they end the loop like Esc. Meanwhile it reads
-    no keys and says "Finishing first…"; a failure of a job it waits for
+    popup sends SIGHUP) and they end the loop like Esc, also one that comes
+    while the loop waits to switch: no switch follows a kill. Meanwhile it
+    reads no keys and says "Finishing first…"; a failure of a job it waits for
     keeps the switcher open to show it (UX principle 11). A clone is not
     waited for (it stops on the way out and keeps nothing, R8.8), nor is a
     folder listing.

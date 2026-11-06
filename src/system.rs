@@ -15,8 +15,8 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -184,16 +184,17 @@ fn signal_mask(text: &str) -> Option<u64> {
 /// once, so it can clean up first; more of them meanwhile change nothing.
 /// Those ignored already (`nohup`) stay ignored.
 pub struct ExitSignals {
+    // Dropped in this order: the signals go, then they end the process again.
     signals: Signals,
-    caught: Vec<i32>,
+    _catching: Catching,
 }
 
 impl ExitSignals {
     pub fn catch() -> io::Result<ExitSignals> {
         let ignored = ignored_signals().unwrap_or(0);
-        let caught: Vec<i32> =
-            [SIGHUP, SIGTERM, SIGINT].into_iter().filter(|&sig| ignored & (1 << (sig - 1)) == 0).collect();
-        Ok(ExitSignals { signals: Signals::new(&caught)?, caught })
+        let caught: Vec<i32> = [SIGHUP, SIGTERM, SIGINT].into_iter().filter(|&sig| !is_set(ignored, sig)).collect();
+        let catching = Catching::start(&caught)?;
+        Ok(ExitSignals { signals: Signals::new(&caught)?, _catching: catching })
     }
 
     /// The first one that arrived since the last look, if any.
@@ -202,12 +203,51 @@ impl ExitSignals {
     }
 }
 
-impl Drop for ExitSignals {
-    /// They end the process again, as before: signal-hook keeps its handler
-    /// once the last action goes, which would leave them ignored.
+fn is_set(mask: u64, signal: i32) -> bool {
+    mask & (1 << (signal - 1)) != 0
+}
+
+/// While one lives, something catches SIGHUP, SIGTERM and SIGINT with
+/// signal-hook ([`ExitSignals`], the attach loop); once none does, they end
+/// the process again, as by default. signal-hook keeps its handler once it
+/// installed one, which would leave them ignored, so a conditional default
+/// action is registered once per signal and process, on while no catcher
+/// lives. (Actions registered at each catcher's end could never be taken
+/// back, and would end the process under the next catcher.) A signal the
+/// process ignored when first caught (`nohup`) gets none: it stays ignored.
+pub struct Catching(());
+
+struct Catchers {
+    live: usize,
+    defaults: Vec<i32>,
+}
+
+static CATCHERS: Mutex<Catchers> = Mutex::new(Catchers { live: 0, defaults: Vec::new() });
+/// Whether the conditional defaults act: no [`Catching`] lives.
+static BY_DEFAULT: LazyLock<Arc<AtomicBool>> = LazyLock::new(|| Arc::new(AtomicBool::new(true)));
+
+impl Catching {
+    pub fn start(signals: &[i32]) -> io::Result<Catching> {
+        let ignored = ignored_signals().unwrap_or(0);
+        let mut catchers = CATCHERS.lock().unwrap_or_else(PoisonError::into_inner);
+        for &signal in signals {
+            if !catchers.defaults.contains(&signal) && !is_set(ignored, signal) {
+                signal_hook::flag::register_conditional_default(signal, Arc::clone(&BY_DEFAULT))?;
+                catchers.defaults.push(signal);
+            }
+        }
+        catchers.live += 1;
+        BY_DEFAULT.store(false, Ordering::SeqCst);
+        Ok(Catching(()))
+    }
+}
+
+impl Drop for Catching {
     fn drop(&mut self) {
-        for &signal in &self.caught {
-            let _ = signal_hook::flag::register_conditional_default(signal, Arc::new(AtomicBool::new(true)));
+        let mut catchers = CATCHERS.lock().unwrap_or_else(PoisonError::into_inner);
+        catchers.live -= 1;
+        if catchers.live == 0 {
+            BY_DEFAULT.store(true, Ordering::SeqCst);
         }
     }
 }
@@ -363,9 +403,64 @@ impl Notifiers<'_> {
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use super::*;
     use std::process::Command;
+
+    /// Runs the test named `test` (its full path) alone in a child process,
+    /// for what acts on the whole process (signals): None in that child, so
+    /// the test does its work there; in the test itself, how the child
+    /// ended and what it printed.
+    pub fn in_child(test: &str) -> Option<std::process::Output> {
+        if env::var("ITM_TEST_CHILD").is_ok_and(|t| t == test) {
+            return None;
+        }
+        let exe = env::current_exe().unwrap();
+        let args = ["--exact", test, "--nocapture", "--test-threads=1"];
+        Some(Command::new(exe).args(args).env("ITM_TEST_CHILD", test).output().unwrap())
+    }
+
+    /// Whether this process ignores one of `signals` (`nohup`), so a test of them cannot run.
+    pub fn ignores(signals: &[i32]) -> bool {
+        let ignored = ignored_signals().unwrap_or(0);
+        signals.iter().any(|&signal| is_set(ignored, signal))
+    }
+
+    /// A catcher catches even after an earlier one ended (that one's end
+    /// leaves nothing behind that would end the process first), and once
+    /// the last one ends the signals end the process again.
+    #[test]
+    fn signals_are_caught_by_each_catcher_and_end_the_process_after_the_last() {
+        if ignores(&[SIGHUP, SIGTERM]) {
+            return;
+        }
+        let Some(child) =
+            in_child("system::tests::signals_are_caught_by_each_catcher_and_end_the_process_after_the_last")
+        else {
+            drop(ExitSignals::catch().unwrap());
+            let mut second = ExitSignals::catch().unwrap();
+            let attach_loop = Catching::start(&[SIGHUP, SIGTERM, SIGINT]).unwrap();
+            signal_hook::low_level::raise(SIGHUP).unwrap();
+            let caught = (0..100).find_map(|_| second.arrived().or_else(|| sleep_none(10)));
+            assert_eq!(caught, Some(SIGHUP));
+            drop(second);
+            signal_hook::low_level::raise(SIGHUP).unwrap(); // still caught: the attach loop's catcher lives
+            drop(attach_loop);
+            println!("caught twice");
+            signal_hook::low_level::raise(SIGTERM).unwrap();
+            thread::sleep(Duration::from_secs(5));
+            println!("SIGTERM did not end the process");
+            return;
+        };
+        let said = String::from_utf8_lossy(&child.stdout);
+        assert!(said.contains("caught twice") && !said.contains("did not end"), "{said}");
+        assert_eq!(std::os::unix::process::ExitStatusExt::signal(&child.status), Some(SIGTERM), "{said}");
+    }
+
+    fn sleep_none(ms: u64) -> Option<i32> {
+        thread::sleep(Duration::from_millis(ms));
+        None
+    }
 
     #[test]
     fn a_command_runs_to_its_end_or_is_killed_at_the_timeout() {

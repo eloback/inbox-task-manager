@@ -452,7 +452,6 @@ mod tests {
         assert_eq!(dialog.check, None, "a check of what was typed before is dropped");
     }
 
-    /// R8.8: Esc during a clone stops it once and keeps the dialog; when it
     /// R8.5: focus that does not move leaves the name being typed as it is
     /// (Textual's focus on the focused input does nothing): a name taken,
     /// said after Enter on the name, and a switch to a name only while
@@ -479,6 +478,7 @@ mod tests {
         assert_eq!(dialog.name.value(), "web", "Tab to the name selected it");
     }
 
+    /// R8.8: Esc during a clone stops it once and keeps the dialog; when it
     /// ended, the dialog says it kept nothing, and Esc closes it.
     #[test]
     fn r8_8_esc_stops_a_clone_and_keeps_the_dialog() {

@@ -447,16 +447,15 @@ fn event_loop<B: Backend>(
         if exit_after_draw && app.snapshot.is_some() {
             return Ok(None);
         }
-        if leaving.is_none()
-            && let Some(signal) = signals.as_mut().and_then(ExitSignals::arrived)
-        {
-            leaving = Some(Err(Error::Exit(128 + signal as u8))); // the clones stop on the way out
+        // A signal ends the loop, also one that was going to switch: the clones stop on the way out.
+        if let Some(signal) = signals.as_mut().and_then(ExitSignals::arrived) {
+            leaving = Some(Err(Error::Exit(128 + signal as u8)));
         }
         if let Some(ended) = leaving.take_if(|_| finishing == 0) {
             return ended;
         }
         let input = if leaving.is_some() {
-            rx.recv().ok() // only the workers' results now: no keys, no refresh
+            rx.recv_timeout(SIGNAL_POLL).ok() // only the workers' results now (and signals): no keys, no refresh
         } else {
             // Wake for the next refresh (unless one runs), for the message to go, for a screen's
             // check, and while a clone runs, often enough to see a signal soon.
@@ -495,8 +494,12 @@ fn event_loop<B: Backend>(
                 running -= 1;
                 finishing -= usize::from(job.must_finish());
                 cloning -= usize::from(matches!(job, Job::Clone { .. }));
-                if cloning == 0 && finishing == 0 {
-                    signals = None; // they end itm again
+                // They end itm again; one that came just before still counts.
+                if cloning == 0
+                    && finishing == 0
+                    && let Some(signal) = signals.take().and_then(|mut caught| caught.arrived())
+                {
+                    leaving = Some(Err(Error::Exit(128 + signal as u8)));
                 }
                 reload |= job.changes_tasks();
                 let failed = result.is_err() && job.must_finish(); // what the loop waits for
@@ -803,6 +806,35 @@ mod tests {
         let (ended, _) = switcher(vec![Step::Key(ctrl('d')), press(KeyCode::Char('y')), Step::Gone], &work, false);
         assert_eq!(ended, Err(Error::Other("the terminal is gone".into())));
         assert_eq!(*work.deleted.lock().unwrap(), ["task-fix-login"]);
+    }
+
+    /// A signal while the switcher waits to switch (a delete runs) ends itm
+    /// once the delete is done, instead of switching; the next signal is
+    /// caught again (an earlier job's end left nothing behind).
+    #[test]
+    fn a_signal_while_waiting_to_switch_ends_itm_instead() {
+        use crate::system::tests::{ignores, in_child};
+        use signal_hook::consts::SIGTERM;
+        if ignores(&[SIGTERM]) {
+            return;
+        }
+        let Some(child) = in_child("tui::tests::a_signal_while_waiting_to_switch_ends_itm_instead") else {
+            for _ in 0..2 {
+                let work = Arc::new(FakeWork::default());
+                let killer = thread::spawn(|| {
+                    thread::sleep(Duration::from_millis(150)); // after Enter, while the delete runs
+                    signal_hook::low_level::raise(SIGTERM).unwrap();
+                });
+                let steps = vec![Step::Key(ctrl('d')), press(KeyCode::Char('y')), Step::Meanwhile(key(KeyCode::Enter))];
+                let (ended, _) = switcher(steps, &work, false);
+                killer.join().unwrap();
+                assert_eq!(ended, Err(Error::Exit(128 + SIGTERM as u8)));
+                assert_eq!(*work.deleted.lock().unwrap(), ["task-fix-login"]);
+            }
+            return;
+        };
+        let said = String::from_utf8_lossy(&child.stdout);
+        assert!(child.status.success(), "{said}");
     }
 
     /// Only a job the closing waits for keeps the switcher open when it

@@ -22,7 +22,7 @@ use crate::error::{Context, Error, Result, bail};
 use crate::herdr::Sessions;
 use crate::itm::Itm;
 use crate::store::write_atomic;
-use crate::system::which;
+use crate::system::{Catching, which};
 
 /// The loop may be between two attaches: look for its attach child this
 /// many times, this far apart, before giving up on it. Unit tests describe
@@ -145,6 +145,7 @@ impl Itm {
     /// detached the way a hand-off detaches it, and its markers are removed
     /// (left behind, they would only go once a later check found the pid stale).
     pub fn attach_loop(&self, target: &str, attach: impl FnMut(&str, Option<&Path>) -> Result<()>) -> Result<()> {
+        let _catching = Catching::start(&[SIGHUP, SIGTERM, SIGINT]).context(|| "cannot handle signals".into())?;
         let mut signals = Signals::new([SIGHUP, SIGTERM, SIGINT]).context(|| "cannot handle signals".into())?;
         let closing = signals.handle();
         let stop = AtomicBool::new(false);
