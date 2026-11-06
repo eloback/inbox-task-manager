@@ -277,7 +277,7 @@ pub fn run(cli: Cli, itm: Itm) -> Result<()> {
         Command::Jump => {
             let status = itm.status();
             if !status.fresh {
-                bail!("the daemon is not running, so waiting agents are unknown (start `itm daemon`)");
+                bail!("the daemon is not running, so waiting agents are unknown (start `itm daemon`; README, Setup)");
             }
             let target = tasks::longest_waiting(&itm.store().load()?, &status, now);
             itm.switch_to(&target.ok_or_else(|| Error::Other("no agent is waiting for you".into()))?)

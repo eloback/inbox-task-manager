@@ -106,6 +106,7 @@ both status --format '{nope}'
 both list
 both list --json
 both list --view snoozed
+both jump
 
 snoozed() { # snoozed <side> <session> <seconds>: snoozed_until is that far after created_at
   python3 - "$(tasks "$1")" "$2" "$3" <<'EOF'
