@@ -19,7 +19,7 @@ use tui_input::Input;
 use tui_input::backend::crossterm::EventHandler;
 
 use super::finder::Saved;
-use super::form::{Editing, Effect, TaskForm};
+use super::form::{Editing, TaskForm};
 use super::help::Help;
 use super::projects::ProjectsScreen;
 use super::screen::{Context, Need, Outcome, Screen, SettingsScreen, SnoozeDialog};
@@ -767,17 +767,6 @@ impl App {
 /// What a rename says (R8.2), as the Python itm's Projects screen says it.
 pub fn renamed(old: &str, new: &str, note: Option<String>) -> String {
     format!("Renamed {old} to {new}.{}", note.map(|n| format!(" {n}.")).unwrap_or_default())
-}
-
-impl Editing {
-    /// What the edit form shows of the session from the switcher's last
-    /// refresh: whether it runs, and which projects keep their workspace
-    /// (R5.4: while projects follow workspaces and the daemon runs).
-    pub fn new(session: String, task: &Task, snap: &Snapshot) -> Editing {
-        let effect = snap.listed.then(|| Effect::of(snap.sessions.get(&session)));
-        let follows = snap.settings.as_ref().is_ok_and(|s| s.projects_from_workspaces) && snap.status.fresh;
-        Editing::with(session, task, effect, follows, snap.settings.as_ref().err().cloned())
-    }
 }
 
 #[cfg(test)]

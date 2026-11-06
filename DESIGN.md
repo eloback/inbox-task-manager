@@ -26,7 +26,10 @@ Verified against Herdr 0.9.3. Re-check them after a Herdr upgrade.
   belongs to the session it was opened in: it keeps running there after its
   client switches away, and stopping that session kills it.
   Its size is fixed in the config (cells or a percentage). Its command
-  inherits the server's environment, `EDITOR` included.
+  inherits the server's environment, `EDITOR` included. A
+  `[[keys.command]]` on `prefix+tab` replaces Herdr's own
+  `cycle_pane_next`, and `prefix+shift+<letter>` is the capital letter
+  after the prefix (Herdr 0.9.3, checked with each contrib key).
 - **Toasts.** `ui.toast.delivery` defaults to `off`. Then
   `herdr notification show` returns `shown: false, reason: "disabled"`. Other
   reasons: `rate_limited`, `no_foreground_client`, `busy`. Herdr itself toasts
@@ -999,7 +1002,11 @@ The switcher and its dialogs follow these principles.
     `XDG_RUNTIME_DIR`;
   - tmux as a scriptable terminal: `send-keys`, `capture-pane -e` (keeps
     colors);
-  - wait for a popup to render before sending keys to it;
+  - wait for a popup to render before sending keys to it, and for it to
+    close before the next prefix key: a popup takes every key, the prefix
+    too;
+  - a client that was handed to another session (re-attached) drops the
+    first keys sent to it: wait until it echoes a probe (`smoke.sh` `ready`);
   - start that tmux with `-f /dev/null`, an explicit `-S` socket and a clean
     environment (`env -i`): your own tmux config may restore saved sessions
     into the new server (tmux-resurrect), and `HERDR_*` variables from a
@@ -1009,7 +1016,10 @@ The switcher and its dialogs follow these principles.
   not trust yet; the trust prompt counts as blocked. A resume test needs one
   short prompt (`claude --model haiku`) in a trusted folder.
 - Known pitfalls: `tmux send-keys M-Enter` arrives as Escape then Enter.
-  `pgrep -f <pattern>` also matches the shell running it.
+  `pgrep -f <pattern>` also matches the shell running it, and processes
+  outside the sandbox (an `itm` in your real Herdr session): signal only a
+  process whose environment names the sandbox (`ITM_SANDBOX`, which a
+  sandboxed Herdr passes on to its popups; `smoke.sh` `sandbox_pids`).
 - Non-trivial changes get a review before they are merged.
 - **The Rust itm.** `cargo fmt --check`, `cargo clippy --all-targets -- -D
   warnings` and `cargo test` must pass at every commit. Unit tests sit at the
@@ -1034,7 +1044,10 @@ The switcher and its dialogs follow these principles.
   rather than executed, which no parallel test's fork can make busy.
 - End to end, against a real headless Herdr with tmux as the terminal:
   `scripts/smoke.sh` (fake agents report themselves blocked over the socket
-  API, no real agent runs) and `scripts/measure.sh`, both run through
+  API, no real agent runs; its Herdr servers get the keys of
+  `contrib/herdr-keys.toml`, and every command there is run through its
+  popup, with a fake git so a clone needs no network) and
+  `scripts/measure.sh`, both run through
   `scripts/sandbox.sh <name>` (no `HERDR_*` variables, private XDG folders
   under `/tmp/itm-<name>`, notifications to a log).
 - `scripts/cross-check.sh` runs the Python itm (the reference; a pinned

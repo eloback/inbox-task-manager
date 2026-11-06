@@ -21,7 +21,7 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
-use super::app::{Action, Job};
+use super::app::{Action, Job, Snapshot};
 use super::draw::{
     ACCENT, MUTED, Tone, WIDE, bold, colored, dialog_box, field_line, key_hints, muted, name_badge, project_line,
 };
@@ -86,6 +86,15 @@ pub struct Editing {
 }
 
 impl Editing {
+    /// What the edit form shows of the session from the switcher's last
+    /// refresh: whether it runs, and which projects keep their workspace
+    /// (R5.4: while projects follow workspaces and the daemon runs).
+    pub fn new(session: String, task: &Task, snap: &Snapshot) -> Editing {
+        let effect = snap.listed.then(|| Effect::of(snap.sessions.get(&session)));
+        let follows = snap.settings.as_ref().is_ok_and(|s| s.projects_from_workspaces) && snap.status.fresh;
+        Editing::with(session, task, effect, follows, snap.settings.as_ref().err().cloned())
+    }
+
     /// `follows`: projects follow workspaces and the daemon runs.
     pub fn with(
         session: String,
