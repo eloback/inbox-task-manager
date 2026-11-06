@@ -268,6 +268,15 @@ impl TaskForm {
         Outcome::Stay
     }
 
+    /// Text pasted into the description, newlines kept; false elsewhere (it is typed then).
+    pub fn paste(&mut self, text: &str) -> bool {
+        let here = self.focus == Part::Description;
+        if here {
+            self.description.insert_str(text);
+        }
+        here
+    }
+
     /// The project finder over the form, its search started with what was typed on the field.
     fn find(&self, typed: &str, cx: &Context) -> Outcome {
         let finder = Finder::new(self.projects.clone(), typed, self.saved.clone(), cx.paths);
@@ -877,6 +886,16 @@ mod tests {
             order: vec!["p-web".into(), "p-api".into()],
         };
         assert_eq!(job, edit);
+    }
+
+    /// R1.1: a paste into the description keeps its lines; anywhere else it is typed.
+    #[test]
+    fn r1_1_a_paste_keeps_the_descriptions_lines() {
+        let mut form = new_form(&[]);
+        assert!(!form.paste("Plan\nlaunch"), "the title types it, one line");
+        press(&mut form, &[key(KeyCode::Tab)]);
+        assert!(form.paste("one\ntwo"));
+        assert_eq!(form.description_text(), "one\ntwo");
     }
 
     /// Keys that edit text stay in the form: Home then Ctrl+K clears the title.

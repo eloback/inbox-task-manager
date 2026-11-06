@@ -821,7 +821,8 @@ The switcher and its dialogs follow these principles.
     rules about keys that arrive before a picker is up, and about
     `select_on_focus`, have no counterpart. A paste (bracketed paste) is
     fed as keys, its whitespace (newlines too) one space each, so a pasted
-    URL opens the finder like typing does and never presses Enter.
+    URL opens the finder like typing does and never presses Enter; the
+    form's description, the one field with several lines, takes it as it is.
   - The main list's keys are matched before the search box gets a key,
     except `?`, which opens the help only while the search is empty and is
     typed otherwise (Textual's `check_consume_key` rule). F1 opens it
@@ -867,7 +868,8 @@ The switcher and its dialogs follow these principles.
     act on rows left from earlier text; a listing that arrives late rebuilds
     the rows from what is typed then. Symlinked folders are resolved in the
     reading thread (`Listing.links`), so a saved folder reached through a
-    link is found. Ghost text (`Folders::ghost`) is a completion that starts
+    link is found, and rows are worked out from the listing alone (no
+    filesystem call while typing). Ghost text (`Folders::ghost`) is a completion that starts
     with exactly what was typed (no casefolding), none after a trailing
     "/"; it is worked out when drawn, from the listings the dialog has, so a
     late listing shows it and a kind switch (only folders complete) clears

@@ -499,8 +499,15 @@ impl App {
         Action::None
     }
 
-    /// Pasted text goes where typing goes, its whitespace (newlines too) one space each.
+    /// Pasted text goes where typing goes, its whitespace (newlines too) one
+    /// space each, so a paste never presses Enter; a field with several
+    /// lines (the form's description) takes it as it is.
     pub fn on_paste(&mut self, text: &str) -> Action {
+        if let Some(Screen::Form(form)) = self.screens.last_mut()
+            && form.paste(text)
+        {
+            return Action::None;
+        }
         let mut action = Action::None;
         for (i, word) in text.split_whitespace().enumerate() {
             for c in (i > 0).then_some(' ').into_iter().chain(word.chars()) {
@@ -1289,6 +1296,19 @@ pub mod tests {
         assert_eq!(app.done(create, Ok(Reply::Created("task-plan".into()))), Action::None);
         assert_eq!(app.message.as_ref().unwrap().text, "Saved “Plan”, snoozed until 09:00.");
         assert_eq!(app.search.value(), "");
+    }
+
+    /// A paste is typed, its newlines a space each, so it never presses Enter.
+    #[test]
+    fn a_paste_is_typed_and_never_presses_enter() {
+        let mut app = app(snapshot());
+        assert_eq!(app.on_paste(" Brand\n new \n"), Action::None);
+        assert_eq!(app.search.value(), "Brand new");
+        app.on_key(ctrl('n'));
+        app.on_key(key(KeyCode::Tab));
+        app.on_paste("one\ntwo");
+        let [Screen::Form(form)] = &app.screens[..] else { panic!("no form") };
+        assert_eq!((form.title.value(), form.description_text().as_str()), ("Brand new", "one\ntwo"));
     }
 
     /// R8.3: Enter on the Projects screen shows the project's tasks.

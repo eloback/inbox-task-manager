@@ -123,17 +123,18 @@ pub fn clone_project(
 /// Everything `output` says until it ends; `said` gets the last line of each
 /// chunk (git rewrites its progress line with "\r").
 fn read_progress(output: &mut impl Read, said: &dyn Fn(String)) -> String {
-    let mut text = String::new();
+    // Read off whole at the end: a chunk can end inside a character (of the name on the last line).
+    let mut bytes = vec![];
     let mut chunk = [0u8; 512];
     while let Ok(n @ 1..) = output.read(&mut chunk) {
+        bytes.extend_from_slice(&chunk[..n]);
         let part = String::from_utf8_lossy(&chunk[..n]);
-        text.push_str(&part);
         if let Some(last) = part.split(['\r', '\n']).map(str::trim).rfind(|p| !p.is_empty()) {
             let shown: String = last.chars().rev().take(70).collect::<Vec<_>>().into_iter().rev().collect();
             said(shown);
         }
     }
-    text
+    String::from_utf8_lossy(&bytes).into_owned()
 }
 
 #[cfg(test)]
@@ -170,5 +171,7 @@ mod tests {
         assert_eq!(rx.try_iter().collect::<Vec<_>>(), ["Receiving objects: 100% (2/2), done."]);
         let long = "x".repeat(100);
         read_progress(&mut long.as_bytes(), &|line: String| assert_eq!(line.len(), 70));
+        let name = format!("{}Café crème\n", "x".repeat(509)); // "é" across the first chunk's end
+        assert!(read_progress(&mut name.as_bytes(), &|_| ()).ends_with("Café crème\n"), "the name read whole");
     }
 }

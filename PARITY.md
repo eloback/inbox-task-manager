@@ -222,7 +222,8 @@ Last updated: milestone 4 (the switcher's screens and dialogs).
 - The form's snooze is a field ←/→ change (Textual's `Select` is a
   drop-down); typing on it picks "Other time…" and types the time there.
 - No mouse: the project field, rows and tabs are not clickable (Textual's
-  are). A paste (bracketed paste) is typed, whitespace one space each.
+  are). A paste (bracketed paste) is typed, whitespace one space each,
+  except into the form's description, which keeps its lines.
 - The Projects screen's column of where a project is gives way in a
   narrow popup, so when it was last used is never cut; Python's is 45
   columns wide.

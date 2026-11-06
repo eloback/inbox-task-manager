@@ -40,9 +40,11 @@ pub struct Listing {
 }
 
 impl Listing {
-    /// Where a subfolder of this one really is.
+    /// Where a subfolder of this one really is, read off the listing (no
+    /// I/O: a screen asks while typing). The folder is resolved and links
+    /// were resolved when it was read, so any other subfolder is just its name.
     pub fn target(&self, name: &str) -> PathBuf {
-        self.links.get(name).cloned().unwrap_or_else(|| resolved(&self.real.join(name)))
+        self.links.get(name).cloned().unwrap_or_else(|| self.real.join(name))
     }
 }
 
