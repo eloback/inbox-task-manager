@@ -568,6 +568,25 @@ pub fn project_line(project: &Project, matched: &[usize], missing: bool, paths: 
     spans
 }
 
+/// How a text field is shown: focused or not, and whether its text is
+/// selected, so the next key typed replaces it ([`super::screen::type_into`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FieldFocus {
+    Unfocused,
+    Focused,
+    Selected,
+}
+
+impl FieldFocus {
+    pub fn of(focused: bool, selected: bool) -> FieldFocus {
+        match (focused, selected) {
+            (false, _) => FieldFocus::Unfocused,
+            (true, false) => FieldFocus::Focused,
+            (true, true) => FieldFocus::Selected,
+        }
+    }
+}
+
 /// A one-line text field: its label (`width` columns), then what was typed
 /// (or the placeholder), and ghost text after it. A value longer than
 /// `room` columns scrolls to keep the cursor in view. Returns the line, and
@@ -578,14 +597,20 @@ pub fn field_line<'a>(
     input: &tui_input::Input,
     placeholder: &str,
     ghost: Option<&str>,
-    focused: bool,
+    focus: FieldFocus,
     room: usize,
 ) -> (Line<'a>, u16) {
-    let style = if focused { Style::new().fg(ACCENT).bold() } else { Style::new().fg(MUTED) };
+    let style = match focus {
+        FieldFocus::Unfocused => Style::new().fg(MUTED),
+        FieldFocus::Focused | FieldFocus::Selected => Style::new().fg(ACCENT).bold(),
+    };
     let mut spans = vec![Span::styled(format!("{label:<width$}"), style)];
     let scroll = input.visual_scroll(room.saturating_sub(1).max(1)); // a column for the cursor at the end
     match input.value() {
         "" => spans.push(muted(placeholder.to_string())),
+        value if focus == FieldFocus::Selected => {
+            spans.push(Span::styled(skip_columns(value, scroll), Style::new().reversed()))
+        }
         value => {
             spans.push(Span::raw(skip_columns(value, scroll)));
             if let Some(rest) = ghost.and_then(|g| g.strip_prefix(value)) {
@@ -1142,11 +1167,12 @@ mod tests {
     #[test]
     fn a_long_value_scrolls_in_its_field() {
         let input = tui_input::Input::new("git@github.com:organization/a-long-repository-name.git".into());
-        let (line, cursor) = field_line("Source", 8, &input, "", None, true, 20);
+        let (line, cursor) = field_line("Source", 8, &input, "", None, FieldFocus::Focused, 20);
         let shown: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(shown, "Source  repository-name.git", "its end, where the cursor is");
         assert_eq!(cursor, 8 + 19);
-        let (line, cursor) = field_line("Name", 8, &tui_input::Input::new("api".into()), "", None, true, 20);
+        let (line, cursor) =
+            field_line("Name", 8, &tui_input::Input::new("api".into()), "", None, FieldFocus::Focused, 20);
         assert_eq!((line.spans[1].content.as_ref(), cursor), ("api", 11));
         assert_eq!(skip_columns("日本語abc", 4), "語abc", "wide characters take two columns");
     }

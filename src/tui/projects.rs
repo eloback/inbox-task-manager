@@ -7,18 +7,19 @@
 use std::collections::BTreeSet;
 
 use ratatui::Frame;
-use ratatui::crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Constraint, Layout, Margin, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Clear, List, ListItem, ListState, Paragraph, Wrap};
 use tui_input::Input;
-use tui_input::backend::crossterm::EventHandler;
 
 use super::add::AddDialog;
 use super::app::{Action, Job, Reply, Snapshot, renamed};
-use super::draw::{Tone, WIDE, bold, field_line, key_hints, muted, name_badge, wrapped_dialog, wrapped_key_hints};
-use super::screen::{Context, Field, Outcome, RemoveDialog, Screen, moves, step};
+use super::draw::{
+    FieldFocus, Tone, WIDE, bold, field_line, key_hints, muted, name_badge, wrapped_dialog, wrapped_key_hints,
+};
+use super::screen::{Context, Field, Outcome, RemoveDialog, Screen, moves, selects, step, type_into};
 use crate::error::{Error, shell_quote};
 use crate::paths::Paths;
 use crate::projects::{RemovalNote, name_problem, projects_by_recent};
@@ -141,13 +142,17 @@ pub struct RenameDialog {
     pub id: String,
     pub old: String,
     pub name: Input,
+    /// The old name is selected: what is typed replaces it.
+    pub selected: bool,
     pub data: Data,
     pub problem: Option<String>,
 }
 
 impl RenameDialog {
     pub fn new(id: String, old: String, data: Data) -> RenameDialog {
-        RenameDialog { id, name: Input::new(old.clone()), old, data, problem: None }
+        let mut name = Input::new(old.clone());
+        let selected = selects(&mut name);
+        RenameDialog { id, name, selected, old, data, problem: None }
     }
 
     pub fn on_key(&mut self, key: KeyEvent, cx: &Context) -> Outcome {
@@ -163,7 +168,7 @@ impl RenameDialog {
                 Outcome::CloseAnd(Action::Run(Job::RenameProject { id: self.id.clone(), name: new.into() }))
             }
             _ => {
-                if self.name.handle_event(&Event::Key(key)).is_some_and(|c| c.value) {
+                if type_into(&mut self.name, &mut self.selected, key) {
                     let problem = name_problem(&self.data, cx.paths, self.name.value().trim(), &self.id);
                     self.problem = problem.map(|e| e.to_string());
                 }
@@ -294,7 +299,8 @@ impl RenameDialog {
             None => muted("Its tasks keep it: they refer to the project's id, not its name."),
         };
         let room = (area.width.min(WIDE).saturating_sub(4) as usize).saturating_sub(10);
-        let (field, cursor) = field_line("New name", 10, &self.name, "", None, true, room);
+        let (field, cursor) =
+            field_line("New name", 10, &self.name, "", None, FieldFocus::of(true, self.selected), room);
         let lines = vec![
             Line::from(bold(format!("Rename project “{}”", self.old))),
             Line::default(),
@@ -371,6 +377,21 @@ mod tests {
         with_cx(|cx| screen.done(&job, Ok(Reply::Renamed("api".into(), "backend2".into(), None)), cx));
         assert_eq!(screen.message, Some(("Renamed api to backend2.".into(), false)));
         assert!(matches!(screen.on_key(key(KeyCode::Enter)), Outcome::CloseAnd(Action::Filter(name)) if name == "api"));
+    }
+
+    /// R8.2, R8.3: the rename dialog opens with the old name selected, as
+    /// in the Python itm: typing replaces it.
+    #[test]
+    fn r8_2_a_rename_types_over_the_old_name() {
+        let mut screen = ProjectsScreen::new(&with_projects());
+        let Outcome::Open(rename) = screen.on_key(ctrl('r')) else { panic!("no rename dialog") };
+        let Screen::Rename(mut rename) = *rename else { panic!() };
+        let mut outcome = Outcome::Stay;
+        for k in "X".chars().map(|c| key(KeyCode::Char(c))).chain([key(KeyCode::Enter)]) {
+            outcome = with_cx(|cx| rename.on_key(k, cx));
+        }
+        let Outcome::CloseAnd(Action::Run(Job::RenameProject { name, .. })) = outcome else { panic!("{outcome:?}") };
+        assert_eq!(name, "X");
     }
 
     /// R8.3: the list follows each refresh, keeping the highlighted project;

@@ -9,18 +9,19 @@
 use std::time::{Duration, Instant};
 
 use ratatui::Frame;
-use ratatui::crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::Rect;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
 use tui_input::Input;
-use tui_input::backend::crossterm::EventHandler;
 
 use super::app::{Action, Job, Reply};
 use super::completion::Folders;
-use super::draw::{ACCENT, Tone, WIDE, bold, dialog_box, field_line, muted, wrapped_key_hints, wrapped_rows};
-use super::screen::{Context, Field, Need, Outcome};
+use super::draw::{
+    ACCENT, FieldFocus, Tone, WIDE, bold, dialog_box, field_line, muted, wrapped_key_hints, wrapped_rows,
+};
+use super::screen::{Context, Field, Need, Outcome, selects, type_into};
 use crate::error::Error;
 use crate::paths::Paths;
 use crate::projects::Check;
@@ -64,6 +65,8 @@ pub struct AddDialog {
     pub source: Input,
     pub name: Input,
     pub focus: Field,
+    /// The focused field's text is selected: what is typed replaces it.
+    pub selected: bool,
     pub folders: Folders,
     /// The last check of what was typed: what it checked, and what it found
     /// (Err: the source is no folder or git URL).
@@ -77,18 +80,27 @@ pub struct AddDialog {
 
 impl AddDialog {
     pub fn new(kind: ProjectKind, source: &str, name: &str, focus: Field) -> AddDialog {
-        AddDialog {
+        let mut dialog = AddDialog {
             kind,
             source: Input::new(source.into()),
             name: Input::new(name.into()),
-            focus: if kind == ProjectKind::Name { Field::Name } else { focus },
+            focus,
+            selected: false,
             folders: Folders::default(),
             check: None,
             check_wanted: true,
             check_after: None,
             busy: None,
             said: None,
-        }
+        };
+        dialog.focus_on(if kind == ProjectKind::Name { Field::Name } else { focus });
+        dialog
+    }
+
+    /// Focus `field`, its text selected (as in the Python itm).
+    fn focus_on(&mut self, field: Field) {
+        self.focus = field;
+        self.selected = selects(if field == Field::Source { &mut self.source } else { &mut self.name });
     }
 
     /// Filled with a workspace's folder and name (R10.5), ready on the name.
@@ -119,7 +131,7 @@ impl AddDialog {
         }
         self.kind = KINDS[at.rem_euclid(KINDS.len() as isize) as usize];
         if self.kind == ProjectKind::Name {
-            self.focus = Field::Name; // a name only has no source
+            self.focus_on(Field::Name); // a name only has no source
         }
         (self.check_wanted, self.check_after, self.said) = (true, None, None);
     }
@@ -150,19 +162,19 @@ impl AddDialog {
                     && (key.code == KeyCode::Tab || self.source.cursor() == self.source.value().chars().count())
                     && self.ghost().is_some() =>
             {
-                self.source = Input::new(self.ghost().expect("checked"));
+                (self.source, self.selected) = (Input::new(self.ghost().expect("checked")), false);
                 self.changed(cx);
             }
             KeyCode::Tab | KeyCode::BackTab | KeyCode::Up | KeyCode::Down => {
                 if self.kind != ProjectKind::Name {
-                    self.focus = if in_source { Field::Name } else { Field::Source };
+                    self.focus_on(if in_source { Field::Name } else { Field::Source });
                 }
             }
             KeyCode::Enter => return self.submit(),
             _ if self.busy.is_some() => {} // what is being added stays as it is
             _ => {
                 let field = if in_source { &mut self.source } else { &mut self.name };
-                if field.handle_event(&Event::Key(key)).is_some_and(|change| change.value) {
+                if type_into(field, &mut self.selected, key) {
                     self.changed(cx);
                 }
             }
@@ -253,7 +265,7 @@ impl AddDialog {
             }
             Err(e) => {
                 if e.is_about_the_name() {
-                    self.focus = Field::Name; // another name will do (R8.5)
+                    self.focus_on(Field::Name); // another name will do (R8.5)
                 }
                 self.said = Some(Said::Failed(e.to_string()));
                 Outcome::Stay
@@ -334,9 +346,8 @@ impl AddDialog {
                 _ => "~/code/project",
             };
             let ghost = self.ghost();
-            let focused = self.focus == Field::Source;
-            let (line, cursor) =
-                field_line("Source", LABEL, &self.source, placeholder, ghost.as_deref(), focused, room);
+            let focus = FieldFocus::of(self.focus == Field::Source, self.selected);
+            let (line, cursor) = field_line("Source", LABEL, &self.source, placeholder, ghost.as_deref(), focus, room);
             source_cursor = cursor;
             lines.push(line);
         }
@@ -346,8 +357,8 @@ impl AddDialog {
             (_, Some(default)) if !default.is_empty() => default,
             _ => "defaults to the repository or folder name",
         };
-        let (line, name_cursor) =
-            field_line("Name", LABEL, &self.name, placeholder, None, self.focus == Field::Name, room);
+        let focus = FieldFocus::of(self.focus == Field::Name, self.selected);
+        let (line, name_cursor) = field_line("Name", LABEL, &self.name, placeholder, None, focus, room);
         lines.push(line);
         lines.push(Line::default());
         lines.extend(status.into_iter().map(|(text, tone)| Line::from(tone.span(text))));
@@ -404,8 +415,9 @@ mod tests {
         assert_eq!(dialog.kind, ProjectKind::Git, "a clone being started: the kind stays");
 
         let mut named = AddDialog::new(ProjectKind::Name, "", "Client X", Field::Name);
-        press(&mut named, &[key(KeyCode::Left), key(KeyCode::Left)], now);
-        assert_eq!((named.kind, named.name.cursor()), (ProjectKind::Name, 6), "the cursor moves in the name");
+        press(&mut named, &[key(KeyCode::Left), key(KeyCode::Right), key(KeyCode::Right)], now);
+        // Left on the selected name goes to its start (as in the Python itm), then the cursor moves.
+        assert_eq!((named.kind, named.name.cursor()), (ProjectKind::Name, 2), "the cursor moves in the name");
     }
 
     /// R8.5: what was typed is checked once typing pauses, and only the

@@ -1,6 +1,5 @@
 ---
 source: src/tui/draw.rs
-assertion_line: 1243
 expression: screen(&mut app)
 ---
 
@@ -13,7 +12,7 @@ expression: screen(&mut app)
  ◆ Client X n╭──────────────────────────────────────────────────────────────────────────────────╮
              │ Rename project “api”                                                             │
              │                                                                                  │
-             │ New name  api2                                                                   │
+             │ New name  2                                                                      │
              │                                                                                  │
              │ Its tasks keep it: they refer to the project's id, not its name.                 │
              │                                                                                  │

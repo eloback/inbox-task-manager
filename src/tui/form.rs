@@ -10,10 +10,9 @@
 use std::collections::BTreeSet;
 
 use jiff::tz::TimeZone;
-use ratatui::crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui_textarea::{TextArea, WrapMode};
 use tui_input::Input;
-use tui_input::backend::crossterm::EventHandler;
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -23,11 +22,11 @@ use ratatui::widgets::{Paragraph, Wrap};
 
 use super::app::{Action, Job, Reply, Snapshot};
 use super::draw::{
-    ACCENT, MUTED, Tone, WIDE, bold, colored, dialog_box, field_line, muted, name_badge, project_line,
+    ACCENT, FieldFocus, MUTED, Tone, WIDE, bold, colored, dialog_box, field_line, muted, name_badge, project_line,
     wrapped_key_hints, wrapped_rows,
 };
 use super::finder::{Finder, Saved};
-use super::screen::{Context, Outcome, Screen};
+use super::screen::{Context, Outcome, Screen, selects, type_into};
 use crate::error::Error;
 use crate::herdr::Session;
 use crate::paths::Paths;
@@ -148,6 +147,8 @@ pub struct TaskForm {
     pub snooze: usize,
     pub other: Input,
     pub focus: Part,
+    /// The focused field's text is selected: what is typed replaces it.
+    pub selected: bool,
     pub error: Option<String>,
     /// A time typed that only GNU `date` reads is being read by a worker
     /// (R4.1): saving waits for it, and keys wait too.
@@ -168,7 +169,7 @@ impl TaskForm {
         paths: &Paths,
     ) -> TaskForm {
         let projects: Vec<String> = projects.into_iter().filter(|id| saved.projects.contains_key(id)).collect();
-        TaskForm {
+        let form = TaskForm {
             editing: None,
             title: Input::new(title.into()),
             description: description(""),
@@ -179,18 +180,20 @@ impl TaskForm {
             snooze: 0,
             other: Input::default(),
             focus: Part::Title,
+            selected: false,
             error: None,
             reading: false,
             cannot_switch: None,
             task_dir: paths.display(&paths.task_dir),
-        }
+        };
+        form.focused_on(Part::Title)
     }
 
     pub fn edit(task: &Task, saved: Saved, editing: Editing) -> TaskForm {
         let projects: Vec<String> =
             task.projects.iter().filter(|id| saved.projects.contains_key(*id)).cloned().collect();
         let text = task.description.clone().unwrap_or_default();
-        TaskForm {
+        let form = TaskForm {
             editing: Some(editing),
             title: Input::new(task.title.clone()),
             description: description(&text),
@@ -201,11 +204,28 @@ impl TaskForm {
             snooze: 0,
             other: Input::default(),
             focus: Part::Title,
+            selected: false,
             error: None,
             reading: false,
             cannot_switch: None,
             task_dir: String::new(),
-        }
+        };
+        form.focused_on(Part::Title)
+    }
+
+    fn focused_on(mut self, part: Part) -> TaskForm {
+        self.focus_on(part);
+        self
+    }
+
+    /// Focus `part`; a one-line field gets its text selected (as in the Python itm).
+    fn focus_on(&mut self, part: Part) {
+        self.focus = part;
+        self.selected = match part {
+            Part::Title => selects(&mut self.title),
+            Part::Other => selects(&mut self.other),
+            _ => false,
+        };
     }
 
     pub fn cannot_switch(self, problem: Option<String>) -> TaskForm {
@@ -240,7 +260,7 @@ impl TaskForm {
     fn move_focus(&mut self, by: isize) {
         let parts = self.parts();
         let at = parts.iter().position(|p| *p == self.focus).unwrap_or(0) as isize;
-        self.focus = parts[(at + by).rem_euclid(parts.len() as isize) as usize];
+        self.focus_on(parts[(at + by).rem_euclid(parts.len() as isize) as usize]);
     }
 
     pub fn description_text(&self) -> String {
@@ -270,8 +290,8 @@ impl TaskForm {
             KeyCode::BackTab => self.move_focus(-1),
             _ => match self.focus {
                 Part::Title | Part::Other if key.code == KeyCode::Enter => return self.save(cx),
-                Part::Title => drop(self.title.handle_event(&Event::Key(key))),
-                Part::Other => drop(self.other.handle_event(&Event::Key(key))),
+                Part::Title => drop(type_into(&mut self.title, &mut self.selected, key)),
+                Part::Other => drop(type_into(&mut self.other, &mut self.selected, key)),
                 Part::Description => drop(self.description.input(key)),
                 Part::Projects => match key.code {
                     KeyCode::Enter | KeyCode::Char(' ') => return self.find("", cx),
@@ -285,8 +305,10 @@ impl TaskForm {
                     KeyCode::Right | KeyCode::Down => self.snooze = (self.snooze + 1).min(self.presets.len() + 1),
                     // Typing on the snooze is typing a time.
                     KeyCode::Char(c) if !ctrl && !alt => {
-                        (self.snooze, self.focus) = (self.presets.len() + 1, Part::Other);
-                        self.other.handle_event(&Event::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)));
+                        self.snooze = self.presets.len() + 1;
+                        self.focus_on(Part::Other);
+                        let typed = KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
+                        type_into(&mut self.other, &mut self.selected, typed);
                     }
                     _ => {}
                 },
@@ -350,7 +372,8 @@ impl TaskForm {
         }) {
             Ok(until) => self.create(until),
             Err(e) => {
-                (self.error, self.focus) = (Some(e), Part::Other);
+                // Back on the time to fix it, the cursor where it was: typing goes on.
+                (self.error, self.focus, self.selected) = (Some(e), Part::Other, false);
                 Outcome::Stay
             }
         }
@@ -368,7 +391,8 @@ impl TaskForm {
     fn save(&mut self, cx: &Context) -> Outcome {
         let title = self.title.value().trim().to_string();
         if title.is_empty() {
-            (self.error, self.focus) = (Some("The task needs a title.".into()), Part::Title);
+            self.error = Some("The task needs a title.".into());
+            self.focus_on(Part::Title);
             return Outcome::Stay;
         }
         let description = self.description_text().trim().to_string();
@@ -545,7 +569,7 @@ impl TaskForm {
             let style = if self.focus == part { Style::new().fg(ACCENT).bold() } else { Style::new().fg(MUTED) };
             Span::styled(format!("{text:<LABEL$}"), style)
         };
-        let focused = |part| self.focus == part;
+        let focused = |part| FieldFocus::of(self.focus == part, self.selected);
         let (title, title_cursor) =
             field_line("Title", LABEL, &self.title, "What is this task about?", None, focused(Part::Title), room);
         lines.push(title);
@@ -731,6 +755,26 @@ mod tests {
             Outcome::CloseAnd(Action::Run(job)) => job,
             other => panic!("not saved: {other:?}"),
         }
+    }
+
+    /// R5.4, R1.1: a title the form opens with is selected, as in the
+    /// Python itm: what is typed replaces it. Coming back to it with Tab
+    /// selects it again; an arrow keeps it and moves the cursor.
+    #[test]
+    fn typing_replaces_the_title_the_form_opens_with() {
+        let mut form = edit_form(None, false, None);
+        assert!(form.selected);
+        press(&mut form, &typed("Fix login now"));
+        assert_eq!(form.title.value(), "Fix login now");
+        press(&mut form, &[key(KeyCode::Tab), key(KeyCode::BackTab)]);
+        press(&mut form, &[key(KeyCode::Left)]);
+        press(&mut form, &typed("! "));
+        assert_eq!(form.title.value(), "! Fix login now", "Left went to its start");
+
+        let mut form = TaskForm::new_task("Plan", vec![], with_projects().saved(), vec![], &paths());
+        press(&mut form, &[key(KeyCode::Backspace)]);
+        assert_eq!(form.title.value(), "", "itm new -i \"Plan\": Backspace clears it");
+        assert!(!new_form(&[]).selected, "an empty title has nothing to select");
     }
 
     /// R1.1: Esc closes an empty form at once, and asks first once something was typed.

@@ -283,6 +283,40 @@ impl SettingsScreen {
 }
 
 /// Up and down in a list: ↑↓, and Ctrl+K / Ctrl+J as in vim; 0 for any other key.
+/// Typing into a one-line field as the Python itm's Textual Input did
+/// (select on focus): while `selected`, which focusing a field with text
+/// in it sets ([`selects`]), a character replaces the text and Backspace
+/// or Delete clears it, so a field that opens filled in (a rename, an
+/// edit's title) takes a new value without being cleared first. Any other
+/// key unselects it, Left and Home going to its start. Returns whether the
+/// value changed.
+pub fn type_into(input: &mut Input, selected: &mut bool, key: KeyEvent) -> bool {
+    let plain = !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+    if std::mem::take(selected) {
+        match key.code {
+            KeyCode::Char(_) if plain => input.reset(),
+            KeyCode::Backspace | KeyCode::Delete => {
+                let had = !input.value().is_empty();
+                input.reset();
+                return had;
+            }
+            KeyCode::Left | KeyCode::Home => {
+                *input = std::mem::take(input).with_cursor(0);
+                return false;
+            }
+            _ => {}
+        }
+    }
+    input.handle_event(&Event::Key(key)).is_some_and(|change| change.value)
+}
+
+/// What focusing a field selects: its text, if it has any, with the cursor
+/// at its end (see [`type_into`]).
+pub fn selects(input: &mut Input) -> bool {
+    *input = std::mem::take(input).with_cursor(usize::MAX);
+    !input.value().is_empty()
+}
+
 pub fn moves(key: KeyEvent) -> isize {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     match key.code {
@@ -419,5 +453,49 @@ impl SnoozeDialog {
             Err(e) => self.error = Some(e.to_string()),
         }
         Outcome::Stay
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    /// The Python itm's Textual Input: a field focused with text in it has
+    /// that text selected; a character replaces it, Backspace and Delete
+    /// clear it, Left and Home go to its start, any other key keeps it.
+    #[test]
+    fn typing_into_a_selected_field_replaces_its_text() {
+        let field = || {
+            let mut input = Input::new("api".into()).with_cursor(1);
+            let selected = selects(&mut input);
+            (input, selected)
+        };
+        let (mut input, mut selected) = field();
+        assert!(selected && input.cursor() == 3, "selected, the cursor at its end");
+        assert!(type_into(&mut input, &mut selected, key(KeyCode::Char('w'))));
+        assert!(type_into(&mut input, &mut selected, key(KeyCode::Char('e'))));
+        assert_eq!((input.value(), selected), ("we", false));
+        for code in [KeyCode::Backspace, KeyCode::Delete] {
+            let (mut input, mut selected) = field();
+            assert!(type_into(&mut input, &mut selected, key(code)));
+            assert_eq!(input.value(), "");
+        }
+        let (mut input, mut selected) = field();
+        assert!(!type_into(&mut input, &mut selected, key(KeyCode::Home)));
+        type_into(&mut input, &mut selected, key(KeyCode::Char('x')));
+        assert_eq!(input.value(), "xapi");
+        let (mut input, mut selected) = field();
+        type_into(&mut input, &mut selected, key(KeyCode::Right));
+        type_into(&mut input, &mut selected, key(KeyCode::Char('s')));
+        assert_eq!(input.value(), "apis", "unselected at its end");
+        let (mut input, mut selected) = field();
+        type_into(&mut input, &mut selected, KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
+        assert!(!selected && input.value() == "api", "a Ctrl key is no character typed");
+        let mut empty = Input::default();
+        assert!(!selects(&mut empty), "nothing to select");
     }
 }

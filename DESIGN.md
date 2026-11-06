@@ -819,6 +819,16 @@ The switcher and its dialogs follow these principles.
     fed as keys, its whitespace (newlines too) one space each, so a pasted
     URL opens the finder like typing does and never presses Enter; the
     form's description, the one field with several lines, takes it as it is.
+  - A one-line field focused with text in it has that text selected, as
+    Textual's `Input` had (`select_on_focus`): a character replaces it,
+    Backspace or Delete clears it, Left or Home goes to its start, and any
+    other key unselects it (`screen::type_into`, drawn reversed). So a field
+    that opens filled in (the rename dialog, the edit form's title, `itm new
+    -i "<title>"`, the add dialog `add-workspace` fills in) takes a new value
+    without being cleared first. The finder's query is never selected (the
+    key that opened it must not be replaced by the next), and a snooze time
+    that could not be read puts the cursor back in it unselected, so typing
+    goes on.
   - The main list's keys are matched before the search box gets a key,
     except `?`, which opens the help only while the search is empty and is
     typed otherwise. F1 opens it

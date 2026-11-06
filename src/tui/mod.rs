@@ -928,8 +928,7 @@ mod tests {
         assert_eq!(chosen, None);
         assert!(shown.contains("project My Thing has no folder yet"), "{shown}");
         let mut steps = vec![press(KeyCode::Enter)];
-        steps.extend((0..4).map(|_| press(KeyCode::Backspace))); // the cursor is on the name: "My Thing" → "My T"
-        steps.extend(typing("ool"));
+        steps.extend(typing("My Tool")); // the name is selected, as in the Python itm: typing replaces it
         steps.push(press(KeyCode::Enter));
         let (chosen, _) = run(steps);
         let Some(Action::ProjectAdded(id, _)) = chosen else { panic!("{chosen:?}") };
