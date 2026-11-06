@@ -662,6 +662,62 @@ The switcher and its dialogs follow these principles.
 - **Not done:** a Projects-screen action for `set` (the screen says how);
   `set --git` (a name cannot become a repository); several folders.
 
+### 2026-11-06: itm in Rust, next to the Python itm until it reaches parity
+- **Why.** A Go-versus-Rust standoff (two MVPs of the core, three reviews)
+  chose Rust: the switcher draws its first frame in about 2 ms instead of
+  175 ms, `itm list` and `itm status` take 1 ms instead of 50 ms, the daemon
+  uses 0.03% of a core and 4 MB instead of 0.8% and 24 MB, and the domain is
+  typed (task states, snooze until a time or an agent, optional folders), so
+  the optional-folder and project rules above become compile errors instead
+  of review notes.
+- **How.** An incremental rewrite. The Rust crate lives at the repository
+  root next to the Python package; the Python itm stays the behavior
+  reference (its tests are the most precise spec) until a cutover. Both read
+  and write the same files byte for byte, so either can run on the other's
+  state; `scripts/cross-check.sh` checks it. `PARITY.md` lists every
+  requirement and every rule of section 2 with its status in Rust, where it
+  lives and the test that pins it.
+- **Herdr over its socket API.** Every query and change goes to the
+  session's socket (one JSON line each way per connection, documented with a
+  JSON Schema by `herdr api schema`), 10–20 times faster than the CLI and
+  not refused after a Herdr upgrade the way the CLI's protocol check is.
+  Sessions are found as `herdr session list` finds them, from Herdr's
+  sessions folder. Only `herdr session attach` and `herdr server` run the
+  `herdr` program.
+- **Stopping a session** is a `server.stop` request, not a detached
+  `/bin/sh herdr session stop`: Herdr answers before it shuts down, so the
+  caller may run inside the session it stops (archiving the current task).
+- **Dependencies**, each pinned exactly (`=x.y.z`, released at least two
+  weeks before it was added):
+  - clap: arguments and help, with subcommands, aliases and repeated
+    options, like argparse;
+  - serde, serde_json: typed, tolerant reading of `tasks.json`, the status
+    cache, `notified.json` and Herdr's answers (unknown fields kept through
+    `flatten`), and Python's exact JSON layout on write;
+  - jiff: local times for snooze phrases and presets; DST gaps and folds
+    resolve like Python's `mktime`;
+  - regex-lite: the snooze grammar, Python's two regexes verbatim;
+  - ratatui (crossterm backend, default features off) and tui-input: the
+    switcher's drawing and its line editing. ratatui has no forms or focus,
+    so those are built in itm;
+  - rustix: the safe system calls std lacks (`getuid`, `kill` with a
+    signal); `unsafe` code is denied in the crate;
+  - tempfile: atomic writes and test folders;
+  - unicode-normalization: `slugify` like Python's `unicodedata` (NFKD, then
+    drop combining marks);
+  - shlex: `$ITM_NOTIFY_COMMAND` and `$EDITOR` split like `shlex.split`;
+  - insta (tests only): screen snapshots on ratatui's `TestBackend`.
+- **Layout.** One crate, binary `itm` (the process-name rule): `cli.rs`
+  (arguments and output), `itm.rs` (the `Itm` context: folders, Herdr, the
+  process table and the time zone of one run, and the task operations the
+  CLI, switcher and daemon share), `store.rs`, `tasks.rs`, `snooze.rs`,
+  `herdr.rs`, `switching.rs`, `daemon.rs` (`observe` asks Herdr,
+  `poll_once` decides and records), `status.rs`, `projects.rs`, `notes.rs`,
+  `system.rs` (what differs between operating systems), `paths.rs`,
+  `times.rs`, `error.rs` and `tui/` (`app.rs` state and keys without I/O,
+  `draw.rs` rendering, `mod.rs` the event loop and its workers). Tests sit
+  next to the code.
+
 ## 5. Known gaps
 
 - **Agent titles.** The text shown for an agent is its terminal title (for
@@ -734,6 +790,22 @@ The switcher and its dialogs follow these principles.
 - Known pitfalls: `tmux send-keys M-Enter` arrives as Escape then Enter.
   `pgrep -f <pattern>` also matches the shell running it.
 - Non-trivial changes get a review before they are merged.
+- **The Rust itm.** `cargo fmt --check`, `cargo clippy --all-targets -- -D
+  warnings` and `cargo test` must pass at every commit. Unit tests sit at the
+  end of each module (`#[cfg(test)] mod tests`) and need no Herdr: a fake
+  session is a unix socket answering canned JSON (`herdr::fake`), the
+  process table a `FakeProcs`, the folders a temporary root (`Itm::under`).
+  Tests never change the test process's environment (tests run in parallel
+  threads): what varies is injected. Screens are drawn on ratatui's
+  `TestBackend`, some pinned as insta snapshots in `src/tui/snapshots/`
+  (`INSTA_UPDATE=always cargo test` rewrites them after an intended change;
+  review the diff). A test that pins a requirement names it (`R4.1` in its
+  name or a comment).
+- End to end, against a real headless Herdr with tmux as the terminal:
+  `scripts/smoke.sh` (fake agents report themselves blocked over the socket
+  API, no real agent runs) and `scripts/measure.sh`, both run through
+  `scripts/sandbox.sh <name>` (no `HERDR_*` variables, private XDG folders
+  under `/tmp/itm-<name>`, notifications to a log).
 
 ## 7. Packaging
 

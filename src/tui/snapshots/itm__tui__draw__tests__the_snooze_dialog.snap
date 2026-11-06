@@ -1,0 +1,26 @@
+---
+source: src/tui/draw.rs
+expression: screen(&mut app)
+---
+  Inbox 3   Snoozed 1   Archived 1   All 5                                                      ⚑ 1 needs you
+
+ › Search tasks · or type a new title
+
+ NEEDS YOU                                                           │  Write docs
+ ⚑ Fix login                                claude waiting · 4m      │
+ ACTIVE                ╭──────────────────────────────────────────────────────────────╮ng
+ ● Write docs          │ Snooze “Write docs”                                          │
+ ○ Old idea            │                                                              │
+                       │ › Type 2h, 14:30, fri 9:00… or pick below                    │
+                       │                                                              │
+                       │  1 hour                                               09:00  │
+                       │  Until an agent needs me                           no timer  │
+                       │                                                              │
+                       │                                                              │
+                       │ enter snooze  ↑↓ pick  esc cancel                            │
+                       ╰──────────────────────────────────────────────────────────────╯
+                                                                     │
+                                                                     │
+                                                                     │  enter open
+
+ enter open  tab view  alt+1…9 row  ^z snooze  ^u wake  ^a archive  esc close
