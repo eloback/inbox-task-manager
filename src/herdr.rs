@@ -27,7 +27,7 @@ use rustix::net::{AddressFamily, SocketAddrUnix, SocketType};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::error::{Context, Error, HerdrFailure, Result, bail};
+use crate::error::{Context, Error, HerdrFailure, Result};
 use crate::status::AgentState;
 use crate::system::{in_new_session, which};
 
@@ -179,21 +179,23 @@ impl Herdr {
             .context(|| "cannot start herdr in its own session".into())?;
         let socket = self.socket(name);
         let deadline = Instant::now() + SERVER_START;
-        while connect(&socket, self.connect_timeout).is_err() {
+        let started = loop {
+            if connect(&socket, self.connect_timeout).is_ok() {
+                break Ok(socket);
+            }
             if let Ok(Some(status)) = server.try_wait()
                 && !status.success()
             {
-                bail!("herdr server for {name} exited with {status}");
+                break Err(Error::Other(format!("herdr server for {name} exited with {status}")));
             }
             if Instant::now() > deadline {
-                bail!("session {name} did not start");
+                break Err(Error::Other(format!("session {name} did not start")));
             }
             thread::sleep(Duration::from_millis(25));
-        }
-        // Reaped whenever it stops, so a stopped session leaves no zombie behind
-        // a long-running attach loop.
+        };
+        // Reaped whenever it ends, so it leaves no zombie behind a long-running attach loop.
         thread::spawn(move || server.wait());
-        Ok(socket)
+        started
     }
 
     /// Run `herdr session attach <name>` in this terminal until it detaches.
