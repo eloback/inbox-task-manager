@@ -174,7 +174,11 @@ pub fn run(cli: Cli, itm: Itm) -> Result<()> {
             }
             let title = title.join(" ");
             if title.trim().is_empty() {
-                bail!("give the task a title: itm new \"<title>\" (this version has no New task form)");
+                // Without a title the New task form opens (R1.1), which needs a terminal.
+                if !terminal() {
+                    bail!("this needs a terminal; pass the missing values as options");
+                }
+                bail!("give the task a title: itm new \"<title>\" (the New task form is not built yet)");
             }
             // A snoozed task is not switched to (R1.7). Check that a switch can
             // work before saving, so a failed one leaves no task.
@@ -196,7 +200,7 @@ pub fn run(cli: Cli, itm: Itm) -> Result<()> {
                 (false, Some(when)) => Until::parse(&when, now, &itm.tz)?,
                 // R4.1: without a time, the snooze dialog.
                 (false, None) => {
-                    if !(std::io::stdin().is_terminal() && std::io::stdout().is_terminal()) {
+                    if !terminal() {
                         bail!("this needs a terminal; pass the missing values as options");
                     }
                     let agent = Itm::agent_snooze_problem(&name, &itm.herdr.sessions()?, &itm.status()).is_none();
@@ -297,7 +301,7 @@ pub fn run(cli: Cli, itm: Itm) -> Result<()> {
                 };
                 itm.add_note(&name, &text, now)?;
                 println!("note added to {name}");
-            } else if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+            } else if terminal() {
                 itm.edit_notes(&notes)?;
             } else {
                 bail!("the editor needs a terminal; --path prints where the notes are");
@@ -329,6 +333,11 @@ pub fn run(cli: Cli, itm: Itm) -> Result<()> {
         Command::Daemon => Arc::new(itm).run_daemon(),
         Command::Setsid { program, args } => Err(crate::system::setsid_exec(&program, &args)),
     }
+}
+
+/// Whether a person can answer: a dialog or an editor needs a terminal both ways.
+fn terminal() -> bool {
+    std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
 }
 
 /// `snooze [task] [when…]`: the first word is the task when it names one.

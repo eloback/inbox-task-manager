@@ -867,6 +867,13 @@ The switcher and its dialogs follow these principles.
   API, no real agent runs) and `scripts/measure.sh`, both run through
   `scripts/sandbox.sh <name>` (no `HERDR_*` variables, private XDG folders
   under `/tmp/itm-<name>`, notifications to a log).
+- `scripts/cross-check.sh` runs the Python itm (the reference; a pinned
+  build) and the Rust itm on shared state in a sandbox: the same commands
+  write the same `tasks.json` byte for byte (timestamps masked) and print
+  the same output and errors; each lists the other's state as the other
+  does; an edit of the other's file (the old single-project format too)
+  changes nothing it should not; a Rust edit waits for the lock. Each
+  milestone adds its commands to it.
 
 ## 7. Packaging
 
