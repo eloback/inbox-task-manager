@@ -437,6 +437,9 @@ fn event_loop<B: Backend>(
             }
         }
         app.expire_message();
+        if leaving.is_some() && finishing > 0 {
+            app.flash("Finishing first…", false); // for as long as it waits, past a flash's few seconds
+        }
         let shown = app.now.epoch;
         let drawn = terminal.draw(|frame| draw::draw(frame, &mut app, shown)).context(|| "cannot draw".into());
         if leaving.is_none()
@@ -543,9 +546,6 @@ fn event_loop<B: Backend>(
                         start(job, &work, &tx, &clones);
                     }
                 }
-            }
-            if leaving.is_some() && finishing > 0 {
-                app.flash("Finishing first…", false);
             }
         }
         if let Some(ended) = leaving.take_if(|_| finishing == 0) {

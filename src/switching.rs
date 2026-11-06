@@ -145,8 +145,10 @@ impl Itm {
     /// detached the way a hand-off detaches it, and its markers are removed
     /// (left behind, they would only go once a later check found the pid stale).
     pub fn attach_loop(&self, target: &str, attach: impl FnMut(&str, Option<&Path>) -> Result<()>) -> Result<()> {
-        let _catching = Catching::start(&[SIGHUP, SIGTERM, SIGINT]).context(|| "cannot handle signals".into())?;
+        // Caught, then the default turned off (and on again first at the end): a
+        // signal in between ends itm as by default, never lost.
         let mut signals = Signals::new([SIGHUP, SIGTERM, SIGINT]).context(|| "cannot handle signals".into())?;
+        let _catching = Catching::start(&[SIGHUP, SIGTERM, SIGINT]).context(|| "cannot handle signals".into())?;
         let closing = signals.handle();
         let stop = AtomicBool::new(false);
         thread::scope(|scope| {

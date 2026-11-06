@@ -184,17 +184,20 @@ fn signal_mask(text: &str) -> Option<u64> {
 /// once, so it can clean up first; more of them meanwhile change nothing.
 /// Those ignored already (`nohup`) stay ignored.
 pub struct ExitSignals {
-    // Dropped in this order: the signals go, then they end the process again.
-    signals: Signals,
+    // Dropped in this order: the signals end the process again, then the
+    // catcher goes. A signal in between ends the process as by default
+    // (nothing is left to finish then) rather than being lost.
     _catching: Catching,
+    signals: Signals,
 }
 
 impl ExitSignals {
     pub fn catch() -> io::Result<ExitSignals> {
         let ignored = ignored_signals().unwrap_or(0);
         let caught: Vec<i32> = [SIGHUP, SIGTERM, SIGINT].into_iter().filter(|&sig| !is_set(ignored, sig)).collect();
-        let catching = Catching::start(&caught)?;
-        Ok(ExitSignals { signals: Signals::new(&caught)?, _catching: catching })
+        // Caught before the default is turned off: a signal in between ends the process (no job runs yet).
+        let signals = Signals::new(&caught)?;
+        Ok(ExitSignals { _catching: Catching::start(&caught)?, signals })
     }
 
     /// The first one that arrived since the last look, if any.
@@ -417,13 +420,20 @@ pub mod tests {
         }
         let exe = env::current_exe().unwrap();
         let args = ["--exact", test, "--nocapture", "--test-threads=1"];
-        Some(Command::new(exe).args(args).env("ITM_TEST_CHILD", test).output().unwrap())
+        let child = Command::new(exe).args(args).env("ITM_TEST_CHILD", test).output().unwrap();
+        let said = String::from_utf8_lossy(&child.stdout);
+        assert!(said.contains("running 1 test"), "the child ran no test named {test} (renamed?):\n{said}");
+        Some(child)
     }
 
-    /// Whether this process ignores one of `signals` (`nohup`), so a test of them cannot run.
+    /// Whether this process ignores one of `signals` (`nohup`), so a test of them cannot run; it says so.
     pub fn ignores(signals: &[i32]) -> bool {
         let ignored = ignored_signals().unwrap_or(0);
-        signals.iter().any(|&signal| is_set(ignored, signal))
+        let skip = signals.iter().any(|&signal| is_set(ignored, signal));
+        if skip {
+            eprintln!("skipped: this process ignores the signals the test sends (nohup?)");
+        }
+        skip
     }
 
     /// A catcher catches even after an earlier one ended (that one's end
