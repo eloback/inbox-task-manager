@@ -224,9 +224,12 @@ Last updated: milestone 4 (the switcher's screens and dialogs).
 - No mouse: the project field, rows and tabs are not clickable (Textual's
   are). A paste (bracketed paste) is typed, whitespace one space each,
   except into the form's description, which keeps its lines.
-- The Projects screen's column of where a project is gives way in a
-  narrow popup, so when it was last used is never cut; Python's is 45
-  columns wide.
+- The Projects screen sizes its columns to what is in them and lets the
+  column of where a project is give way (and go) in a narrow popup, so
+  when it was last used is never cut; Python's columns are fixed (14, 45
+  and 16 wide). Key hints in the forms, the finder, the add dialog and the
+  Projects screen wrap whole, a line each as needed. A field's value
+  longer than the field scrolls to keep the cursor in view.
 - While a clone runs, SIGTERM and SIGINT stop it as SIGHUP does (Python
   catches SIGHUP only).
 - The Settings screen shows the settings as each 2 s refresh read them, so

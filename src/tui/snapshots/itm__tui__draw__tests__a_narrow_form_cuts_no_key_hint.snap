@@ -1,0 +1,27 @@
+---
+source: src/tui/draw.rs
+assertion_line: 1105
+expression: shown
+---
+
+
+
+
+
+╭──────────────────────────────────────────────────────╮
+│ New task                                             │
+│                                                      │
+│ Title        What is this task about?                │
+│ Description  Optional. Enter adds a line.            │
+│                                                      │
+│                                                      │
+│ Projects     No project                              │
+│ Snooze       Don't snooze                            │
+│                                                      │
+│ Starts in ~                                          │
+│ Session   task-…                                     │
+│ Then switches you to it                              │
+│                                                      │
+│ enter create  tab next field                         │
+│ ^s create from any field  esc cancel                 │
+╰──────────────────────────────────────────────────────╯

@@ -22,7 +22,9 @@ use tui_input::backend::crossterm::EventHandler;
 use super::add::AddDialog;
 use super::app::Action;
 use super::completion::Folders;
-use super::draw::{ACCENT, PROJECT, SUCCESS, WIDE, bold, colored, dialog_box, key_hints, muted, project_line};
+use super::draw::{
+    ACCENT, PROJECT, SUCCESS, WIDE, bold, colored, dialog_box, muted, project_line, wrapped_key_hints, wrapped_rows,
+};
 use super::screen::{Field, Need, Outcome, Screen, moves, step};
 use crate::folders::{Listing, folder_parent, looks_like_path};
 use crate::fuzzy::fuzzy_match;
@@ -318,7 +320,11 @@ impl Finder {
         let rows = self.rows.as_deref().unwrap_or_default();
         let shown = rows.len().min(ROWS) as u16;
         let status = self.status();
-        let inside = dialog_box(frame, area, WIDE, 4 + shown + u16::from(status.is_some()) * 2 + 2 + 2);
+        let width = area.width.min(WIDE).saturating_sub(4); // inside the border and margin
+        let keys = [("enter", "add · remove a ✓ one"), ("tab", "complete a folder"), ("↑↓", "move"), ("esc", "back")];
+        let keys = wrapped_key_hints(&keys, width);
+        let said = status.as_ref().map_or(0, |s| 1 + wrapped_rows(&Line::from(s.as_str()), width as usize) as u16);
+        let inside = dialog_box(frame, area, WIDE, 4 + shown + said + 1 + keys.len() as u16 + 2);
         let mut head = vec![Line::from(bold("Projects")), Line::default()];
         let typed = match self.query.value() {
             "" => muted("Search projects, or type ~/folder, /folder or a git URL"),
@@ -337,12 +343,7 @@ impl Finder {
             tail.extend([Line::default(), Line::from(muted(status))]);
         }
         tail.push(Line::default());
-        tail.push(key_hints(&[
-            ("enter", "add · remove a ✓ one"),
-            ("tab", "complete a folder"),
-            ("↑↓", "move"),
-            ("esc", "back"),
-        ]));
+        tail.extend(keys);
         let below = Rect { y: list.bottom(), height: inside.bottom().saturating_sub(list.bottom()), ..inside };
         frame.render_widget(Paragraph::new(tail).wrap(Wrap { trim: false }), below);
     }

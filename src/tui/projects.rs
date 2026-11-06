@@ -17,7 +17,7 @@ use tui_input::backend::crossterm::EventHandler;
 
 use super::add::AddDialog;
 use super::app::{Action, Job, Reply, Snapshot, renamed};
-use super::draw::{Tone, WIDE, bold, field_line, key_hints, muted, name_badge, wrapped_dialog};
+use super::draw::{Tone, WIDE, bold, field_line, key_hints, muted, name_badge, wrapped_dialog, wrapped_key_hints};
 use super::screen::{Context, Field, Outcome, RemoveDialog, Screen, moves, step};
 use crate::error::{Error, shell_quote};
 use crate::paths::Paths;
@@ -179,13 +179,15 @@ impl ProjectsScreen {
     pub fn draw(&self, frame: &mut Frame, area: Rect, paths: &Paths, now: i64) {
         frame.render_widget(Clear, area);
         let area = area.inner(Margin { horizontal: 1, vertical: 1 });
-        let [title, _, list, hint, message, keys] = Layout::vertical([
+        let hints = [("enter", "show its tasks"), ("^n", "add"), ("^r", "rename"), ("^d", "remove"), ("esc", "back")];
+        let keys = wrapped_key_hints(&hints, area.width);
+        let [title, _, list, hint, message, footer] = Layout::vertical([
             Constraint::Length(1),
             Constraint::Length(1),
             Constraint::Fill(1),
             Constraint::Length(if self.hint().is_some() { 2 } else { 0 }),
             Constraint::Length(u16::from(self.message.is_some()) * 2),
-            Constraint::Length(1),
+            Constraint::Length(keys.len() as u16),
         ])
         .areas(area);
         frame.render_widget(
@@ -196,10 +198,8 @@ impl ProjectsScreen {
         let items: Vec<ListItem> = match ids.is_empty() {
             true => vec![ListItem::new(muted("No projects yet. Ctrl+N adds a repository, a folder or a name."))],
             false => {
-                // One width for where they are, as wide as the longest end of a row lets it be.
-                let tail = ids.iter().map(|id| self.used(id, now).chars().count()).max().unwrap_or(0);
-                let room = (list.width as usize).saturating_sub(14 + 5 + 1 + tail).clamp(12, 45);
-                ids.iter().map(|id| ListItem::new(Line::from(self.row(id, paths, now, room)))).collect()
+                let widths = self.widths(&ids, now, list.width as usize);
+                ids.iter().map(|id| ListItem::new(Line::from(self.row(id, paths, now, widths)))).collect()
             }
         };
         let at = self.selected.as_ref().and_then(|id| ids.iter().position(|i| i == id));
@@ -213,8 +213,7 @@ impl ProjectsScreen {
             let tone = if *error { Tone::Error } else { Tone::Muted };
             frame.render_widget(Paragraph::new(tone.span(text.clone())).wrap(Wrap { trim: false }), message);
         }
-        let hints = [("enter", "show its tasks"), ("^n", "add"), ("^r", "rename"), ("^d", "remove"), ("esc", "back")];
-        frame.render_widget(Paragraph::new(key_hints(&hints)), keys);
+        frame.render_widget(Paragraph::new(keys), footer);
     }
 
     /// How to give the highlighted project a folder when it has none (the screen has no action for it).
@@ -227,38 +226,65 @@ impl ProjectsScreen {
         ))
     }
 
-    /// Its tasks (how many are open), when it was last used, and whether its folder is missing.
-    fn used(&self, id: &str, now: i64) -> String {
+    /// Its tasks, and how many of them are open.
+    fn count(&self, id: &str) -> String {
         let tasks: Vec<_> = self.data.tasks.values().filter(|t| t.projects.iter().any(|p| p == id)).collect();
         let open = tasks.iter().filter(|t| t.state != State::Archived).count();
         let plural = if tasks.len() == 1 { "" } else { "s" };
-        let mut count = format!("{} task{plural}", tasks.len());
-        if !tasks.is_empty() {
-            count.push_str(&format!(" · {open} open"));
+        match tasks.is_empty() {
+            true => format!("0 task{plural}"),
+            false => format!("{} task{plural} · {open} open", tasks.len()),
         }
-        let missing = if self.missing.contains(id) { " · folder missing" } else { "" };
-        format!("{count:<16} used {}{missing}", rel(self.data.projects[id].last_used_at, now))
     }
 
-    /// Its name, kind, where it is in `room` columns (its end kept in a
-    /// narrow popup), its tasks and when it was last used, which is never cut.
-    fn row(&self, id: &str, paths: &Paths, now: i64, room: usize) -> Vec<Span<'static>> {
+    /// When it was last used, and whether its folder is missing.
+    fn used(&self, id: &str, now: i64) -> String {
+        let missing = if self.missing.contains(id) { " · folder missing" } else { "" };
+        format!("used {}{missing}", rel(self.data.projects[id].last_used_at, now))
+    }
+
+    /// The columns' widths in `width`, one set for every row: the badge and
+    /// the count as wide as their longest (at most 14 and 16), and where
+    /// each project is in what is left (at most 45). When it was used is
+    /// never cut: where they are gives way first, and goes when it would
+    /// have fewer than 8 columns.
+    fn widths(&self, ids: &[String], now: i64, width: usize) -> Widths {
+        let longest = |f: &dyn Fn(&str) -> usize| ids.iter().map(|id| f(id)).max().unwrap_or(0);
+        let badge = longest(&|id| self.data.projects[id].name.chars().count() + 3).min(14);
+        let count = longest(&|id| self.count(id).chars().count() + 1).min(16);
+        let used = longest(&|id| self.used(id, now).chars().count());
+        let place = width.saturating_sub(badge + 5 + 1 + count + 1 + used).min(45);
+        Widths { badge, count, place: if place < 8 { 0 } else { place } }
+    }
+
+    /// Its name, kind, where it is (its end kept when cut), its tasks and when it was last used.
+    fn row(&self, id: &str, paths: &Paths, now: i64, widths: Widths) -> Vec<Span<'static>> {
         let project = &self.data.projects[id];
-        let used = self.used(id, now);
-        let place = paths.place(project);
-        let chars: Vec<char> = place.chars().collect();
-        let place = match chars.len() >= room {
-            true => format!("…{}", chars[chars.len() + 2 - room..].iter().collect::<String>()),
-            false => place,
-        };
-        let mut spans = name_badge(&project.name, 14, &[]);
-        spans.extend([
-            muted(format!("{:<4} ", project.kind().name())),
-            Span::raw(format!("{place:<room$} ")),
-            muted(used),
-        ]);
+        let mut spans = name_badge(&project.name, widths.badge, &[]);
+        spans.push(muted(format!("{:<4} ", project.kind().name())));
+        let room = widths.place;
+        if room > 0 {
+            let place = paths.place(project);
+            let chars: Vec<char> = place.chars().collect();
+            let place = match chars.len() >= room {
+                true => format!("…{}", chars[chars.len() + 2 - room..].iter().collect::<String>()),
+                false => place,
+            };
+            spans.push(Span::raw(format!("{place:<room$} ")));
+        }
+        let count = widths.count;
+        spans.push(muted(format!("{:<count$} {}", self.count(id), self.used(id, now))));
         spans
     }
+}
+
+/// The Projects screen's columns, in cells.
+#[derive(Debug, Clone, Copy)]
+struct Widths {
+    badge: usize,
+    count: usize,
+    /// Where a project is; none when 0.
+    place: usize,
 }
 
 impl RenameDialog {
@@ -267,18 +293,19 @@ impl RenameDialog {
             Some(problem) => Tone::Error.span(problem.clone()),
             None => muted("Its tasks keep it: they refer to the project's id, not its name."),
         };
+        let room = (area.width.min(WIDE).saturating_sub(4) as usize).saturating_sub(10);
+        let (field, cursor) = field_line("New name", 10, &self.name, "", None, true, room);
         let lines = vec![
             Line::from(bold(format!("Rename project “{}”", self.old))),
             Line::default(),
-            field_line("New name", 10, &self.name, "", None, true),
+            field,
             Line::default(),
             Line::from(status),
             Line::default(),
             key_hints(&[("enter", "rename"), ("esc", "cancel")]),
         ];
         let inside = wrapped_dialog(frame, area, WIDE, lines);
-        let x = (inside.x + 10 + self.name.visual_cursor() as u16).min(inside.right().saturating_sub(1));
-        frame.set_cursor_position((x, inside.y + 2));
+        frame.set_cursor_position(((inside.x + cursor).min(inside.right().saturating_sub(1)), inside.y + 2));
     }
 }
 

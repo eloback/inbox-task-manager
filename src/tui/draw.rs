@@ -84,7 +84,7 @@ pub fn key_hints(keys: &[(&str, &str)]) -> Line<'static> {
 }
 
 /// Key hints on as many lines as `width` needs, never cutting one (UX principle 5).
-fn wrapped_key_hints(keys: &[(&str, &str)], width: u16) -> Vec<Line<'static>> {
+pub fn wrapped_key_hints(keys: &[(&str, &str)], width: u16) -> Vec<Line<'static>> {
     let mut lines: Vec<Vec<(&str, &str)>> = vec![vec![]];
     let mut used = 0;
     for &(key, what) in keys {
@@ -550,8 +550,10 @@ pub fn project_line(project: &Project, matched: &[usize], missing: bool, paths: 
     spans
 }
 
-/// A one-line text field: its label, then what was typed (or the
-/// placeholder), and ghost text after it. Returns the column the cursor goes in.
+/// A one-line text field: its label (`width` columns), then what was typed
+/// (or the placeholder), and ghost text after it. A value longer than
+/// `room` columns scrolls to keep the cursor in view. Returns the line, and
+/// the column the cursor goes in, from the start of the line.
 pub fn field_line<'a>(
     label: &str,
     width: usize,
@@ -559,19 +561,32 @@ pub fn field_line<'a>(
     placeholder: &str,
     ghost: Option<&str>,
     focused: bool,
-) -> Line<'a> {
+    room: usize,
+) -> (Line<'a>, u16) {
     let style = if focused { Style::new().fg(ACCENT).bold() } else { Style::new().fg(MUTED) };
     let mut spans = vec![Span::styled(format!("{label:<width$}"), style)];
+    let scroll = input.visual_scroll(room.saturating_sub(1).max(1)); // a column for the cursor at the end
     match input.value() {
         "" => spans.push(muted(placeholder.to_string())),
         value => {
-            spans.push(Span::raw(value.to_string()));
+            spans.push(Span::raw(skip_columns(value, scroll)));
             if let Some(rest) = ghost.and_then(|g| g.strip_prefix(value)) {
                 spans.push(muted(rest.to_string()));
             }
         }
     }
-    Line::from(spans)
+    (Line::from(spans), (width + input.visual_cursor() - scroll) as u16)
+}
+
+/// `text` without its first `columns` display columns.
+fn skip_columns(text: &str, columns: usize) -> String {
+    let mut skipped = 0;
+    let rest = text.char_indices().find(|(_, c)| {
+        let past = skipped >= columns;
+        skipped += Span::raw(c.to_string()).width();
+        past
+    });
+    rest.map_or(String::new(), |(at, _)| text[at..].to_string())
 }
 
 /// Giving a folder changes which workspaces count as the project in every
@@ -1075,6 +1090,35 @@ mod tests {
         insta::assert_snapshot!(sized(&mut app, 100, 30));
     }
 
+    /// UX principle 5: in a narrow popup (the form's is 70% wide) no key
+    /// hint is cut, and what saving does wraps instead of being cut.
+    #[test]
+    fn a_narrow_form_cuts_no_key_hint() {
+        let mut app = app(with_projects());
+        app.alone = true; // as `itm new` in its popup
+        app.screens = vec![];
+        app.on_key(ctrl('n'));
+        let shown = sized(&mut app, 56, 26);
+        for hint in ["enter create", "tab next field", "^s create from any field", "esc cancel"] {
+            assert!(shown.contains(hint), "{hint} cut:\n{shown}");
+        }
+        insta::assert_snapshot!(shown);
+    }
+
+    /// A value longer than its field scrolls to keep the cursor in view; the
+    /// cursor stays inside the field.
+    #[test]
+    fn a_long_value_scrolls_in_its_field() {
+        let input = tui_input::Input::new("git@github.com:organization/a-long-repository-name.git".into());
+        let (line, cursor) = field_line("Source", 8, &input, "", None, true, 20);
+        let shown: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(shown, "Source  repository-name.git", "its end, where the cursor is");
+        assert_eq!(cursor, 8 + 19);
+        let (line, cursor) = field_line("Name", 8, &tui_input::Input::new("api".into()), "", None, true, 20);
+        assert_eq!((line.spans[1].content.as_ref(), cursor), ("api", 11));
+        assert_eq!(skip_columns("日本語abc", 4), "語abc", "wide characters take two columns");
+    }
+
     /// R1.6: many projects give way to the field's hint, counted as "+n".
     #[test]
     fn the_project_field_fits_many_projects_and_its_hint() {
@@ -1175,6 +1219,19 @@ mod tests {
             screen.message = Some(("Renamed api2 to api.".into(), false));
         }
         insta::assert_snapshot!(sized(&mut app, 110, 16));
+    }
+
+    /// R8.3: in a narrow popup where a project is gives way first; when it was used is never cut.
+    #[test]
+    fn a_narrow_projects_screen_cuts_no_time() {
+        let mut app = app(with_projects());
+        app.on_key(ctrl('p'));
+        for width in [70, 64] {
+            let shown = sized(&mut app, width, 16);
+            assert!(shown.contains("used 1m ago · folder missing"), "{width}:\n{shown}");
+            assert!(shown.contains("^d remove"), "{width}:\n{shown}");
+        }
+        assert!(sized(&mut app, 100, 16).contains("~/code/api"), "the place, where it fits");
     }
 
     #[test]

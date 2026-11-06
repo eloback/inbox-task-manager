@@ -19,11 +19,12 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::Paragraph;
+use ratatui::widgets::{Paragraph, Wrap};
 
 use super::app::{Action, Job, Snapshot};
 use super::draw::{
-    ACCENT, MUTED, Tone, WIDE, bold, colored, dialog_box, field_line, key_hints, muted, name_badge, project_line,
+    ACCENT, MUTED, Tone, WIDE, bold, colored, dialog_box, field_line, muted, name_badge, project_line,
+    wrapped_key_hints, wrapped_rows,
 };
 use super::finder::{Finder, Saved};
 use super::screen::{Context, Outcome, Screen};
@@ -465,55 +466,54 @@ impl TaskForm {
             Some(_) => &[("^s", "save"), ("esc", "cancel")],
             None => &[("enter", "create"), ("tab", "next field"), ("^s", "create from any field"), ("esc", "cancel")],
         };
-        let fields = self.parts().len() as u16 + 2; // the description has three rows
-        let height = 2 + fields + 1 + effects.len() as u16 + u16::from(self.error.is_some()) + 2 + 2;
-        let inside = dialog_box(frame, area, WIDE, height);
-        let width = inside.width as usize;
+        // The fields have a row each (the description three); what follows wraps.
+        let fields = 2 + self.parts().len() as u16 + 2;
+        let width = (area.width.min(WIDE).saturating_sub(4)) as usize; // inside the border and margin
+        let mut tail = vec![Line::default()];
+        for (label, text, tone) in effects {
+            tail.push(Line::from(match label {
+                "" => vec![tone.span(text)],
+                label => vec![muted(format!("{label} ")), Span::raw(text)],
+            }));
+        }
+        if let Some(e) = &self.error {
+            tail.push(Line::from(Tone::Error.span(e.clone())));
+        }
+        tail.push(Line::default());
+        tail.extend(wrapped_key_hints(keys, width as u16));
+        let rows: usize = tail.iter().map(|line| wrapped_rows(line, width)).sum();
+        let inside = dialog_box(frame, area, WIDE, fields + rows as u16 + 2);
+        let room = (inside.width as usize).saturating_sub(LABEL);
         let mut lines =
             vec![Line::from(bold(if self.editing.is_some() { "Edit task" } else { "New task" })), Line::default()];
         let label = |text: &str, part: Part| {
             let style = if self.focus == part { Style::new().fg(ACCENT).bold() } else { Style::new().fg(MUTED) };
             Span::styled(format!("{text:<LABEL$}"), style)
         };
-        lines.push(field_line(
-            "Title",
-            LABEL,
-            &self.title,
-            "What is this task about?",
-            None,
-            self.focus == Part::Title,
-        ));
+        let focused = |part| self.focus == part;
+        let (title, title_cursor) =
+            field_line("Title", LABEL, &self.title, "What is this task about?", None, focused(Part::Title), room);
+        lines.push(title);
         let description_row = lines.len();
         lines.extend([Line::from(label("Description", Part::Description)), Line::default(), Line::default()]);
         let mut projects = vec![label("Projects", Part::Projects)];
-        projects.extend(self.project_field(width - LABEL, paths));
+        projects.extend(self.project_field(room, paths));
         lines.push(Line::from(projects));
+        let mut other_cursor = 0;
         if self.editing.is_none() {
             let mut snooze = vec![label("Snooze", Part::Snooze)];
             snooze.extend(self.snooze_choice(now, tz));
             lines.push(Line::from(snooze));
             if self.other_chosen() {
                 let placeholder = "2h, 14:30, tomorrow 9:00, fri 9:00";
-                lines.push(field_line("", LABEL, &self.other, placeholder, None, self.focus == Part::Other));
+                let (other, cursor) = field_line("", LABEL, &self.other, placeholder, None, focused(Part::Other), room);
+                other_cursor = cursor;
+                lines.push(other);
             }
         }
-        lines.push(Line::default());
-        for (label, text, tone) in effects {
-            let mut line = vec![];
-            if !label.is_empty() {
-                line.push(muted(format!("{label} ")));
-                line.push(Span::raw(text));
-            } else {
-                line.push(tone.span(text));
-            }
-            lines.push(Line::from(line));
-        }
-        if let Some(e) = &self.error {
-            lines.push(Line::from(Tone::Error.span(e.clone())));
-        }
-        lines.push(Line::default());
-        lines.push(key_hints(keys));
-        frame.render_widget(Paragraph::new(lines), inside);
+        frame.render_widget(Paragraph::new(lines), Rect { height: fields, ..inside });
+        let below = Rect { y: inside.y + fields, height: inside.height.saturating_sub(fields), ..inside };
+        frame.render_widget(Paragraph::new(tail).wrap(Wrap { trim: false }), below);
         // The description is a widget of its own, over its three rows. Empty
         // and elsewhere, its placeholder is drawn here: the widget draws its
         // cursor before it.
@@ -534,13 +534,12 @@ impl TaskForm {
             frame.render_widget(Paragraph::new(muted("Optional. Enter adds a line.")), rows);
         }
         let typing = match self.focus {
-            Part::Title => Some((2, &self.title)),
-            Part::Other => Some((self.parts().len() as u16 + 3, &self.other)),
+            Part::Title => Some((2, title_cursor)),
+            Part::Other => Some((self.parts().len() as u16 + 3, other_cursor)),
             _ => None,
         };
-        if let Some((row, input)) = typing {
-            let x = (inside.x + LABEL as u16 + input.visual_cursor() as u16).min(inside.right().saturating_sub(1));
-            frame.set_cursor_position((x, inside.y + row));
+        if let Some((row, column)) = typing {
+            frame.set_cursor_position(((inside.x + column).min(inside.right().saturating_sub(1)), inside.y + row));
         }
     }
 

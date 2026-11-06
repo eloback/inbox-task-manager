@@ -19,7 +19,7 @@ use tui_input::backend::crossterm::EventHandler;
 
 use super::app::{Action, Job, Reply};
 use super::completion::Folders;
-use super::draw::{ACCENT, Tone, WIDE, bold, dialog_box, field_line, key_hints, muted, wrapped_rows};
+use super::draw::{ACCENT, Tone, WIDE, bold, dialog_box, field_line, muted, wrapped_key_hints, wrapped_rows};
 use super::screen::{Context, Field, Need, Outcome};
 use crate::error::Error;
 use crate::paths::Paths;
@@ -309,7 +309,9 @@ impl AddDialog {
         let fields: u16 = if self.kind == ProjectKind::Name { 1 } else { 2 };
         let width = area.width.min(WIDE).saturating_sub(4) as usize; // inside the border and margin
         let rows: usize = status.iter().map(|(text, _)| wrapped_rows(&Line::from(text.as_str()), width)).sum();
-        let inside = dialog_box(frame, area, WIDE, 3 + fields + 1 + rows as u16 + 2 + 2);
+        let keys = [("enter", "add"), ("tab", "complete"), ("←→", "kind (empty source)"), ("esc", "back")];
+        let keys = wrapped_key_hints(&keys, width as u16);
+        let inside = dialog_box(frame, area, WIDE, 3 + fields + 1 + rows as u16 + 1 + keys.len() as u16 + 2);
         let mut tabs = vec![];
         for kind in KINDS {
             let label = match kind {
@@ -324,6 +326,8 @@ impl AddDialog {
             tabs.push(Span::raw(" "));
         }
         let mut lines = vec![Line::from(bold("Add project")), Line::from(tabs), Line::default()];
+        let room = (inside.width as usize).saturating_sub(LABEL);
+        let mut source_cursor = 0;
         if self.kind != ProjectKind::Name {
             let placeholder = match self.kind {
                 ProjectKind::Git => "git@host:group/repo.git or https://host/group/repo",
@@ -331,7 +335,10 @@ impl AddDialog {
             };
             let ghost = self.ghost();
             let focused = self.focus == Field::Source;
-            lines.push(field_line("Source", LABEL, &self.source, placeholder, ghost.as_deref(), focused));
+            let (line, cursor) =
+                field_line("Source", LABEL, &self.source, placeholder, ghost.as_deref(), focused, room);
+            source_cursor = cursor;
+            lines.push(line);
         }
         let default = self.shown_check().and_then(|c| c.as_ref().ok()).map(|c| c.default_name.as_str());
         let placeholder = match (self.kind, default) {
@@ -339,19 +346,20 @@ impl AddDialog {
             (_, Some(default)) if !default.is_empty() => default,
             _ => "defaults to the repository or folder name",
         };
-        lines.push(field_line("Name", LABEL, &self.name, placeholder, None, self.focus == Field::Name));
+        let (line, name_cursor) =
+            field_line("Name", LABEL, &self.name, placeholder, None, self.focus == Field::Name, room);
+        lines.push(line);
         lines.push(Line::default());
         lines.extend(status.into_iter().map(|(text, tone)| Line::from(tone.span(text))));
         lines.push(Line::default());
-        lines.push(key_hints(&[("enter", "add"), ("tab", "complete"), ("←→", "kind (empty source)"), ("esc", "back")]));
+        lines.extend(keys);
         frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inside);
-        let (row, input) = match (self.kind, self.focus) {
-            (ProjectKind::Name, _) => (3, &self.name),
-            (_, Field::Source) => (3, &self.source),
-            (_, Field::Name) => (4, &self.name),
+        let (row, column) = match (self.kind, self.focus) {
+            (ProjectKind::Name, _) => (3, name_cursor),
+            (_, Field::Source) => (3, source_cursor),
+            (_, Field::Name) => (4, name_cursor),
         };
-        let x = (inside.x + LABEL as u16 + input.visual_cursor() as u16).min(inside.right().saturating_sub(1));
-        frame.set_cursor_position((x, inside.y + row));
+        frame.set_cursor_position(((inside.x + column).min(inside.right().saturating_sub(1)), inside.y + row));
     }
 }
 
