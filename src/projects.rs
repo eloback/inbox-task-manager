@@ -855,6 +855,24 @@ esac
     }
 
     /// R8.1, R8.2: a name only, named by its source; never "project" for a blank one.
+    /// DESIGN.md section 2: adding (setting, renaming, removing) holds
+    /// `.projects.lock`, so a clone, which runs outside the store lock, is
+    /// never raced by another add that checked for duplicates first.
+    #[test]
+    fn adding_waits_for_the_projects_lock() {
+        let (_tmp, itm) = itm();
+        let held = itm.projects_lock().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::scope(|s| {
+            s.spawn(|| tx.send(add(&itm, ProjectKind::Name, "Client X", None)).unwrap());
+            let waited = rx.recv_timeout(std::time::Duration::from_millis(300));
+            assert!(waited.is_err(), "it waits while another holds the lock: {waited:?}");
+            drop(held);
+            let added = rx.recv_timeout(std::time::Duration::from_secs(5)).expect("it goes on once the lock is free");
+            assert_eq!(added.unwrap(), "Client X");
+        });
+    }
+
     #[test]
     fn a_name_only_project() {
         let (_tmp, itm) = itm();

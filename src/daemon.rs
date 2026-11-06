@@ -24,7 +24,7 @@ use crate::herdr::{Agent, Sessions, Workspace};
 use crate::itm::Itm;
 use crate::status::{AgentState, AgentStatus, Cache, SessionStatus};
 use crate::store::{State, python_json, write_atomic};
-use crate::system::{notify_command, output_within};
+use crate::system::{NotifyCommand, notify_command, output_within};
 use crate::tasks::{self, is_task_session};
 use crate::times;
 use crate::workspaces::project_roots;
@@ -57,6 +57,20 @@ pub struct Notice {
     pub title: String,
     pub body: String,
     pub task: String,
+}
+
+/// The command that shows `notice` on the desktop, or the line the daemon
+/// logs instead when there is none or `$ITM_NOTIFY_COMMAND` cannot be read
+/// (R3.2): the daemon goes on either way.
+fn desktop_command(
+    command: Result<Option<NotifyCommand>>,
+    notice: &Notice,
+) -> std::result::Result<NotifyCommand, String> {
+    match command {
+        Ok(Some(command)) => Ok(command),
+        Ok(None) => Err(format!("no way to show desktop notifications; set ITM_NOTIFY_COMMAND: {}", notice.title)),
+        Err(e) => Err(format!("{e}: {}", notice.title)),
+    }
 }
 
 fn wait_key(session: &str, agent: &Agent) -> String {
@@ -225,12 +239,12 @@ impl Itm {
     /// closes, and its Open action switches the newest itm client to the task.
     fn desktop_notify(self: &Arc<Self>, notice: &Notice) {
         let open = self.live_clients().is_ok_and(|c| !c.is_empty());
-        let command = match notify_command(self.notify_command.as_deref(), &notice.title, &notice.body, open) {
-            Ok(Some(command)) => command,
-            Ok(None) => {
-                return eprintln!("no way to show desktop notifications; set ITM_NOTIFY_COMMAND: {}", notice.title);
-            }
-            Err(e) => return eprintln!("{e}: {}", notice.title),
+        let command = match desktop_command(
+            notify_command(self.notify_command.as_deref(), &notice.title, &notice.body, open),
+            notice,
+        ) {
+            Ok(command) => command,
+            Err(line) => return eprintln!("{line}"),
         };
         let (itm, task) = (Arc::clone(self), notice.task.clone());
         thread::spawn(move || {
@@ -457,6 +471,24 @@ mod tests {
         let mut notified = Notified::new();
         assert!(pass(&itm, &mut notified, &seen, NOW).is_err());
         assert!(notified.is_empty());
+    }
+
+    /// R3.2: without a way to notify, or with an `$ITM_NOTIFY_COMMAND` that
+    /// does not read, the daemon logs the notification and goes on.
+    #[test]
+    fn a_notification_with_no_way_to_show_it_is_logged() {
+        let notice = Notice { title: "Needs input · A".into(), body: "claude: p1".into(), task: "task-a".into() };
+        let broken = notify_command(Some("ntfy 'unclosed"), &notice.title, &notice.body, false);
+        assert_eq!(
+            desktop_command(broken, &notice).unwrap_err(),
+            "cannot read $ITM_NOTIFY_COMMAND: ntfy 'unclosed: Needs input · A"
+        );
+        assert_eq!(
+            desktop_command(Ok(None), &notice).unwrap_err(),
+            "no way to show desktop notifications; set ITM_NOTIFY_COMMAND: Needs input · A"
+        );
+        let custom = notify_command(Some("ntfy"), &notice.title, &notice.body, false);
+        assert_eq!(desktop_command(custom, &notice).unwrap().argv, ["ntfy", "Needs input · A", "claude: p1"]);
     }
 
     #[test]
