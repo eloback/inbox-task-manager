@@ -19,7 +19,7 @@ set -u
 root=${ITM_SANDBOX:?run this through scripts/sandbox.sh}
 repo=$(cd "$(dirname "$0")/.." && pwd)
 itm=${ITM:-$repo/target/release/itm}
-python_itm=${ITM_PYTHON:-/tmp/itm-standoff-cache/python-ref/bin/itm}
+python_itm=${ITM_PYTHON:-}
 runtime=$XDG_RUNTIME_DIR/inbox-task-manager
 sessions=$XDG_CONFIG_HOME/herdr/sessions
 tmux_sock=$root/tmux.sock

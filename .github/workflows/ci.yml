@@ -4,6 +4,10 @@ on:
   push:
   pull_request:
 
+# Checks only read the code; no job needs to write anything.
+permissions:
+  contents: read
+
 jobs:
   rust:
     name: fmt, clippy and tests

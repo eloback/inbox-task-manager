@@ -1001,7 +1001,7 @@ The switcher and its dialogs follow these principles.
   more from clean. Python 0.2.0: 5,594 lines of product and 3,997 of tests
   (280 tests), one dependency (Textual).
 - **What changed at the cutover.** The Python package, its tests and
-  `pyproject.toml` left the tree (commit cb07b9d has them); the Nix
+  `pyproject.toml` left the tree (commit 7bdbaa4 has them); the Nix
   package, the flake's checks and CI build the crate (section 7); the
   version went to 0.3.0, after the Python 0.2.0; `PARITY.md` lists every
   requirement and rule with its status, where it lives and the test that

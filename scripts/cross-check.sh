@@ -17,12 +17,12 @@
 #   scripts/sandbox.sh cross scripts/cross-check.sh; rm -rf /tmp/itm-cross
 #
 # ITM (default target/release/itm) and ITM_PYTHON (default the pinned
-# Python build at /tmp/itm-standoff-cache/python-ref/bin/itm) choose the
+# Python build at ~/.cache/itm/python-ref/bin/itm, set by sandbox.sh) choose the
 # binaries. The Python itm left the tree at the cutover; its last version
 # (0.2.0, the Rust rewrite's base) builds from that commit's flake:
 #
-#   nix build -o /tmp/itm-standoff-cache/python-ref \
-#     "git+file://$PWD?rev=cb07b9ddf34f82a012d3aa2147a2f663d9780cc5"
+#   nix build -o ~/.cache/itm/python-ref \
+#     "git+file://$PWD?rev=7bdbaa491bd7d2d6ca7e4297c7199fcf3d1fa852"
 # The Nix build of the Python itm puts its own git first on PATH,
 # so git projects run its inner entry point, `.itm-wrapped` next to it
 # (ITM_PYTHON_BARE), with a git whose clone makes an empty checkout of the
@@ -36,7 +36,7 @@ set -u
 root=${ITM_SANDBOX:?run this through scripts/sandbox.sh}
 repo=$(cd "$(dirname "$0")/.." && pwd)
 rust=${ITM:-$repo/target/release/itm}
-python=${ITM_PYTHON:-/tmp/itm-standoff-cache/python-ref/bin/itm}
+python=${ITM_PYTHON:-}
 python_bare=${ITM_PYTHON_BARE:-$(dirname "$python")/.itm-wrapped}
 [ -x "$rust" ] || { echo "no Rust itm at $rust (cargo build --release, or set ITM)"; exit 2; }
 [ -x "$python" ] || { echo "no Python itm at $python (set ITM_PYTHON)"; exit 2; }

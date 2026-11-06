@@ -4,7 +4,7 @@ Where the Rust itm (the crate at the repository root) stands against
 every requirement in `REQUIREMENTS.md` and every rule in `DESIGN.md`
 section 2. The Python itm 0.2.0 was the behavior reference: its package
 and tests (`inbox_task_manager/`, `tests/*.py`) left the tree at the
-cutover (milestone 5) and are at commit cb07b9d, the rewrite's base;
+cutover (milestone 5) and are at commit 7bdbaa4, the rewrite's base;
 `scripts/cross-check.sh` runs a pinned build of it and the Rust itm on
 shared state. Updated with every change that moves a row.
 

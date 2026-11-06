@@ -6,16 +6,26 @@
 # the real Herdr sessions or itm's real state. The path is short on purpose:
 # Herdr's socket paths are limited to about 108 bytes (DESIGN.md, section 1).
 # Desktop notifications go to /tmp/itm-<name>/notifications.log.
+# /tmp is shared: a root someone else made (or could write to) is refused,
+# since the command runs with its HOME, config and notify.sh.
+# ITM and ITM_PYTHON (default: the Python itm built into
+# ~/.cache/itm/python-ref, see cross-check.sh) pass through.
 set -euo pipefail
 name=$1; shift
 root=/tmp/itm-$name
+mkdir -m 700 "$root" 2>/dev/null || true
+if [ -L "$root" ] || [ ! -d "$root" ] || [ ! -O "$root" ] || [ "$(stat -c %a "$root")" != 700 ]; then
+  echo "refusing $root: not a folder of yours with mode 700 (remove it and run again)" >&2
+  exit 2
+fi
 mkdir -p "$root"/config "$root"/state "$root"/data "$root"/runtime "$root"/home
 chmod 700 "$root"/runtime
 notify=$root/notify.sh
-if [ ! -x "$notify" ]; then
-  printf '#!/bin/sh\nprintf "%%s | %%s\\n" "$1" "$2" >> %s/notifications.log\n' "$root" > "$notify"
-  chmod +x "$notify"
-fi
+printf '#!/bin/sh\nprintf "%%s | %%s\\n" "$1" "$2" >> %s/notifications.log\n' "$root" > "$notify"
+chmod +x "$notify"
+pass=(ITM_PYTHON="${ITM_PYTHON:-${XDG_CACHE_HOME:-$HOME/.cache}/itm/python-ref/bin/itm}")
+[ -n "${ITM:-}" ] && pass+=(ITM="$ITM")
+[ -n "${ITM_PYTHON_BARE:-}" ] && pass+=(ITM_PYTHON_BARE="$ITM_PYTHON_BARE")
 exec env -i \
   PATH="$PATH" \
   HOME="$root/home" \
@@ -28,4 +38,5 @@ exec env -i \
   XDG_RUNTIME_DIR="$root/runtime" \
   ITM_NOTIFY_COMMAND="$notify" \
   ITM_SANDBOX="$root" \
+  "${pass[@]}" \
   "$@"

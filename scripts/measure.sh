@@ -14,7 +14,7 @@ root=${ITM_SANDBOX:?run this through scripts/sandbox.sh}
 repo=$(cd "$(dirname "$0")/.." && pwd)
 itm=${ITM:-$repo/target/release/itm}
 measure="python3 $repo/scripts/measure.py"
-python_itm=${ITM_PYTHON:-/tmp/itm-standoff-cache/python-ref/bin/itm}
+python_itm=${ITM_PYTHON:-}
 sessions=$XDG_CONFIG_HOME/herdr/sessions
 tmux_sock=$root/tmux.sock
 call() { printf '%s\n' "$2" | socat -t 5 - "UNIX-CONNECT:$sessions/$1/herdr.sock"; }
@@ -45,7 +45,11 @@ tmux -S "$tmux_sock" -f /dev/null new-session -d -x 120 -y 40 \
   "ITM_EXIT_AFTER_DRAW=1 $measure tty-runs 10 $itm ui 2> $root/ui.txt"
 until [ -s "$root/ui.txt" ]; do sleep 0.2; done
 echo "rust switcher first draw (120x40 tmux): $(cat "$root/ui.txt")"
-echo "python itm list:   $($measure runs 20 $python_itm list)"
-echo "python itm status: $($measure runs 20 $python_itm status)"
-echo "python daemon:     $($measure daemon 60 $python_itm daemon)"
+if [ -x "$python_itm" ]; then
+  echo "python itm list:   $($measure runs 20 "$python_itm" list)"
+  echo "python itm status: $($measure runs 20 "$python_itm" status)"
+  echo "python daemon:     $($measure daemon 60 "$python_itm" daemon)"
+else
+  echo "SKIP python itm (${python_itm:-ITM_PYTHON unset} missing)"
+fi
 echo "binary: $(stat -c %s "$itm") bytes"
