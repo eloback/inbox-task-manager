@@ -10,8 +10,8 @@ use std::fmt;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Error {
-    /// `herdr` is not on `PATH` (pip installs bring none).
-    HerdrMissing,
+    /// A program itm runs (`herdr`, `git`) is not on `PATH` (pip installs bring neither).
+    Missing(&'static str),
     /// A request to a Herdr session failed.
     Herdr {
         method: &'static str,
@@ -43,6 +43,9 @@ pub enum Error {
     },
     /// The user closed a dialog without choosing.
     Cancelled,
+    /// End with this exit status and say nothing: the user said no to a
+    /// question (1), or a signal stopped a clone (128 + its number).
+    Exit(u8),
     /// Anything else.
     Other(String),
 }
@@ -67,7 +70,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
-            Error::HerdrMissing => f.write_str("herdr not found; install it or add it to PATH"),
+            Error::Missing(program) => write!(f, "{program} not found; install it or add it to PATH"),
             Error::Herdr { method, failure } => match failure {
                 HerdrFailure::NotRunning => write!(f, "herdr {method}: session not running"),
                 HerdrFailure::TimedOut => write!(f, "herdr {method} timed out"),
@@ -94,6 +97,7 @@ impl fmt::Display for Error {
                 shell_quote(folder)
             ),
             Error::Cancelled => f.write_str("cancelled"),
+            Error::Exit(status) => write!(f, "exit status {status}"),
             Error::Other(message) => f.write_str(message),
         }
     }

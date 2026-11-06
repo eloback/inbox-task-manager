@@ -1,5 +1,6 @@
 //! The switcher (`itm`, `itm ui`): a terminal UI over ratatui, and the
-//! snooze dialog `itm snooze` opens without a time.
+//! dialogs the CLI opens alone: snooze without a time, the delete question,
+//! what to do with a removed project's clone.
 //!
 //! The event loop waits for a key, a worker's result or a deadline (the
 //! 2 s refresh, a message expiring). Anything that can block (Herdr calls,
@@ -26,11 +27,12 @@ use ratatui::backend::Backend;
 use ratatui::crossterm::event::{self, Event, KeyEvent, KeyEventKind};
 
 pub use app::View;
-use app::{Action, App, Job, Moment, Snapshot};
-use screen::{Context as ScreenContext, Outcome, Screen, SnoozeDialog};
+use app::{Action, App, Job, Moment, NotesTail, Snapshot};
+use screen::{Context as ScreenContext, Outcome, RemoveDialog, Screen, SnoozeDialog};
 
 use crate::error::{Context, Error, Result};
 use crate::itm::Itm;
+use crate::projects::{CloneChoice, RemovalNote, RemovalPlan};
 use crate::snooze::{self, Until};
 
 const REFRESH: Duration = Duration::from_secs(2);
@@ -55,6 +57,9 @@ pub trait Events {
     /// The next input, a key or what a worker sent on `results`, or None
     /// once `deadline` passed. `busy`: a worker runs, so a result may come.
     fn next(&self, results: &Receiver<Input>, deadline: Instant, busy: bool) -> Option<Input>;
+    /// Run `program` with the terminal as it was before the switcher took
+    /// it (an editor), then take it back.
+    fn suspended(&self, program: &mut dyn FnMut() -> Result<()>) -> Result<()>;
 }
 
 /// The terminal and the system clock. Keys are read only while the loop
@@ -88,14 +93,26 @@ impl Events for TerminalEvents {
             }
         }
     }
+
+    fn suspended(&self, program: &mut dyn FnMut() -> Result<()>) -> Result<()> {
+        use ratatui::crossterm::{execute, terminal};
+        ratatui::restore();
+        let result = program();
+        terminal::enable_raw_mode()
+            .and_then(|()| execute!(std::io::stdout(), terminal::EnterAlternateScreen))
+            .context(|| "cannot take the terminal back".into())?;
+        result
+    }
 }
 
 /// The blocking work the switcher hands to workers.
 pub trait Work: Send + Sync {
     /// Everything the switcher shows.
     fn load(&self) -> Result<Snapshot>;
-    /// Do a job; the session it concerns.
+    /// Do a job; the session it concerns (removing a project: what happened).
     fn perform(&self, job: &Job) -> Result<String>;
+    /// Open a task's notes in the editor, started first when missing (R9.4).
+    fn open_notes(&self, session: &str) -> Result<()>;
 }
 
 impl Work for Itm {
@@ -119,16 +136,38 @@ impl Work for Itm {
             false => (None, None),
         };
         let missing = crate::projects::missing_folders(&data);
-        Ok(Snapshot { data, sessions, status: self.status(), current, switch_problem, listed, missing })
+        let notes = (data.tasks.keys())
+            .filter_map(|name| {
+                let (modified, lines) = self.notes_tail(name, 12)?;
+                let modified = modified.duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
+                Some((name.clone(), NotesTail { modified, lines }))
+            })
+            .collect();
+        Ok(Snapshot { data, sessions, status: self.status(), current, switch_problem, listed, missing, notes })
     }
 
     fn perform(&self, job: &Job) -> Result<String> {
         match job {
             Job::Wake { session, .. } => self.wake_task(session).map(|()| session.clone()),
             Job::Archive { session, .. } => self.archive_task(session).map(|()| session.clone()),
+            Job::Delete { session, .. } => self.delete_task(session).map(|()| session.clone()),
             Job::Create { title } => self.create_task(title, None, &[], None),
             Job::Snooze { session, until, .. } => self.snooze_task(session, *until).map(|()| session.clone()),
+            Job::RemoveProject { id, choice, .. } => {
+                let notes = self.remove_project(id, *choice)?;
+                let lines = notes.into_iter().map(|note| match note {
+                    RemovalNote::Done(line) | RemovalNote::Kept(line) => line,
+                });
+                Ok(lines.collect::<Vec<_>>().join("; "))
+            }
         }
+    }
+
+    fn open_notes(&self, session: &str) -> Result<()> {
+        let data = self.store().load()?; // a task deleted meanwhile must not get its notes back
+        let task = data.tasks.get(session).ok_or_else(|| Error::Other("this task no longer exists".into()))?;
+        let path = self.ensure_notes(session, task, &data.projects)?;
+        self.edit_notes(&path)
     }
 }
 
@@ -150,6 +189,24 @@ pub fn snooze_dialog(session: &str, title: &str, agent: bool, tz: &TimeZone) -> 
     let chosen = in_terminal(|terminal| alone(terminal, screen, tz, &TerminalEvents))?;
     Ok(match chosen {
         Some(Action::Run(Job::Snooze { until, .. })) => Some(until),
+        _ => None,
+    })
+}
+
+/// The delete question alone (`itm delete`, R5.3): whether the user said yes.
+pub fn confirm_delete(session: &str, title: &str) -> Result<bool> {
+    let screen = Screen::ConfirmDelete { session: session.into(), title: title.into() };
+    let chosen = in_terminal(|terminal| alone(terminal, screen, &TimeZone::UTC, &TerminalEvents))?;
+    Ok(matches!(chosen, Some(Action::Run(Job::Delete { .. }))))
+}
+
+/// The remove dialog alone (`itm project remove`, R8.7): what to do with
+/// the clone, or None when it was closed (nothing changes then).
+pub fn remove_project_dialog(plan: &RemovalPlan, paths: &crate::paths::Paths) -> Result<Option<CloneChoice>> {
+    let screen = Screen::RemoveProject(RemoveDialog::new(plan, paths));
+    let chosen = in_terminal(|terminal| alone(terminal, screen, &TimeZone::UTC, &TerminalEvents))?;
+    Ok(match chosen {
+        Some(Action::Run(Job::RemoveProject { choice, .. })) => Some(choice),
         _ => None,
     })
 }
@@ -228,6 +285,14 @@ fn event_loop<B: Backend>(
             Action::None => {}
             Action::Quit => return Ok(None),
             Action::Switch(session) => return Ok(Some(session)),
+            Action::Notes(session) => {
+                // The one blocking call on the loop: nothing is drawn while the editor has the terminal.
+                if let Err(e) = events.suspended(&mut || work.open_notes(&session)) {
+                    app.flash(e.to_string(), true);
+                }
+                terminal.clear().context(|| "cannot draw".into())?;
+                reload = true; // the preview shows the notes as they are now
+            }
             Action::Run(job) => {
                 jobs += 1;
                 let (work, failed) = (Arc::clone(&work), Input::Done(job.clone(), Err(unexpected())));
@@ -328,6 +393,10 @@ mod tests {
                 }
             }
         }
+
+        fn suspended(&self, program: &mut dyn FnMut() -> Result<()>) -> Result<()> {
+            program()
+        }
     }
 
     /// Loads [`snapshot`] (failing or panicking on the loads `fails` names)
@@ -337,6 +406,8 @@ mod tests {
         loads: AtomicUsize,
         fails: Vec<(usize, &'static str)>,
         jobs: Mutex<Vec<Job>>,
+        /// The tasks whose notes were opened.
+        notes: Mutex<Vec<String>>,
     }
 
     impl Work for FakeWork {
@@ -352,6 +423,14 @@ mod tests {
         fn perform(&self, job: &Job) -> Result<String> {
             self.jobs.lock().unwrap().push(job.clone());
             Ok(String::new())
+        }
+
+        fn open_notes(&self, session: &str) -> Result<()> {
+            self.notes.lock().unwrap().push(session.into());
+            match session {
+                "task-later" => Err(Error::Other("no editor found; set $EDITOR".into())),
+                _ => Ok(()),
+            }
         }
     }
 

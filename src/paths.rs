@@ -5,7 +5,7 @@ use std::env;
 use std::ffi::OsString;
 use std::fs::{self, DirBuilder};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use crate::error::{Error, Result};
 
@@ -115,6 +115,34 @@ pub fn expand_home(path: &Path, home: &Path) -> PathBuf {
     }
 }
 
+/// `path` absolute, its links resolved as far as it exists, like Python's
+/// `os.path.realpath`: a folder that is not there (yet, or any more) still
+/// compares with the folders that are (duplicates, R8.4).
+pub fn resolved(path: &Path) -> PathBuf {
+    let absolute = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+    let mut out = PathBuf::new();
+    let mut exists = true;
+    for part in absolute.components() {
+        match part {
+            Component::ParentDir => {
+                out.pop();
+                exists = true; // back in what may exist: look again
+            }
+            Component::CurDir => {}
+            part => {
+                out.push(part);
+                if exists {
+                    match fs::canonicalize(&out) {
+                        Ok(real) => out = real,
+                        Err(_) => exists = false,
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
 /// `$XDG_RUNTIME_DIR/inbox-task-manager`, else `/run/user/<uid>/…` when that
 /// folder is ours, else a private `/tmp/inbox-task-manager-<uid>`. The daemon
 /// (started by a service manager) and every client (started from a shell)
@@ -192,6 +220,17 @@ mod tests {
         assert_eq!(with("/srv/clones"), PathBuf::from("/srv/clones"));
         assert_eq!(with("~other/x"), std::path::absolute("~other/x").unwrap(), "only the shell's own ~ is read");
         assert_eq!(with(""), PathBuf::from("/h/.local/share/inbox-task-manager/projects"), "empty is unset");
+    }
+
+    #[test]
+    fn paths_resolve_as_far_as_they_exist() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().canonicalize().unwrap();
+        fs::create_dir(real.join("code")).unwrap();
+        std::os::unix::fs::symlink(real.join("code"), real.join("link")).unwrap();
+        assert_eq!(resolved(&real.join("link/api/../web")), real.join("code/web"));
+        assert_eq!(resolved(&real.join("link/./x/y")), real.join("code/x/y"));
+        assert_eq!(resolved(&real.join("gone/../link")), real.join("code"));
     }
 
     #[test]

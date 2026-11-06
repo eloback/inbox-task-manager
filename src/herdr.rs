@@ -164,7 +164,7 @@ impl Herdr {
     /// terminal. One that exits with an error is not waited for.
     pub fn start_server(&self, name: &str, cwd: &Path) -> Result<PathBuf> {
         if which("herdr").is_none() {
-            return Err(Error::HerdrMissing);
+            return Err(Error::Missing("herdr"));
         }
         let mut command = in_new_session("herdr").context(|| "cannot start herdr in its own session".into())?;
         for (key, _) in std::env::vars_os().filter(|(key, _)| key.to_string_lossy().starts_with("HERDR_")) {
@@ -198,6 +198,25 @@ impl Herdr {
         started
     }
 
+    /// Have `herdr session delete` remove a stopped session's saved layout
+    /// and agents, in a process of its own session that tries again until
+    /// the server is gone (Herdr refuses to delete a running session; a
+    /// stop is answered before the server goes) and outlives this one,
+    /// which may be inside the session. Its outcome is not waited for.
+    pub fn delete_detached(&self, name: &str) -> io::Result<()> {
+        const RETRY: &str = r#"for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30; do
+  herdr session delete "$1" --json >/dev/null 2>&1 && exit 0; sleep 0.5
+done; exit 1"#;
+        let mut sh = in_new_session("/bin/sh")?;
+        sh.args(["-c", RETRY, "sh", name]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+        for (key, _) in std::env::vars_os().filter(|(key, _)| key.to_string_lossy().starts_with("HERDR_")) {
+            sh.env_remove(key); // the session to delete is named; nothing else should point herdr elsewhere
+        }
+        let mut child = sh.spawn()?;
+        thread::spawn(move || child.wait()); // reaped whenever it ends
+        Ok(())
+    }
+
     /// Run `herdr session attach <name>` in this terminal until it detaches.
     pub fn attach(&self, name: &str, cwd: Option<&Path>) -> Result<()> {
         let mut command = Command::new("herdr");
@@ -221,7 +240,11 @@ fn valid_session_name(name: &str) -> bool {
 
 /// "herdr not found" for a missing program, the error itself otherwise.
 pub fn missing_herdr(e: io::Error) -> Error {
-    if e.kind() == ErrorKind::NotFound { Error::HerdrMissing } else { Error::Other(format!("cannot run herdr: {e}")) }
+    if e.kind() == ErrorKind::NotFound {
+        Error::Missing("herdr")
+    } else {
+        Error::Other(format!("cannot run herdr: {e}"))
+    }
 }
 
 impl Herdr {

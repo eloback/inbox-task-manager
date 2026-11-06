@@ -18,7 +18,7 @@ use std::time::Duration;
 use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
 use signal_hook::iterator::Signals;
 
-use crate::error::{Context, Result, bail};
+use crate::error::{Context, Error, Result, bail};
 use crate::herdr::Sessions;
 use crate::itm::Itm;
 use crate::store::write_atomic;
@@ -122,7 +122,7 @@ impl Itm {
     pub fn switch_to(&self, target: &str) -> Result<()> {
         if !self.inside_herdr() {
             if which("herdr").is_none() {
-                bail!("herdr not found; install it or add it to PATH"); // before a task is saved for nothing
+                return Err(Error::Missing("herdr")); // before a task is saved for nothing
             }
             return self.attach_loop(target, |name, cwd| self.herdr.attach(name, cwd));
         }

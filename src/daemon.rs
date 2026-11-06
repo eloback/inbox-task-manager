@@ -116,7 +116,7 @@ impl Itm {
             for task in data.tasks.values_mut() {
                 // This version does not follow workspaces (R10): as with that
                 // setting off, no record of open workspaces is kept.
-                task.extra.remove("workspace_projects");
+                task.workspace_projects.clear();
             }
             let mut notices = vec![];
             let mut notice =

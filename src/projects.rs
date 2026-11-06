@@ -1,25 +1,121 @@
-//! Saved projects (R8): named folders tasks work in. A task's session starts
-//! with one Herdr workspace per project, named after it (R1.2). This version
-//! saves folders only; git projects the Python itm saved are listed and used
-//! as they are.
+//! Saved projects (R8): what a task is about, saved once and shared by any
+//! number of tasks. A project is a git repository (itm's clone is its
+//! folder), a local folder, or a name only; a task's session starts with one
+//! Herdr workspace per project with a folder, named after it (R1.2).
+//!
+//! Adding and removing hold `.projects.lock`; a clone runs under it but
+//! outside the store lock, because it can take minutes and the daemon
+//! writes the store every 2 s (DESIGN.md section 2, Projects).
 
 use std::collections::BTreeSet;
+use std::ffi::OsString;
 use std::fs::{self, File};
-use std::io::Read;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
 use serde::Serialize;
 
-use crate::error::{Context, Error, Result, bail};
+use crate::error::{Context, Error, Result, bail, shell_quote};
 use crate::itm::Itm;
-use crate::paths::expand_home;
-use crate::store::{Data, Project, flocked};
+use crate::paths::{expand_home, resolved};
+use crate::store::{Data, Project, ProjectKind, State, flocked};
+use crate::system::{ExitSignals, in_new_session};
 use crate::times;
 
+/// What to do with a removed git project's clone (R8.7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloneChoice {
+    Keep,
+    /// Even with local work (`--delete-clone`).
+    Delete,
+    /// Only without local work, checked again under the lock (the dialog's choice).
+    IfClean,
+}
+
+/// What became of a git project's clone, as a dialog asks about it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CloneState {
+    /// Gone already.
+    Missing,
+    /// Not a clone itm may delete (not a checkout of the repository, outside
+    /// the projects folder, or holding another project).
+    Foreign,
+    /// itm's own clone; `local_work` says what only it has.
+    Deletable { local_work: Option<String> },
+}
+
+/// What removing a project would do, for a question before it (nothing is changed).
+#[derive(Debug, Clone, PartialEq)]
+pub struct RemovalPlan {
+    pub id: String,
+    pub project: Project,
+    /// Titles of the tasks that have it, archived ones included: removing is refused then.
+    pub users: Vec<String>,
+    /// For a git project only.
+    pub clone: Option<CloneState>,
+}
+
+/// A line of what removing a project did. A clone kept is a warning.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RemovalNote {
+    Done(String),
+    Kept(String),
+}
+
 impl Itm {
-    /// Save a folder as a project; returns its name. The name defaults to the folder's.
-    pub fn add_folder_project(&self, source: &str, name: Option<&str>) -> Result<String> {
+    /// Save a project; returns its id (R8.2). A git repository is cloned
+    /// first (R8.6); a folder is saved resolved; a name only is named by its
+    /// source. The name defaults to the repository's or folder's.
+    pub fn add_project(&self, kind: ProjectKind, source: &str, name: Option<&str>) -> Result<String> {
         let source = source.trim();
+        let (url, path) = match kind {
+            ProjectKind::Git => (Some(source), Some(self.paths.projects.join(self.git.repo_key(source)?))),
+            ProjectKind::Dir => (None, Some(self.folder_spec(source)?)),
+            ProjectKind::Name => (None, None),
+        };
+        let name = match kind {
+            ProjectKind::Name if name.is_some_and(|n| !n.is_empty()) => {
+                bail!("a name-only project is named by its source: `itm project add name <name>`")
+            }
+            ProjectKind::Name => check_project_name(source)?, // nothing else to name it after
+            _ => {
+                let default = path.as_ref().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().into_owned());
+                let given = name.map(str::trim).filter(|n| !n.is_empty());
+                check_project_name(given.or(default.as_deref()).unwrap_or("project"))?
+            }
+        };
+        // Every writer of projects holds this lock, so checking once before the clone is enough.
+        let _lock = self.projects_lock()?;
+        self.check_project_free(&self.store().load()?, path.as_deref(), Some(&name), kind, None)?;
+        if let (Some(url), Some(clone)) = (url, &path) {
+            self.clone_repo(url, clone)?;
+        }
+        let now = times::now();
+        self.store().edit(|data| {
+            let id = new_project_id(data)?;
+            let path = path.as_ref().map(|p| p.display().to_string());
+            let project = Project {
+                name,
+                path,
+                url: url.map(Into::into),
+                added_at: now,
+                last_used_at: now,
+                extra: Default::default(),
+            };
+            data.projects.insert(id.clone(), project);
+            Ok(id)
+        })
+    }
+
+    fn projects_lock(&self) -> Result<File> {
+        let lock = self.paths.state.join(".projects.lock");
+        flocked(&lock).context(|| format!("cannot lock {}", lock.display()))
+    }
+
+    /// A folder as a project's folder is saved: resolved, and never inside
+    /// itm's projects folder (R8.5: add its repository instead).
+    fn folder_spec(&self, source: &str) -> Result<PathBuf> {
         if source.is_empty() {
             bail!("empty folder path");
         }
@@ -28,42 +124,268 @@ impl Itm {
             bail!("not a folder: {source}");
         }
         let folder = fs::canonicalize(&folder).context(|| format!("cannot resolve {source}"))?;
-        let clones = fs::canonicalize(&self.paths.projects).unwrap_or_else(|_| self.paths.projects.clone());
-        if folder.starts_with(&clones) {
-            bail!("{} is inside itm's projects folder; add its repository instead", self.paths.display(&folder));
+        if folder.starts_with(resolved(&self.paths.projects)) {
+            bail!(
+                "{} is inside itm's projects folder; add its repository with `itm project add git`",
+                self.paths.display(&folder)
+            );
         }
-        let default = folder.file_name().map_or("project".into(), |n| n.to_string_lossy().into_owned());
-        let name = check_project_name(name.map(str::trim).filter(|n| !n.is_empty()).unwrap_or(&default))?;
-        // Every writer of projects holds this lock (the Python itm clones under it).
-        let lock = self.paths.state.join(".projects.lock");
-        let _lock = flocked(&lock).context(|| format!("cannot lock {}", lock.display()))?;
-        let now = times::now();
-        self.store().edit(|data| {
-            let same_folder =
-                |p: &&Project| p.path.as_ref().is_some_and(|path| fs::canonicalize(path).is_ok_and(|p| p == folder));
-            if let Some(same) = data.projects.values().find(same_folder) {
-                return Err(Error::ProjectExists { name: same.name.clone() });
+        Ok(folder)
+    }
+
+    /// Refuse a repository or folder saved already (R8.4: by resolved path;
+    /// a repository's clone path comes from its normalized URL, so this also
+    /// finds it given another way), or a name another project has (R8.5).
+    /// `exclude` is a project being changed.
+    fn check_project_free(
+        &self,
+        data: &Data,
+        folder: Option<&Path>,
+        name: Option<&str>,
+        kind: ProjectKind,
+        exclude: Option<&str>,
+    ) -> Result<()> {
+        if let Some(folder) = folder {
+            let target = resolved(folder);
+            let same = |p: &Project| p.folder().is_some_and(|path| resolved(path) == target);
+            if let Some((_, project)) = data.projects.iter().find(|(id, p)| Some(id.as_str()) != exclude && same(p)) {
+                return Err(Error::ProjectExists { name: project.name.clone() });
             }
-            if let Some(taken) = data.projects.values().find(|p| p.name.to_lowercase() == name.to_lowercase()) {
-                return Err(match taken.kind() {
-                    // A name waiting for its folder: give it this one rather than a second project.
-                    "name" => {
-                        Error::ProjectWithoutFolder { name: taken.name.clone(), folder: folder.display().to_string() }
-                    }
-                    _ => Error::ProjectNameTaken { name: taken.name.clone(), place: self.paths.place(taken) },
-                });
+        }
+        let Some(taken) = name.and_then(|name| named(data, name, None)) else { return Ok(()) };
+        if taken.kind() == ProjectKind::Name && kind == ProjectKind::Dir {
+            // A name waiting for its folder: give it this one rather than a second project.
+            let folder = folder.expect("a folder project has one").display().to_string();
+            return Err(Error::ProjectWithoutFolder { name: taken.name.clone(), folder });
+        }
+        Err(Error::ProjectNameTaken { name: taken.name.clone(), place: self.paths.place(taken) })
+    }
+
+    /// Clone `url` into `target`, or keep a checkout of it already there
+    /// (R8.6). The clone goes to a hidden folder next to the target and is
+    /// renamed into place; a failed or interrupted one leaves nothing, not
+    /// even the host and owner folders it made. SIGHUP (a popup closed),
+    /// SIGTERM (a cancel) and SIGINT stop git and end itm after the cleanup,
+    /// with 128 + the signal as its exit status.
+    pub fn clone_repo(&self, url: &str, target: &Path) -> Result<()> {
+        if fs::symlink_metadata(target).is_ok() {
+            if !self.git.is_checkout_of(target, url)? {
+                bail!("{} already exists and is not a checkout of {url}", self.paths.display(target));
             }
-            let project = Project {
-                name: name.clone(),
-                path: Some(folder.display().to_string()),
-                url: None,
-                added_at: now,
-                last_used_at: now,
-                extra: Default::default(),
-            };
-            data.projects.insert(new_project_id(data)?, project);
-            Ok(name.clone())
-        })
+            return Ok(());
+        }
+        // Held until the cleanup is done: further signals change nothing meanwhile.
+        let mut stop = ExitSignals::catch().context(|| "cannot watch for signals".into())?;
+        let parent = target.parent().expect("a clone is inside the projects folder");
+        let cloned = (|| {
+            fs::create_dir_all(parent).context(|| format!("cannot create {}", parent.display()))?;
+            let name = target.file_name().map_or("repo".into(), |n| n.to_string_lossy().into_owned());
+            let hidden = tempfile::Builder::new()
+                .prefix(&format!(".{name}."))
+                .tempdir_in(parent)
+                .context(|| format!("cannot create a folder in {}", parent.display()))?;
+            let repo = hidden.path().join("repo");
+            self.git.clone(url, &repo, &mut stop)?;
+            fs::rename(&repo, target).context(|| format!("cannot move the clone to {}", target.display()))
+            // `hidden` goes here, with whatever a failed clone left in it.
+        })();
+        if cloned.is_err() {
+            self.prune_empty_parents(target);
+        }
+        drop(stop);
+        cloned
+    }
+
+    /// Remove the empty folders above `path`, up to the projects folder.
+    fn prune_empty_parents(&self, path: &Path) {
+        let root = resolved(&self.paths.projects);
+        for parent in resolved(path).ancestors().skip(1) {
+            if parent == root || !parent.starts_with(&root) || fs::remove_dir(parent).is_err() {
+                break;
+            }
+        }
+    }
+
+    /// A removed git project's clone, when itm may delete it: a real checkout
+    /// of its repository inside the projects folder, holding no other project
+    /// of `data`.
+    fn deletable_clone(&self, data: &Data, project: &Project) -> Result<Option<PathBuf>> {
+        let (Some(url), Some(path)) = (&project.url, project.folder()) else { return Ok(None) };
+        if !self.git.is_checkout_of(path, url)? {
+            return Ok(None);
+        }
+        let clone = resolved(path);
+        let root = resolved(&self.paths.projects);
+        if clone == root || !clone.starts_with(&root) {
+            return Ok(None);
+        }
+        let holds = |other: &Project| other.folder().is_some_and(|f| resolved(f).starts_with(&clone));
+        Ok((!data.projects.values().any(holds)).then(|| path.to_path_buf()))
+    }
+
+    /// What removing the project `query` names would do (R8.7), for a question first.
+    pub fn removal_plan(&self, query: &str) -> Result<RemovalPlan> {
+        let data = self.store().load()?;
+        let id = resolve_project(&data, query)?;
+        let project = data.projects[&id].clone();
+        let users = project_users(&data, &id);
+        let clone = match (&project.url, project.folder()) {
+            (Some(_), Some(path)) => Some(if fs::symlink_metadata(path).is_err() {
+                CloneState::Missing
+            } else {
+                // As removing sees it: once this project is gone, others may still hold the clone.
+                let mut others = data.clone();
+                others.projects.remove(&id);
+                match self.deletable_clone(&others, &project)? {
+                    None => CloneState::Foreign,
+                    Some(clone) => CloneState::Deletable { local_work: self.git.local_work(&clone)? },
+                }
+            }),
+            _ => None,
+        };
+        Ok(RemovalPlan { id, project, users, clone })
+    }
+
+    /// Forget a project no task has, archived ones included (R8.7); returns
+    /// what happened. Only a git project's clone is ever deleted, as `clone`
+    /// says, and only when it is one itm may delete.
+    pub fn remove_project(&self, query: &str, clone: CloneChoice) -> Result<Vec<RemovalNote>> {
+        let _lock = self.projects_lock()?;
+        let (project, data) = self.store().edit(|data| {
+            let id = resolve_project(data, query)?;
+            let name = data.projects[&id].name.clone();
+            let users = project_users(data, &id);
+            if !users.is_empty() {
+                bail!(
+                    "project '{name}' is used by {} task(s); remove it from them (`itm edit <task> --remove-project {}`) or delete them first: {}",
+                    users.len(),
+                    shell_quote(&name),
+                    users.join(", ")
+                );
+            }
+            let project = data.projects.remove(&id).expect("resolved");
+            Ok((project, data.clone()))
+        })?;
+        let mut notes = vec![RemovalNote::Done(format!("project {} removed", project.name))];
+        let Some(folder) = project.folder().filter(|f| project.url.is_some() && fs::symlink_metadata(f).is_ok()) else {
+            return Ok(notes);
+        };
+        if clone == CloneChoice::Keep {
+            return Ok(notes);
+        }
+        let Some(path) = self.deletable_clone(&data, &project)? else {
+            notes.push(RemovalNote::Kept(format!("kept {}: not a clone itm can delete", self.paths.display(folder))));
+            return Ok(notes);
+        };
+        let shown = self.paths.display(&path);
+        if clone == CloneChoice::IfClean
+            && let Some(work) = self.git.local_work(&path)?
+        {
+            notes.push(RemovalNote::Kept(format!("kept {shown}: it has {work}; --delete-clone deletes it anyway")));
+            return Ok(notes);
+        }
+        fs::remove_dir_all(&path).context(|| format!("cannot delete {shown}"))?;
+        self.prune_empty_parents(&path);
+        notes.push(RemovalNote::Done(format!("deleted {shown}")));
+        Ok(notes)
+    }
+
+    /// Rename a project; its tasks keep it, since they store its id. Returns
+    /// (old name, new name, a note). A project without a folder is found in
+    /// workspaces only by name (R10.1), so the note names the tasks it may
+    /// leave while their workspaces are still named the old way.
+    pub fn rename_project(&self, query: &str, new_name: &str) -> Result<(String, String, Option<String>)> {
+        let _lock = self.projects_lock()?;
+        let (old, name, kind, found_in) = self.store().edit(|data| {
+            let id = resolve_project(data, query)?;
+            let name = check_project_name(new_name)?;
+            if let Some(taken) = named(data, &name, Some(&id)) {
+                return Err(Error::ProjectNameTaken { name: taken.name.clone(), place: self.paths.place(taken) });
+            }
+            let project = data.projects.get_mut(&id).expect("resolved");
+            let old = std::mem::replace(&mut project.name, name.clone());
+            let kind = project.kind();
+            // Only where workspace sync can drop it: found there, with its workspace open in a session the daemon reads.
+            let found_in: Vec<String> = (data.tasks.values())
+                .filter(|t| t.state != State::Archived)
+                .filter(|t| t.found_projects.contains(&id) && t.workspace_projects.contains(&id))
+                .map(|t| t.title.clone())
+                .collect();
+            Ok((old, name, kind, found_in))
+        })?;
+        // "Remove a project when its workspace closes" is on by default; config.toml (R10.4) is not read yet.
+        let note = (kind == ProjectKind::Name && !found_in.is_empty() && old.to_lowercase() != name.to_lowercase())
+            .then(|| {
+                format!(
+                    "workspaces named {old} no longer count as it (it has no folder), so it may leave {} unless they are renamed {name}",
+                    found_in.join(", ")
+                )
+            });
+        Ok((old, name, note))
+    }
+
+    /// Give a project without a repository a folder, move its folder, or
+    /// (None) make it a name only; returns what that did (R8.2). Nothing on
+    /// disk changes. A repository's folder is its clone and stays.
+    pub fn set_project_folder(&self, query: &str, folder: Option<&str>) -> Result<Vec<String>> {
+        let path = folder.map(|f| self.folder_spec(f.trim())).transpose()?;
+        let _lock = self.projects_lock()?;
+        let (name, old, users) = self.store().edit(|data| {
+            let id = resolve_project(data, query)?;
+            let project = &data.projects[&id];
+            if let (Some(url), ProjectKind::Git) = (&project.url, project.kind()) {
+                bail!("{}'s folder is itm's clone of {url}; it cannot be changed", project.name);
+            }
+            self.check_project_free(data, path.as_deref(), None, ProjectKind::Dir, Some(&id))?;
+            let project = data.projects.get_mut(&id).expect("resolved");
+            let old = std::mem::replace(&mut project.path, path.as_ref().map(|p| p.display().to_string()));
+            let name = project.name.clone();
+            let users: Vec<String> = (data.tasks.values())
+                .filter(|t| t.projects.contains(&id) && t.state != State::Archived)
+                .map(|t| t.title.clone())
+                .collect();
+            Ok((name, old, users))
+        })?;
+        let new = path.as_ref().map(|p| p.display().to_string());
+        if new == old {
+            return Ok(vec![match new {
+                Some(_) => format!("{name} already has that folder"),
+                None => format!("{name} has no folder"),
+            }]);
+        }
+        let mut said = vec![match &path {
+            Some(path) => format!("{name} is now in {}", self.paths.display(path)),
+            None => format!("{name} has no folder now"),
+        }];
+        if !users.is_empty() {
+            // Which of their workspaces count as it follows the new folder (R10.3).
+            let how = if path.is_some() { "by the new folder" } else { "only when named after it" };
+            said.push(format!("workspaces of {} count as it {how} from now on", users.join(", ")));
+        }
+        Ok(said)
+    }
+
+    /// `itm project add git <url>` as a terminal UI starts it (R8.8): a child
+    /// in its own session (closing a popup hangs up nothing; the UI stops it
+    /// with SIGTERM, which `itm setsid` makes sure is not ignored), stdin
+    /// closed, and git and ssh told never to prompt, so a password or
+    /// host-key question can neither draw over the UI nor hang. Its output,
+    /// git's progress included, is for the UI to read; its last line is the
+    /// project's name.
+    #[cfg_attr(not(test), expect(dead_code, reason = "the add dialog (R8.3, milestone 4) starts the clone child"))]
+    pub fn clone_child(&self, url: &str, name: Option<&str>) -> io::Result<Command> {
+        let mut command = in_new_session(&self.program)?;
+        command.args(["project", "add", "git", url]);
+        if let Some(name) = name {
+            command.args(["--name", name]);
+        }
+        let ssh = std::env::var_os("GIT_SSH_COMMAND");
+        command
+            .env_remove("ITM_POPUP") // it would delay every error by 2.5 s
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_SSH_COMMAND", batch_ssh(ssh.as_deref()))
+            .stdin(Stdio::null());
+        Ok(command)
     }
 
     /// (name, folder) of a task's projects whose folders exist, the first
@@ -73,11 +395,11 @@ impl Itm {
         let mut folders = vec![];
         // A project without a folder gets no workspace.
         for project in task.projects.iter().filter_map(|id| data.projects.get(id)) {
-            let Some(folder) = project.path.as_ref().map(PathBuf::from) else { continue };
+            let Some(folder) = project.folder() else { continue };
             if folder.is_dir() {
-                folders.push((project.name.clone(), folder));
+                folders.push((project.name.clone(), folder.to_path_buf()));
             } else if warn {
-                eprintln!("itm: {} ({}) is missing; it gets no workspace", self.paths.display(&folder), project.name);
+                eprintln!("itm: {} ({}) is missing; it gets no workspace", self.paths.display(folder), project.name);
             }
         }
         folders
@@ -118,6 +440,57 @@ impl Itm {
         self.herdr.sessions().is_ok_and(|sessions| !sessions.contains_key(session))
     }
 
+    /// What projects added to a task mean for its session (R5.4): one that
+    /// never started will start with a workspace in each; a running one gets
+    /// a workspace per project now, named after it (the first focused when
+    /// it is the session this runs in); a stopped one keeps its workspaces.
+    /// A project without a folder, or whose folder is missing, gets none.
+    pub fn project_change_messages(&self, session: &str, added: &[Project]) -> Vec<String> {
+        let display = |folder: &Path| self.paths.display(folder);
+        let mut said = vec![];
+        let mut present = vec![];
+        for project in added {
+            match project.folder() {
+                None => said.push(format!("{} has no folder, so it gets no workspace", project.name)),
+                Some(folder) if !folder.is_dir() => {
+                    said.push(format!("{} is missing, so it gets no workspace", display(folder)))
+                }
+                Some(folder) => present.push((project, folder)),
+            }
+        }
+        if present.is_empty() {
+            return said;
+        }
+        let places = present.iter().map(|(_, folder)| display(folder)).collect::<Vec<_>>().join(", ");
+        let sessions = match self.herdr.sessions() {
+            Ok(sessions) => sessions,
+            Err(e) => {
+                said.push(format!(
+                    "could not tell whether its session runs ({e}); open a workspace in {places} if it does"
+                ));
+                return said;
+            }
+        };
+        match sessions.get(session) {
+            None => said.push(format!("its session will start with a workspace in {places}")),
+            Some(stopped) if !stopped.running => {
+                said.push(format!("its stopped session keeps its workspaces; open one in {places} when you need it"))
+            }
+            Some(running) => {
+                let focus = self.current_session(&sessions).as_deref() == Some(session);
+                for (i, (project, folder)) in present.iter().enumerate() {
+                    said.push(
+                        match self.herdr.create_workspace(&running.socket, folder, &project.name, focus && i == 0) {
+                            Ok(()) => format!("opened a workspace in {}", display(folder)),
+                            Err(e) => format!("could not open a workspace in {}: {e}", display(folder)),
+                        },
+                    );
+                }
+            }
+        }
+        said
+    }
+
     /// One workspace per project, the first focused; none when the session has some already.
     fn open_workspaces(&self, socket: &Path, folders: &[(String, PathBuf)]) -> Result<()> {
         if self.herdr.workspace_count(socket)? > 0 {
@@ -130,10 +503,35 @@ impl Itm {
     }
 }
 
+/// `$GIT_SSH_COMMAND` (else ssh) in batch mode: it fails instead of asking.
+fn batch_ssh(current: Option<&std::ffi::OsStr>) -> OsString {
+    let mut ssh = current.filter(|c| !c.is_empty()).map_or_else(|| OsString::from("ssh"), Into::into);
+    ssh.push(" -o BatchMode=yes");
+    ssh
+}
+
+/// What a clone that failed because git or ssh wanted to ask something
+/// should say next (R8.8): add it from a terminal, where they can ask.
+#[cfg_attr(not(test), expect(dead_code, reason = "the add dialog (R8.3, milestone 4) starts the clone child"))]
+pub fn clone_hint(output: &str) -> Option<&'static str> {
+    const PROMPTS: [&str; 6] = [
+        "terminal prompts disabled",
+        "could not read username",
+        "could not read password",
+        "host key verification failed",
+        "permission denied",
+        "batch mode",
+    ];
+    let lowered = output.to_lowercase();
+    PROMPTS.iter().any(|p| lowered.contains(p)).then_some(
+        "this repository needs a password or a host key confirmation; run `itm project add git <url>` in a terminal",
+    )
+}
+
 /// Ids of the projects whose folder is set and not there; a project
 /// without a folder has none to miss.
 pub fn missing_folders(data: &Data) -> BTreeSet<String> {
-    let missing = |p: &Project| p.path.as_ref().is_some_and(|path| !Path::new(path).is_dir());
+    let missing = |p: &Project| p.folder().is_some_and(|path| !path.is_dir());
     data.projects.iter().filter(|(_, p)| missing(p)).map(|(id, _)| id.clone()).collect()
 }
 
@@ -146,6 +544,20 @@ pub fn resolve_project(data: &Data, query: &str) -> Result<String> {
         _ if data.projects.contains_key(query) => Ok(query.into()),
         _ => Err(Error::NoSuchProject(query.into())),
     }
+}
+
+/// The project other than `exclude` that has `name`, ignoring case (R8.5).
+fn named<'a>(data: &'a Data, name: &str, exclude: Option<&str>) -> Option<&'a Project> {
+    let name = name.to_lowercase();
+    data.projects.iter().find(|(id, p)| Some(id.as_str()) != exclude && p.name.to_lowercase() == name).map(|(_, p)| p)
+}
+
+/// Titles of the tasks that have a project, archived ones included, sorted.
+fn project_users(data: &Data, id: &str) -> Vec<String> {
+    let mut titles: Vec<String> =
+        data.tasks.values().filter(|t| t.projects.iter().any(|p| p == id)).map(|t| t.title.clone()).collect();
+    titles.sort();
+    titles
 }
 
 /// 1 to 60 characters, without tabs or other control characters.
@@ -175,7 +587,7 @@ fn new_project_id(data: &Data) -> Result<String> {
 pub struct ProjectRow<'a> {
     pub id: &'a str,
     pub name: &'a str,
-    pub kind: &'a str,
+    pub kind: ProjectKind,
     /// None for a name only.
     pub path: Option<&'a str>,
     pub url: Option<&'a str>,
@@ -190,7 +602,7 @@ pub fn project_rows(data: &Data) -> Vec<ProjectRow<'_>> {
             kind: p.kind(),
             path: p.path.as_deref(),
             url: p.url.as_deref(),
-            tasks: data.tasks.values().filter(|t| t.projects.contains(id)).count(),
+            tasks: project_users(data, id).len(),
         })
         .collect();
     rows.sort_by_key(|row| row.name.to_lowercase());
@@ -198,32 +610,99 @@ pub fn project_rows(data: &Data) -> Vec<ProjectRow<'_>> {
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use super::*;
+    use crate::git::Git;
     use crate::herdr::fake;
     use crate::itm::tests::itm;
     use crate::store::Task;
     use serde_json::json;
 
-    fn folder(itm: &Itm, rel: &str) -> PathBuf {
+    pub fn folder(itm: &Itm, rel: &str) -> PathBuf {
         let path = itm.paths.home.join(rel);
         fs::create_dir_all(&path).unwrap();
         path
+    }
+
+    /// A git stand-in: a clone makes a checkout whose `origin` is the URL
+    /// (or fails as one that needs a password, when `<its folder>/clone-fails`
+    /// exists); `ls-remote --get-url` prints the URL as given; a clone's
+    /// stashes are `.git/stashes`; it has no other local work.
+    pub fn fake_git(itm: &mut Itm) -> PathBuf {
+        let script = itm.paths.home.parent().unwrap().join("fake-git");
+        fs::write(
+            &script,
+            r#"here=$(dirname "$0")
+case "$1" in
+clone)
+  echo "Cloning into '$5'..." >&2
+  if [ -e "$here/clone-fails" ]; then
+    echo "fatal: could not read Username for 'https://example.com': terminal prompts disabled" >&2; exit 128
+  fi
+  mkdir -p "$5/.git" && echo "$4" >"$5/.git/origin" ;;
+ls-remote) echo "$3" ;;
+-C)
+  dir=$2; shift 2
+  case "$1 $2" in
+  "remote get-url") cat "$dir/.git/origin" ;;
+  "stash list") cat "$dir/.git/stashes" 2>/dev/null || true ;;
+  esac ;;
+esac
+"#,
+        )
+        .unwrap();
+        itm.git = Git::with(&["sh", script.to_str().unwrap()]);
+        script
+    }
+
+    fn add(itm: &Itm, kind: ProjectKind, source: &str, name: Option<&str>) -> Result<String> {
+        itm.add_project(kind, source, name).map(|id| itm.store().load().unwrap().projects[&id].name.clone())
+    }
+
+    fn project(itm: &Itm, name: &str) -> (String, Project) {
+        let data = itm.store().load().unwrap();
+        let id = resolve_project(&data, name).unwrap();
+        (id.clone(), data.projects[&id].clone())
+    }
+
+    fn api_clone(itm: &Itm) -> PathBuf {
+        itm.paths.projects.join("github.com/acme/api")
+    }
+
+    /// Every entry under the projects folder, as paths relative to it.
+    fn leftovers(itm: &Itm) -> Vec<String> {
+        fn walk(dir: &Path, root: &Path, out: &mut Vec<String>) {
+            for entry in fs::read_dir(dir).into_iter().flatten().flatten() {
+                out.push(entry.path().strip_prefix(root).unwrap().display().to_string());
+                if entry.file_type().unwrap().is_dir() {
+                    walk(&entry.path(), root, out);
+                }
+            }
+        }
+        let mut out = vec![];
+        walk(&itm.paths.projects, &itm.paths.projects, &mut out);
+        out.sort();
+        out
     }
 
     #[test]
     fn a_folder_is_saved_once_under_a_free_name() {
         let (_tmp, itm) = itm();
         let api = folder(&itm, "code/api");
-        assert_eq!(itm.add_folder_project("~/code/api", None).unwrap(), "api");
-        // R8.4: the same folder is the same project; R8.5: a name is one project's, ignoring case.
-        let err = itm.add_folder_project(api.to_str().unwrap(), Some("other")).unwrap_err();
-        assert_eq!(err, Error::ProjectExists { name: "api".into() });
-        assert_eq!(err.to_string(), "project already exists: api");
+        std::os::unix::fs::symlink(&api, itm.paths.home.join("link")).unwrap();
+        assert_eq!(add(&itm, ProjectKind::Dir, "~/code/api", None).unwrap(), "api");
+        let (_, saved) = project(&itm, "api");
+        assert_eq!((saved.kind(), saved.added_at), (ProjectKind::Dir, saved.last_used_at));
+        // R8.4: the same folder (by resolved path) is the same project; R8.5: a name is one project's, ignoring case.
+        for source in [format!("{}/", api.display()), "~/link".into()] {
+            let err = add(&itm, ProjectKind::Dir, &source, Some("other")).unwrap_err();
+            assert_eq!(err, Error::ProjectExists { name: "api".into() });
+            assert_eq!(err.to_string(), "project already exists: api");
+        }
         folder(&itm, "work/api");
-        let err = itm.add_folder_project("~/work/api", Some("API")).unwrap_err();
+        let err = add(&itm, ProjectKind::Dir, "~/work/api", Some("API")).unwrap_err();
         assert_eq!(err, Error::ProjectNameTaken { name: "api".into(), place: "~/code/api".into() });
-        assert_eq!(itm.add_folder_project("~/work/api", Some(" work api ")).unwrap(), "work api");
+        assert_eq!(add(&itm, ProjectKind::Dir, "~/work/api", Some(" work api ")).unwrap(), "work api");
 
         let data = itm.store().load().unwrap();
         let id = resolve_project(&data, "API").unwrap();
@@ -236,21 +715,9 @@ mod tests {
     #[test]
     fn a_folder_named_like_a_name_only_project_is_offered_to_it() {
         let (_tmp, itm) = itm();
-        itm.store()
-            .edit(|data| {
-                let project = Project {
-                    name: "Client X".into(),
-                    path: None,
-                    url: None,
-                    added_at: 1,
-                    last_used_at: 1,
-                    extra: Default::default(),
-                };
-                Ok(data.projects.insert("c0ffee00".into(), project))
-            })
-            .unwrap();
+        add(&itm, ProjectKind::Name, "Client X", None).unwrap();
         let x = folder(&itm, "client-x").canonicalize().unwrap();
-        let err = itm.add_folder_project("~/client-x", Some("client x")).unwrap_err();
+        let err = add(&itm, ProjectKind::Dir, "~/client-x", Some("client x")).unwrap_err();
         assert_eq!(err, Error::ProjectWithoutFolder { name: "Client X".into(), folder: x.display().to_string() });
         let hint = format!("give it this one with `itm project set 'Client X' --dir {}`", x.display());
         assert!(err.to_string().ends_with(&hint), "{err}");
@@ -258,15 +725,416 @@ mod tests {
 
     #[test]
     fn what_cannot_be_a_project() {
-        let (_tmp, itm) = itm();
-        assert_eq!(itm.add_folder_project("~/nowhere", None).unwrap_err().to_string(), "not a folder: ~/nowhere");
-        assert_eq!(itm.add_folder_project("  ", None).unwrap_err().to_string(), "empty folder path");
+        let (_tmp, mut itm) = itm();
+        fake_git(&mut itm);
+        assert_eq!(add(&itm, ProjectKind::Dir, "~/nowhere", None).unwrap_err().to_string(), "not a folder: ~/nowhere");
+        assert_eq!(add(&itm, ProjectKind::Dir, "  ", None).unwrap_err().to_string(), "empty folder path");
         folder(&itm, "x");
-        assert!(itm.add_folder_project("~/x", Some("a\tb")).is_err());
-        let clone = itm.paths.projects.join("github.com/acme/api");
-        fs::create_dir_all(&clone).unwrap();
-        let err = itm.add_folder_project(clone.to_str().unwrap(), None).unwrap_err();
-        assert!(err.to_string().contains("inside itm's projects folder"), "{err}");
+        assert!(
+            add(&itm, ProjectKind::Dir, "~/x", Some("a\tb")).unwrap_err().to_string().contains("1 to 60 characters")
+        );
+        // R8.5: a folder inside itm's projects folder is its repository's, not a folder project.
+        add(&itm, ProjectKind::Git, "git@github.com:acme/api.git", None).unwrap();
+        let inside = itm.paths.projects.join("github.com/acme");
+        for path in [api_clone(&itm), itm.paths.projects.clone(), inside] {
+            let err = add(&itm, ProjectKind::Dir, path.to_str().unwrap(), Some("x")).unwrap_err().to_string();
+            assert!(
+                err.ends_with("is inside itm's projects folder; add its repository with `itm project add git`"),
+                "{err}"
+            );
+        }
+        assert_eq!(
+            add(&itm, ProjectKind::Git, "/home/me/repo", None).unwrap_err().to_string(),
+            "not a git URL: /home/me/repo"
+        );
+    }
+
+    /// R8.1, R8.2: a name only, named by its source; never "project" for a blank one.
+    #[test]
+    fn a_name_only_project() {
+        let (_tmp, itm) = itm();
+        assert_eq!(add(&itm, ProjectKind::Name, " Client X ", None).unwrap(), "Client X");
+        let (_, saved) = project(&itm, "client x");
+        assert_eq!((saved.kind(), saved.folder()), (ProjectKind::Name, None));
+        assert_eq!(itm.paths.place(&saved), "no folder");
+        let err = add(&itm, ProjectKind::Name, "Other", Some("Another name")).unwrap_err();
+        assert!(err.to_string().contains("named by its source"), "{err}");
+        for blank in ["", "   "] {
+            assert!(
+                add(&itm, ProjectKind::Name, blank, None)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("a project name has 1 to 60")
+            );
+        }
+        let err = add(&itm, ProjectKind::Name, "client x", None).unwrap_err();
+        assert_eq!(err.to_string().split(" (").next().unwrap(), "project already exists: Client X");
+        let data = itm.store().load().unwrap();
+        let rows = project_rows(&data);
+        assert_eq!((rows[0].kind, rows[0].path, rows[0].url), (ProjectKind::Name, None, None));
+    }
+
+    /// R8.6: a repository is cloned under projects/<host>/<path> and saved with its URL as given.
+    #[test]
+    fn a_repository_is_cloned_into_the_projects_folder() {
+        let (_tmp, mut itm) = itm();
+        fake_git(&mut itm);
+        assert_eq!(add(&itm, ProjectKind::Git, " git@github.com:acme/api.git ", None).unwrap(), "api");
+        let (_, api) = project(&itm, "api");
+        assert_eq!(api.url.as_deref(), Some("git@github.com:acme/api.git"));
+        assert_eq!(api.folder(), Some(api_clone(&itm).as_path()));
+        assert_eq!(api.kind(), ProjectKind::Git);
+        assert!(api_clone(&itm).join(".git").is_dir());
+        assert_eq!(
+            leftovers(&itm),
+            [
+                "github.com",
+                "github.com/acme",
+                "github.com/acme/api",
+                "github.com/acme/api/.git",
+                "github.com/acme/api/.git/origin"
+            ],
+            "no hidden folder is left"
+        );
+        let mode = fs::metadata(api_clone(&itm)).unwrap().permissions();
+        assert_ne!(std::os::unix::fs::PermissionsExt::mode(&mode) & 0o077, 0, "not the hidden folder's 0700");
+
+        // R8.4: the same repository by another URL is refused before any clone.
+        let err = add(&itm, ProjectKind::Git, "https://github.com/acme/api", Some("api2")).unwrap_err();
+        assert_eq!(err.to_string(), "project already exists: api");
+        // R8.5: two remotes named api need another name; the message names the other one.
+        let err = add(&itm, ProjectKind::Git, "git@gitlab.com:other/api.git", None).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "project already exists: api (git@github.com:acme/api.git); choose another name, or rename it with `itm project rename api <name>`"
+        );
+        assert!(!itm.paths.projects.join("gitlab.com").exists(), "nothing was cloned");
+        assert_eq!(
+            add(&itm, ProjectKind::Git, "git@gitlab.com:other/api.git", Some("other-api")).unwrap(),
+            "other-api"
+        );
+        assert_eq!(project(&itm, "other-api").1.url.as_deref(), Some("git@gitlab.com:other/api.git"));
+    }
+
+    /// R8.6: a checkout of the repository already there is reused; any other folder or a link is an error.
+    #[test]
+    fn a_checkout_already_there_is_reused_and_anything_else_refused() {
+        let (_tmp, mut itm) = itm();
+        let script = fake_git(&mut itm);
+        fs::create_dir_all(api_clone(&itm).join(".git")).unwrap();
+        fs::write(api_clone(&itm).join(".git/origin"), "git@github.com:acme/api\n").unwrap();
+        fs::write(script.parent().unwrap().join("clone-fails"), "").unwrap(); // a clone would fail
+        itm.clone_repo("https://github.com/acme/api", &api_clone(&itm)).unwrap();
+        let err = itm.clone_repo("https://github.com/other/api", &api_clone(&itm)).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "{} already exists and is not a checkout of https://github.com/other/api",
+                api_clone(&itm).display()
+            )
+        );
+        let web = itm.paths.projects.join("github.com/acme/web");
+        std::os::unix::fs::symlink(api_clone(&itm), &web).unwrap();
+        assert!(
+            itm.clone_repo("git@github.com:acme/web.git", &web).unwrap_err().to_string().contains("not a checkout")
+        );
+        let plain = itm.paths.projects.join("github.com/acme/plain");
+        fs::create_dir(&plain).unwrap();
+        assert!(
+            itm.clone_repo("git@github.com:acme/plain.git", &plain).unwrap_err().to_string().contains("not a checkout")
+        );
+    }
+
+    /// DESIGN.md section 2: a failed clone leaves nothing, not even the folders it made.
+    #[test]
+    fn a_failed_clone_leaves_nothing() {
+        let (_tmp, mut itm) = itm();
+        let script = fake_git(&mut itm);
+        fs::write(script.parent().unwrap().join("clone-fails"), "").unwrap();
+        let err = add(&itm, ProjectKind::Git, "https://github.com/acme/api", None).unwrap_err();
+        assert_eq!(err.to_string(), "could not clone https://github.com/acme/api");
+        assert_eq!(leftovers(&itm), Vec::<String>::new());
+        assert!(itm.store().load().unwrap().projects.is_empty());
+        // A missing git is said as such.
+        itm.git = Git::with(&["/nowhere/git"]);
+        let err = add(&itm, ProjectKind::Git, "https://github.com/acme/api", None).unwrap_err();
+        assert_eq!(err.to_string(), "git not found; install it or add it to PATH");
+    }
+
+    /// R8.2: rename frees the name and keeps the tasks (they store its id); the new name is checked.
+    #[test]
+    fn rename_frees_the_name_and_keeps_tasks() {
+        let (_tmp, mut itm) = itm();
+        fake_git(&mut itm);
+        add(&itm, ProjectKind::Git, "git@github.com:acme/api.git", None).unwrap();
+        let api = itm.create_task("A", None, &["api".into()], None).unwrap();
+        assert_eq!(itm.rename_project("api", "acme-api").unwrap(), ("api".into(), "acme-api".into(), None));
+        add(&itm, ProjectKind::Git, "git@gitlab.com:other/api.git", None).unwrap();
+        let data = itm.store().load().unwrap();
+        assert_eq!(data.projects[&data.tasks[&api].projects[0]].name, "acme-api");
+
+        add(&itm, ProjectKind::Name, "notes", None).unwrap();
+        assert_eq!(itm.rename_project("acme-api", "ACME-api").unwrap().1, "ACME-api", "only the case changes");
+        let err = itm.rename_project("acme-api", "Notes").unwrap_err().to_string();
+        assert!(err.starts_with("project already exists: notes (no folder)"), "{err}");
+        assert!(itm.rename_project("acme-api", " ").unwrap_err().to_string().contains("1 to 60 characters"));
+        assert_eq!(itm.rename_project("missing", "x").unwrap_err(), Error::NoSuchProject("missing".into()));
+        assert_eq!(project(&itm, "ACME-api").1.kind(), ProjectKind::Git);
+    }
+
+    /// R8.2, R10.1: renaming a project without a folder names the tasks that
+    /// may lose it, where workspace sync found it in a workspace open now.
+    #[test]
+    fn renaming_says_named_workspaces_no_longer_count() {
+        let (_tmp, itm) = itm();
+        add(&itm, ProjectKind::Name, "Client X", None).unwrap();
+        let (id, _) = project(&itm, "Client X");
+        itm.create_task("Run", None, &[], None).unwrap();
+        itm.create_task("Stopped", None, &[], None).unwrap();
+        itm.store()
+            .edit(|data| {
+                let run = data.tasks.get_mut("task-run").unwrap();
+                (run.projects, run.found_projects, run.workspace_projects) =
+                    (vec![id.clone()], vec![id.clone()], vec![id.clone()]);
+                let stopped = data.tasks.get_mut("task-stopped").unwrap();
+                (stopped.projects, stopped.found_projects) = (vec![id.clone()], vec![id.clone()]); // no workspace open now
+                Ok(())
+            })
+            .unwrap();
+        let (old, new, note) = itm.rename_project("Client X", "Client Y").unwrap();
+        assert_eq!((old.as_str(), new.as_str()), ("Client X", "Client Y"));
+        let note = note.unwrap();
+        assert!(
+            note.contains("workspaces named Client X no longer count as it (it has no folder), so it may leave Run"),
+            "{note}"
+        );
+        assert!(!note.contains("Stopped"), "{note}");
+        assert_eq!(itm.rename_project("Client Y", "client y").unwrap().2, None, "the same name, another case");
+    }
+
+    /// R8.2: `set` gives a project without a repository a folder, moves it or takes it; nothing on disk changes.
+    #[test]
+    fn set_gives_moves_and_takes_the_folder() {
+        let (_tmp, mut itm) = itm();
+        fake_git(&mut itm);
+        add(&itm, ProjectKind::Name, "Client X", None).unwrap();
+        let (first, second) = (folder(&itm, "code/x").canonicalize().unwrap(), folder(&itm, "code/x2"));
+        itm.create_task("Work", None, &["Client X".into()], None).unwrap();
+        assert_eq!(
+            itm.set_project_folder("client x", Some("~/code/x")).unwrap(),
+            ["Client X is now in ~/code/x", "workspaces of Work count as it by the new folder from now on"]
+        );
+        assert_eq!(project(&itm, "Client X").1.folder(), Some(first.as_path()));
+        assert_eq!(
+            itm.set_project_folder("Client X", Some(" ~/code/x ")).unwrap(),
+            ["Client X already has that folder"]
+        );
+        itm.set_project_folder("Client X", Some("~/code/x2")).unwrap();
+        assert_eq!(
+            itm.set_project_folder("Client X", None).unwrap(),
+            ["Client X has no folder now", "workspaces of Work count as it only when named after it from now on"]
+        );
+        assert_eq!(itm.set_project_folder("Client X", None).unwrap(), ["Client X has no folder"]);
+        assert_eq!(project(&itm, "Client X").1.folder(), None);
+        assert!(second.is_dir(), "nothing on disk changes");
+
+        add(&itm, ProjectKind::Dir, "~/code/other", None).unwrap_err();
+        folder(&itm, "code/other");
+        add(&itm, ProjectKind::Dir, "~/code/other", None).unwrap();
+        let err = itm.set_project_folder("Client X", Some("~/code/other")).unwrap_err();
+        assert_eq!(err.to_string(), "project already exists: other");
+        let clones = itm.paths.projects.join("github.com/a/b");
+        fs::create_dir_all(&clones).unwrap();
+        let err = itm.set_project_folder("Client X", clones.to_str()).unwrap_err().to_string();
+        assert!(err.contains("inside itm's projects folder"), "{err}");
+        add(&itm, ProjectKind::Git, "git@github.com:acme/api.git", None).unwrap();
+        let err = itm.set_project_folder("api", None).unwrap_err().to_string();
+        assert_eq!(err, "api's folder is itm's clone of git@github.com:acme/api.git; it cannot be changed");
+        // A folder project can move too, and the old folder is free again.
+        assert_eq!(itm.set_project_folder("other", Some("~/code/x")).unwrap(), ["other is now in ~/code/x"]);
+    }
+
+    /// R8.7: removing is refused while any task has the project, archived ones included.
+    #[test]
+    fn remove_is_refused_while_used() {
+        let (_tmp, itm) = itm();
+        folder(&itm, "a");
+        add(&itm, ProjectKind::Dir, "~/a", None).unwrap();
+        itm.create_task("X", None, &["a".into()], None).unwrap();
+        itm.store().edit(|data| Ok(data.tasks.get_mut("task-x").map(|t| t.archive(1)))).unwrap();
+        let err = itm.remove_project("a", CloneChoice::Keep).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "project 'a' is used by 1 task(s); remove it from them (`itm edit <task> --remove-project a`) or delete them first: X"
+        );
+        assert_eq!(itm.store().load().unwrap().projects.len(), 1);
+    }
+
+    /// R8.7: removing a folder or a name only forgets it.
+    #[test]
+    fn removing_a_folder_or_a_name_forgets_it() {
+        let (_tmp, itm) = itm();
+        let a = folder(&itm, "a");
+        add(&itm, ProjectKind::Dir, "~/a", None).unwrap();
+        add(&itm, ProjectKind::Name, "Client X", None).unwrap();
+        assert_eq!(itm.removal_plan("Client X").unwrap().clone, None);
+        assert_eq!(
+            itm.remove_project("A", CloneChoice::Delete).unwrap(),
+            [RemovalNote::Done("project a removed".into())]
+        );
+        assert_eq!(
+            itm.remove_project("client x", CloneChoice::Keep).unwrap(),
+            [RemovalNote::Done("project Client X removed".into())]
+        );
+        assert!(itm.store().load().unwrap().projects.is_empty());
+        assert!(a.is_dir());
+    }
+
+    /// R8.7: a clone is deleted with its empty host and owner folders, kept
+    /// with local work unless asked, and checked again when deleting.
+    #[test]
+    fn a_clone_is_deleted_only_when_clean_or_asked() {
+        let (_tmp, mut itm) = itm();
+        fake_git(&mut itm);
+        let api = || add(&itm, ProjectKind::Git, "git@github.com:acme/api.git", None).unwrap();
+        api();
+        let plan = itm.removal_plan("API").unwrap();
+        assert_eq!((plan.users.len(), plan.clone), (0, Some(CloneState::Deletable { local_work: None })));
+        assert_eq!(itm.remove_project("api", CloneChoice::Keep).unwrap().len(), 1);
+        assert!(api_clone(&itm).is_dir(), "kept");
+        fs::remove_dir_all(&itm.paths.projects).unwrap();
+
+        api();
+        let notes = itm.remove_project("api", CloneChoice::IfClean).unwrap();
+        assert_eq!(notes[1], RemovalNote::Done(format!("deleted {}", api_clone(&itm).display())));
+        assert_eq!(leftovers(&itm), Vec::<String>::new(), "the empty host and owner folders went too");
+
+        api();
+        fs::write(api_clone(&itm).join(".git/stashes"), "stash@{0}: WIP\n").unwrap();
+        let plan = itm.removal_plan("api").unwrap();
+        assert_eq!(plan.clone, Some(CloneState::Deletable { local_work: Some("stashes".into()) }));
+        let notes = itm.remove_project("api", CloneChoice::IfClean).unwrap();
+        let kept = format!("kept {}: it has stashes; --delete-clone deletes it anyway", api_clone(&itm).display());
+        assert_eq!(notes[1], RemovalNote::Kept(kept));
+        assert!(api_clone(&itm).is_dir());
+        api();
+        itm.remove_project("api", CloneChoice::Delete).unwrap();
+        assert!(!api_clone(&itm).exists(), "--delete-clone deletes it anyway");
+
+        api();
+        fs::remove_dir_all(api_clone(&itm)).unwrap();
+        assert_eq!(itm.removal_plan("api").unwrap().clone, Some(CloneState::Missing));
+        assert_eq!(
+            itm.remove_project("api", CloneChoice::Delete).unwrap().len(),
+            1,
+            "nothing to say about a clone gone"
+        );
+    }
+
+    /// R8.7: only a real checkout of the repository inside the projects folder, holding no other project, is deleted.
+    #[test]
+    fn what_is_not_its_clone_is_kept() {
+        let (_tmp, mut itm) = itm();
+        fake_git(&mut itm);
+        // Another project inside the clone.
+        add(&itm, ProjectKind::Git, "git@github.com:acme/api.git", None).unwrap();
+        itm.store()
+            .edit(|data| {
+                let docs = api_clone(&itm).join("docs");
+                fs::create_dir(&docs).unwrap();
+                let path = Some(docs.display().to_string());
+                let project = Project {
+                    name: "docs".into(),
+                    path,
+                    url: None,
+                    added_at: 1,
+                    last_used_at: 1,
+                    extra: Default::default(),
+                };
+                Ok(data.projects.insert("d0c5d0c5".into(), project))
+            })
+            .unwrap();
+        assert_eq!(itm.removal_plan("api").unwrap().clone, Some(CloneState::Foreign));
+        let notes = itm.remove_project("api", CloneChoice::Delete).unwrap();
+        assert_eq!(
+            notes[1],
+            RemovalNote::Kept(format!("kept {}: not a clone itm can delete", api_clone(&itm).display()))
+        );
+        assert!(api_clone(&itm).is_dir());
+        itm.remove_project("docs", CloneChoice::Keep).unwrap();
+        fs::remove_dir_all(&itm.paths.projects).unwrap();
+
+        // Not a checkout of its repository.
+        add(&itm, ProjectKind::Git, "git@github.com:acme/api.git", None).unwrap();
+        fs::write(api_clone(&itm).join(".git/origin"), "git@github.com:someone/else\n").unwrap();
+        itm.remove_project("api", CloneChoice::Delete).unwrap();
+        assert!(api_clone(&itm).is_dir());
+        fs::remove_dir_all(&itm.paths.projects).unwrap();
+
+        // A clone behind a symlinked folder, and a symlinked clone: what they point at stays.
+        let elsewhere = folder(&itm, "code/acme/api");
+        fs::create_dir(elsewhere.join(".git")).unwrap();
+        fs::write(elsewhere.join(".git/origin"), "git@github.com:acme/api.git\n").unwrap();
+        let save = |path: &Path| {
+            itm.store()
+                .edit(|data| {
+                    let url = Some("git@github.com:acme/api.git".into());
+                    let path = Some(path.display().to_string());
+                    Ok(data.projects.insert(
+                        "a91a91a9".into(),
+                        Project {
+                            name: "api".into(),
+                            path,
+                            url,
+                            added_at: 1,
+                            last_used_at: 1,
+                            extra: Default::default(),
+                        },
+                    ))
+                })
+                .unwrap()
+        };
+        fs::create_dir_all(itm.paths.projects.join("github.com")).unwrap();
+        std::os::unix::fs::symlink(elsewhere.parent().unwrap(), itm.paths.projects.join("github.com/acme")).unwrap();
+        save(&api_clone(&itm));
+        itm.remove_project("api", CloneChoice::Delete).unwrap();
+        assert!(elsewhere.join(".git").is_dir(), "behind a symlinked folder");
+        fs::remove_file(itm.paths.projects.join("github.com/acme")).unwrap();
+        fs::create_dir(itm.paths.projects.join("github.com/acme")).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, api_clone(&itm)).unwrap();
+        save(&api_clone(&itm));
+        itm.remove_project("api", CloneChoice::Delete).unwrap();
+        assert!(elsewhere.join(".git").is_dir(), "a symlinked clone");
+    }
+
+    /// R8.8: the child a terminal UI clones with never prompts, and a clone
+    /// that wanted to ask says to add it from a terminal.
+    #[test]
+    fn the_clone_child_never_prompts() {
+        let (_tmp, mut itm) = itm();
+        itm.program = "/opt/itm/bin/itm".into();
+        let command = itm.clone_child("git@github.com:acme/api.git", Some("api2")).unwrap();
+        let args: Vec<_> = command.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+        assert_eq!(
+            args,
+            ["setsid", "/opt/itm/bin/itm", "project", "add", "git", "git@github.com:acme/api.git", "--name", "api2"]
+        );
+        let envs: Vec<_> = command
+            .get_envs()
+            .map(|(k, v)| (k.to_string_lossy().into_owned(), v.map(|v| v.to_string_lossy().into_owned())))
+            .collect();
+        assert!(envs.contains(&("ITM_POPUP".into(), None)), "{envs:?}");
+        assert!(envs.contains(&("GIT_TERMINAL_PROMPT".into(), Some("0".into()))), "{envs:?}");
+        assert!(
+            envs.iter()
+                .any(|(k, v)| k == "GIT_SSH_COMMAND" && v.as_deref().is_some_and(|v| v.ends_with(" -o BatchMode=yes")))
+        );
+        assert_eq!(batch_ssh(Some("ssh -i key".as_ref())), "ssh -i key -o BatchMode=yes");
+        assert_eq!(batch_ssh(Some("".as_ref())), "ssh -o BatchMode=yes");
+        assert_eq!(batch_ssh(None), "ssh -o BatchMode=yes");
+        assert!(clone_hint("fatal: could not read Username for 'https://x'").unwrap().contains("in a terminal"));
+        assert!(clone_hint("Host key verification failed.").is_some());
+        assert_eq!(clone_hint("fatal: repository not found"), None);
     }
 
     #[test]
@@ -274,8 +1142,8 @@ mod tests {
         let (_tmp, itm) = itm();
         folder(&itm, "api");
         folder(&itm, "web");
-        itm.add_folder_project("~/api", None).unwrap();
-        itm.add_folder_project("~/web", None).unwrap();
+        add(&itm, ProjectKind::Dir, "~/api", None).unwrap();
+        add(&itm, ProjectKind::Dir, "~/web", None).unwrap();
         let projects = ["WEB".to_string(), "api".to_string(), "web".to_string()];
         let name = itm.create_task("Fix", None, &projects, None).unwrap();
         let data = itm.store().load().unwrap();
@@ -290,18 +1158,25 @@ mod tests {
         assert!(!itm.store().load().unwrap().tasks.contains_key("task-nope"));
     }
 
+    /// R1.2: a session starts in its first project with a folder; a name
+    /// only or a missing folder gets no workspace.
     #[test]
     fn a_session_starts_in_its_first_project_with_a_folder() {
         let (_tmp, itm) = itm();
         let web = folder(&itm, "web");
         folder(&itm, "gone");
-        itm.add_folder_project("~/gone", None).unwrap();
-        itm.add_folder_project("~/web", None).unwrap();
-        let name = itm.create_task("Fix", None, &["gone".into(), "web".into()], None).unwrap();
+        add(&itm, ProjectKind::Dir, "~/gone", None).unwrap();
+        add(&itm, ProjectKind::Dir, "~/web", None).unwrap();
+        add(&itm, ProjectKind::Name, "Client X", None).unwrap();
+        let name = itm.create_task("Fix", None, &["Client X".into(), "gone".into(), "web".into()], None).unwrap();
         fs::remove_dir(itm.paths.home.join("gone")).unwrap();
         let data = itm.store().load().unwrap();
         assert_eq!(itm.task_cwd(&data, &name), web.canonicalize().unwrap());
+        assert_eq!(itm.task_folders(&data, &name, false), [("web".to_string(), web.canonicalize().unwrap())]);
         assert_eq!(itm.task_cwd(&data, "task-other"), itm.paths.task_dir);
+        let only = itm.create_task("Only", None, &["Client X".into()], None).unwrap();
+        assert_eq!(itm.task_cwd(&itm.store().load().unwrap(), &only), itm.paths.task_dir);
+        assert_eq!(missing_folders(&data).len(), 1, "a name only is never missing");
     }
 
     #[test]
@@ -329,7 +1204,7 @@ mod tests {
     fn a_session_that_ran_before_is_not_built_again() {
         let (_tmp, itm) = itm();
         folder(&itm, "api");
-        itm.add_folder_project("~/api", None).unwrap();
+        add(&itm, ProjectKind::Dir, "~/api", None).unwrap();
         let name = itm.create_task("Fix", None, &["api".into()], None).unwrap();
         fs::create_dir_all(itm.paths.herdr_config.join("sessions").join(&name)).unwrap(); // Herdr knows it
         let mut data = itm.store().load().unwrap();

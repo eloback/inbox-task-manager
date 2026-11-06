@@ -14,7 +14,7 @@ expression: screen(&mut app)
                        │                                                              │ng 4m
                        │ Stops its session and the programs running in it. Reopening  │
                        │ restores the layout and resumes agents that support it.      │
-                       │                                                              │
+                       │                                                              │t · ctrl+o writes
                        │ y archive   n keep                                           │
                        │                                                              │
                        ╰──────────────────────────────────────────────────────────────╯

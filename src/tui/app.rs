@@ -4,7 +4,7 @@
 //! top of the stack gets keys, so list keys can never act on the task
 //! behind a dialog.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
 use clap::ValueEnum;
@@ -19,6 +19,7 @@ use crate::error::Error;
 use crate::herdr::Sessions;
 use crate::itm::Itm;
 use crate::paths::Paths;
+use crate::projects::CloneChoice;
 use crate::snooze::{self, Until};
 use crate::status::Status;
 use crate::store::{Data, State, Task};
@@ -69,6 +70,15 @@ pub struct Snapshot {
     /// Ids of the projects whose folder is set and not there. A project
     /// without a folder is never missing (DESIGN.md section 2, Projects).
     pub missing: BTreeSet<String>,
+    /// The end of each task's notes (R9.5), by session.
+    pub notes: BTreeMap<String, NotesTail>,
+}
+
+/// When a task's notes last changed (epoch second) and their last lines.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NotesTail {
+    pub modified: i64,
+    pub lines: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -98,8 +108,10 @@ impl Moment {
 pub enum Job {
     Wake { session: String, title: String },
     Archive { session: String, title: String },
+    Delete { session: String, title: String },
     Create { title: String },
     Snooze { session: String, title: String, until: Until },
+    RemoveProject { id: String, name: String, choice: CloneChoice },
 }
 
 #[derive(Debug, PartialEq)]
@@ -109,6 +121,8 @@ pub enum Action {
     /// Leave, then switch to this session (after the terminal is restored).
     Switch(String),
     Run(Job),
+    /// Open this task's notes in the editor, which gets the terminal meanwhile (R9.4).
+    Notes(String),
 }
 
 pub struct Message {
@@ -253,6 +267,10 @@ impl App {
             KeyCode::Char('z') if ctrl => self.snooze(),
             KeyCode::Char('u') if ctrl => return self.wake(),
             KeyCode::Char('a') if ctrl => return self.archive(),
+            KeyCode::Char('d') if ctrl => self.delete(),
+            KeyCode::Char('o') if ctrl => {
+                return self.highlighted_task().map_or(Action::None, |(s, _)| Action::Notes(s));
+            }
             _ if alt => {}
             _ => {
                 if self.search.handle_event(&Event::Key(key)).is_some_and(|change| change.value) {
@@ -337,6 +355,14 @@ impl App {
         Action::Run(Job::Archive { session, title })
     }
 
+    /// Ctrl+D: deleting cannot be undone, so it always asks (R5.3).
+    fn delete(&mut self) {
+        if let Some((session, task)) = self.highlighted_task() {
+            let title = task.title.clone();
+            self.screens.push(Screen::ConfirmDelete { session, title });
+        }
+    }
+
     /// A job finished in its worker.
     pub fn done(&mut self, job: Job, result: Result<String, Error>) -> Action {
         let current = self.snapshot.as_ref().and_then(|s| s.current.clone());
@@ -350,6 +376,16 @@ impl App {
                     return Action::Quit;
                 }
                 self.flash(format!("Archived “{title}”."), false);
+            }
+            (Job::Delete { session, title }, Ok(_)) => {
+                if current.as_deref() == Some(&session) {
+                    return Action::Quit; // its clients moved to the next task, this one included
+                }
+                self.flash(format!("Deleted “{title}”."), false);
+            }
+            (Job::RemoveProject { .. }, Ok(said)) => {
+                let kept = said.contains("kept ");
+                self.flash(said, kept);
             }
             (Job::Snooze { session, title, until }, Ok(_)) => {
                 if current.as_deref() == Some(&session) {

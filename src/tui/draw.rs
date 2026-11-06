@@ -10,10 +10,11 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, List, ListItem, Paragraph, Wrap};
 
 use super::app::{App, Row, Snapshot, View};
-use super::screen::{Screen, SnoozeDialog};
+use super::screen::{RemoveDialog, Screen, SnoozeDialog};
+use crate::projects::{CloneChoice, CloneState};
 use crate::snooze::Until;
 use crate::status::AgentState;
-use crate::store::{State, Task};
+use crate::store::{ProjectKind, State, Task};
 use crate::times::{age, day_and_clock, rel};
 
 const ACCENT: Color = Color::Cyan;
@@ -303,11 +304,13 @@ fn preview(app: &App, now: i64) -> (Vec<Line<'static>>, Option<&'static str>) {
     for (id, project) in task.projects.iter().filter_map(|id| Some((id, snap.data.projects.get(id)?))) {
         lines.push(Line::from(vec![
             colored(format!("◆ {}", project.name), PROJECT),
-            muted(format!("  {}", project.kind())),
+            muted(format!("  {}", project.kind().name())),
         ]));
         lines.push(Line::from(muted(format!("  {}", app.paths.place(project)))));
         if snap.missing.contains(id) {
             lines.push(Line::from(colored("  Its folder is missing, so it gets no workspace.", ERROR)));
+        } else if project.kind() == ProjectKind::Name {
+            lines.push(Line::from(muted("  give it one: prefix+shift+a in its workspace, or itm project set")));
         }
     }
     if let Some(description) = &task.description {
@@ -358,6 +361,8 @@ fn preview(app: &App, now: i64) -> (Vec<Line<'static>>, Option<&'static str>) {
             Some(_) => colored("Agents unknown: the daemon is not running", WARNING),
         }));
     }
+    lines.push(Line::default());
+    lines.extend(notes_preview(snap, name, task, now));
     lines.extend([Line::default(), Line::from(muted(format!("used {}", rel(task.last_used_at, now))))]);
     let enter = match task.state {
         State::Active => "open",
@@ -365,6 +370,25 @@ fn preview(app: &App, now: i64) -> (Vec<Line<'static>>, Option<&'static str>) {
         State::Archived => "reopen",
     };
     (lines, Some(enter))
+}
+
+/// When the task's notes were edited and their last lines (R9.5), without
+/// what itm started them with (the preview shows those already).
+fn notes_preview(snap: &Snapshot, name: &str, task: &Task, now: i64) -> Vec<Line<'static>> {
+    let Some(tail) = snap.notes.get(name) else {
+        return vec![Line::from(muted("Notes · none yet · ctrl+o writes some"))];
+    };
+    let known: Vec<&str> = task.description.as_deref().unwrap_or("").lines().map(str::trim).collect();
+    let started = |line: &str| line.starts_with("# ") || (line.starts_with("*Created ") && line.ends_with('*'));
+    let written: Vec<&String> = (tail.lines.iter()).filter(|l| !started(l) && !known.contains(&l.trim())).collect();
+    if written.is_empty() {
+        return vec![Line::from(muted("Notes · nothing written yet · ctrl+o"))];
+    }
+    let mut lines = vec![Line::from(muted(format!("Notes · edited {}", rel(tail.modified, now))))];
+    lines.extend(
+        written[written.len().saturating_sub(3)..].iter().map(|l| Line::from(muted(format!("  {}", cut(l, 80))))),
+    );
+    lines
 }
 
 /// Where a session that never ran will start (R1.2): in its first project
@@ -399,8 +423,91 @@ fn dialog_box(frame: &mut Frame, area: Rect, height: u16) -> Rect {
 fn draw_screen(frame: &mut Frame, screen: &Screen, area: Rect, tz: &TimeZone, now: i64) {
     match screen {
         Screen::ConfirmArchive { title, .. } => draw_archive(frame, title, area),
+        Screen::ConfirmDelete { title, .. } => draw_delete(frame, title, area),
         Screen::Snooze(snooze) => draw_snooze(frame, snooze, area, tz, now),
+        Screen::RemoveProject(dialog) => draw_remove(frame, dialog, area),
     }
+}
+
+/// Deleting cannot be undone, and the question says what goes (UX principle 10).
+fn draw_delete(frame: &mut Frame, title: &str, area: Rect) {
+    let lines = vec![
+        Line::from(Span::styled(format!("Delete “{title}”?"), Style::new().bold())),
+        Line::default(),
+        Line::from(muted(
+            "Stops its session and removes its layout, agents and notes. Its project stays. This cannot be undone.",
+        )),
+        Line::default(),
+        Line::from(vec![
+            Span::styled("y", Style::new().fg(ERROR).bold()),
+            muted(" delete   "),
+            Span::styled("n", Style::new().fg(ACCENT).bold()),
+            muted(" keep"),
+        ]),
+    ];
+    let inside = dialog_box(frame, area, 9);
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inside);
+}
+
+/// What removing a project does to its clone (R8.7): only a clean clone of
+/// itm's own is offered for deleting, and keeping it comes first.
+fn draw_remove(frame: &mut Frame, dialog: &RemoveDialog, area: Rect) {
+    let folder = dialog.folder.clone().unwrap_or_default();
+    let mut lines = vec![Line::from(Span::styled(format!("Remove project “{}”?", dialog.name), Style::new().bold()))];
+    lines.push(Line::default());
+    if !dialog.users.is_empty() {
+        lines.push(Line::from(colored(
+            format!("Used by {} task(s), archived ones included:", dialog.users.len()),
+            ERROR,
+        )));
+        lines.extend(dialog.users.iter().map(|title| Line::from(format!("  · {title}"))));
+        lines.push(Line::default());
+        lines.push(Line::from(muted(
+            "Remove it from those tasks (ctrl+e) or delete them first. Removing a project never touches a task.",
+        )));
+    } else {
+        match (&dialog.kind, &dialog.clone) {
+            (ProjectKind::Name, _) => lines.push(Line::from(muted("It has no folder; nothing is deleted."))),
+            (ProjectKind::Dir, _) => {
+                lines.push(Line::from(muted(format!("Forgets the folder {folder}. Nothing is deleted."))))
+            }
+            (_, Some(CloneState::Missing)) => lines.push(Line::from(muted("Its clone is already gone."))),
+            (_, Some(CloneState::Deletable { local_work: Some(work) })) => {
+                lines.push(Line::from(vec![muted("Clone: "), Span::raw(folder)]));
+                lines.push(Line::from(colored(format!("It has {work}, so the clone is kept."), WARNING)));
+                let force = format!("To delete it anyway: itm project remove {} --delete-clone", dialog.name);
+                lines.push(Line::from(muted(force)));
+            }
+            (_, Some(CloneState::Deletable { local_work: None })) => {
+                lines.push(Line::from(vec![muted("Clone: "), Span::raw(folder)]));
+            }
+            _ => {
+                lines.push(Line::from(muted(format!("Its folder {folder} is kept: it is not a clone itm may delete."))))
+            }
+        }
+        lines.push(Line::default());
+        let clean = dialog.choices.len() > 1;
+        let with_work = matches!(dialog.clone, Some(CloneState::Deletable { local_work: Some(_) }));
+        for (i, choice) in dialog.choices.iter().enumerate() {
+            let (text, color) = match choice {
+                CloneChoice::Keep if clean => ("Keep the clone  (default)", Color::Reset),
+                CloneChoice::Keep if with_work => ("Forget the project, keep the clone", Color::Reset),
+                CloneChoice::Keep => ("Forget the project", Color::Reset),
+                CloneChoice::IfClean | CloneChoice::Delete => ("Delete the clone", ERROR),
+            };
+            let style = Style::new().fg(color);
+            let style = if i == dialog.selected { style.add_modifier(Modifier::REVERSED) } else { style };
+            lines.push(Line::from(Span::styled(format!(" {text} "), style)));
+        }
+    }
+    lines.push(Line::default());
+    let keys: &[(&str, &str)] = match dialog.choices.is_empty() {
+        true => &[("esc", "back")],
+        false => &[("enter", "remove"), ("esc", "cancel, nothing changes")],
+    };
+    lines.push(key_hints(keys));
+    let inside = dialog_box(frame, area, lines.len() as u16 + 4);
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inside);
 }
 
 /// Destructive actions confirm and say what will be lost (UX principle 10).

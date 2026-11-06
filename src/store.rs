@@ -47,14 +47,44 @@ pub struct Task {
     /// Project ids; the first is where the session starts.
     #[serde(default, skip_serializing_if = "Vec::is_empty", deserialize_with = "ids_or_none")]
     pub projects: Vec<String>,
+    /// The projects workspace sync added (R10.1); it removes only these. A
+    /// hand edit naming one makes it the user's.
+    #[serde(default, skip_serializing_if = "Vec::is_empty", deserialize_with = "ids_or_none")]
+    pub found_projects: Vec<String>,
+    /// The projects whose workspace was open on the daemon's last pass over
+    /// the running session (R10.3); only true while the daemon reads it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty", deserialize_with = "ids_or_none")]
+    pub workspace_projects: Vec<String>,
     /// When a snoozed task wakes; a snoozed task without it waits for an agent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snoozed_until: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub archived_at: Option<i64>,
-    /// Fields this version does not use (`found_projects`, …), kept as they are.
+    /// Fields this version does not use, kept as they are.
     #[serde(flatten)]
     pub extra: BTreeMap<String, Value>,
+}
+
+/// What a project is, read off its fields (never stored, N1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum ProjectKind {
+    /// A git repository; its folder is itm's clone.
+    Git,
+    /// A local folder.
+    Dir,
+    /// A name only, without a folder: no workspace opens for it.
+    Name,
+}
+
+impl ProjectKind {
+    pub fn name(self) -> &'static str {
+        match self {
+            ProjectKind::Git => "git",
+            ProjectKind::Dir => "dir",
+            ProjectKind::Name => "name",
+        }
+    }
 }
 
 /// A saved project: a git repository (its URL, and itm's clone as its
@@ -75,12 +105,17 @@ pub struct Project {
 }
 
 impl Project {
-    pub fn kind(&self) -> &'static str {
+    pub fn kind(&self) -> ProjectKind {
         match (&self.url, &self.path) {
-            (Some(_), _) => "git",
-            (None, Some(_)) => "dir",
-            (None, None) => "name",
+            (Some(_), _) => ProjectKind::Git,
+            (None, Some(_)) => ProjectKind::Dir,
+            (None, None) => ProjectKind::Name,
         }
+    }
+
+    /// Its folder; None for a name only.
+    pub fn folder(&self) -> Option<&Path> {
+        self.path.as_deref().map(Path::new)
     }
 }
 
@@ -261,6 +296,8 @@ mod tests {
             last_used_at: 1,
             description: None,
             projects: vec![],
+            found_projects: vec![],
+            workspace_projects: vec![],
             snoozed_until: None,
             archived_at: None,
             extra: BTreeMap::new(),
@@ -368,7 +405,11 @@ mod tests {
         let task = &data.tasks["task-caf"];
         assert_eq!(task.title, "Café crème 🚀");
         assert_eq!(task.projects, ["a1b2c3d4"]);
-        assert_eq!((data.projects["a1b2c3d4"].name.as_str(), data.projects["a1b2c3d4"].kind()), ("api", "dir"));
+        assert_eq!(task.found_projects, ["a1b2c3d4"]);
+        assert_eq!(
+            (data.projects["a1b2c3d4"].name.as_str(), data.projects["a1b2c3d4"].kind()),
+            ("api", ProjectKind::Dir)
+        );
 
         store.edit(|_| Ok(())).unwrap();
         // Python's rewrite: the legacy "project" became "projects", the stored

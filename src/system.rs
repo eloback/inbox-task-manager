@@ -7,16 +7,21 @@
 //! built and tested everywhere.
 
 use std::env;
+use std::ffi::OsStr;
 use std::fs;
 use std::io::{self, Read};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use rustix::process::{Pid, Signal, kill_process, test_kill_process};
+use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
+use signal_hook::iterator::Signals;
 
 use crate::error::{Error, Result, bail};
 
@@ -135,9 +140,60 @@ fn alive(pid: u32) -> bool {
     }
 }
 
-fn terminate(pid: u32) {
+pub fn terminate(pid: u32) {
     if let Some(pid) = pid_of(pid) {
         let _ = kill_process(pid, Signal::TERM);
+    }
+}
+
+/// Stop `child` with SIGTERM, which lets it stop its own helpers (git's),
+/// and SIGKILL when it is still there after `patience`; how it ended.
+pub fn stop_child(child: &mut Child, patience: Duration) -> io::Result<ExitStatus> {
+    terminate(child.id());
+    let deadline = Instant::now() + patience;
+    while Instant::now() < deadline {
+        if let Some(status) = child.try_wait()? {
+            return Ok(status);
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    child.kill()?;
+    child.wait()
+}
+
+/// The signals this process ignores, a bit each (SIGHUP is bit 0), as
+/// `nohup` or a parent left them: from `/proc` on Linux, else from `ps`.
+/// None when neither says.
+pub fn ignored_signals() -> Option<u64> {
+    match fs::read_to_string("/proc/self/status") {
+        Ok(status) => status.lines().find_map(|l| l.strip_prefix("SigIgn:")).and_then(signal_mask),
+        Err(_) => {
+            Ps::run(&["-o", "sigignore=", "-p", &std::process::id().to_string()]).as_deref().and_then(signal_mask)
+        }
+    }
+}
+
+/// A mask of signals as `/proc` and `ps -o sigignore=` print it, in hex.
+fn signal_mask(text: &str) -> Option<u64> {
+    u64::from_str_radix(text.trim().trim_start_matches("0x"), 16).ok()
+}
+
+/// SIGHUP (a popup closed), SIGTERM (a cancel) and SIGINT, caught from
+/// [`ExitSignals::catch`] until dropped instead of ending the process at
+/// once, so it can clean up first; more of them meanwhile change nothing.
+/// Those ignored already (`nohup`) stay ignored.
+pub struct ExitSignals(Signals);
+
+impl ExitSignals {
+    pub fn catch() -> io::Result<ExitSignals> {
+        let ignored = ignored_signals().unwrap_or(0);
+        let caught = [SIGHUP, SIGTERM, SIGINT].into_iter().filter(|&sig| ignored & (1 << (sig - 1)) == 0);
+        Ok(ExitSignals(Signals::new(caught)?))
+    }
+
+    /// The first one that arrived since the last look, if any.
+    pub fn arrived(&mut self) -> Option<i32> {
+        self.0.pending().next()
     }
 }
 
@@ -188,17 +244,23 @@ pub fn output_within(
 /// terminal: closing it hangs up nothing `program` runs. std calls setsid
 /// only in an `unsafe` `pre_exec`, so itm runs itself as `itm setsid
 /// <program>` (hidden), which calls setsid and then becomes `program`.
-pub fn in_new_session(program: &str) -> io::Result<Command> {
+pub fn in_new_session(program: impl AsRef<OsStr>) -> io::Result<Command> {
     let mut command = Command::new(env::current_exe()?);
-    command.args(["setsid", program]);
+    command.arg("setsid").arg(program);
     Ok(command)
 }
 
 /// `itm setsid <program> [args…]`: leave this session, then become
-/// `program`. Returns only when that failed.
+/// `program`, with SIGTERM not ignored: an ignored signal stays ignored
+/// through exec, and SIGTERM is how a clone child is cancelled (and a
+/// headless server stopped). Returns only when that failed.
 pub fn setsid_exec(program: &str, args: &[String]) -> Error {
     if let Err(e) = rustix::process::setsid() {
         return Error::Other(format!("cannot start a session: {e}"));
+    }
+    // A caught signal is reset to its default by exec; an ignored one is not.
+    if let Err(e) = signal_hook::flag::register(SIGTERM, Arc::new(AtomicBool::new(false))) {
+        return Error::Other(format!("cannot reset SIGTERM: {e}"));
     }
     let e = Command::new(program).args(args).exec();
     match e.kind() {
@@ -281,6 +343,39 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(text.len(), 300_000);
+    }
+
+    /// DESIGN.md section 2: signals ignored before a clone (`nohup`) stay
+    /// ignored. Rust ignores SIGPIPE in every program, which shows each reader works.
+    #[test]
+    fn ignored_signals_are_read_from_the_process_table() {
+        let sigpipe = 1 << (13 - 1);
+        assert!(ignored_signals().is_some_and(|mask| mask & sigpipe != 0));
+        if Ps::run(&["-o", "sigignore=", "-p", &std::process::id().to_string()]).is_some() {
+            let ps = Ps::run(&["-o", "sigignore=", "-p", &std::process::id().to_string()]).unwrap();
+            assert!(signal_mask(&ps).is_some_and(|mask| mask & sigpipe != 0), "{ps}");
+        }
+        assert_eq!(signal_mask("\t0000000000001000\n"), Some(sigpipe));
+        assert_eq!(signal_mask(" 1000"), Some(sigpipe), "ps pads with spaces");
+        assert_eq!(signal_mask("-"), None);
+    }
+
+    #[test]
+    fn a_child_is_stopped_with_sigterm_then_killed() {
+        let mut polite = Command::new("sleep").arg("30").spawn().unwrap();
+        let status = stop_child(&mut polite, Duration::from_secs(5)).unwrap();
+        assert_eq!(std::os::unix::process::ExitStatusExt::signal(&status), Some(15));
+        let mut stubborn = Command::new("sh")
+            .args(["-c", "trap '' TERM; echo ready; exec sleep 30"])
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut ready = [0; 6];
+        stubborn.stdout.take().unwrap().read_exact(&mut ready).unwrap(); // the trap is set
+        let started = Instant::now();
+        let status = stop_child(&mut stubborn, Duration::from_millis(200)).unwrap();
+        assert_eq!(std::os::unix::process::ExitStatusExt::signal(&status), Some(9));
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 
     #[test]

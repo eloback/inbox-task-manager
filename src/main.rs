@@ -5,6 +5,7 @@
 mod cli;
 mod daemon;
 mod error;
+mod git;
 mod herdr;
 mod itm;
 mod notes;
@@ -28,6 +29,7 @@ fn main() -> ExitCode {
     let cli = cli::Cli::parse();
     match cli::run(cli, itm::Itm::from_env()) {
         Ok(()) => ExitCode::SUCCESS,
+        Err(error::Error::Exit(status)) => ExitCode::from(status),
         Err(e) => {
             eprintln!("itm: {e}");
             // A Herdr popup closes when its command exits: keep the error readable

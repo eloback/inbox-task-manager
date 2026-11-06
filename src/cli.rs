@@ -3,18 +3,18 @@
 use std::io::IsTerminal;
 use std::sync::Arc;
 
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{ArgGroup, Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 
 use crate::error::{Context, Error, Result, bail};
 use crate::herdr::Sessions;
 use crate::itm::Itm;
-use crate::projects::project_rows;
+use crate::projects::{CloneChoice, CloneState, RemovalNote, project_rows};
 use crate::snooze::Until;
 use crate::status::Status;
-use crate::store::{Data, State, python_json};
+use crate::store::{Data, ProjectKind, State, python_json};
 use crate::system::which;
-use crate::tasks::{self, counts, inbox_order, is_task_session};
+use crate::tasks::{self, Edit, counts, inbox_order, is_task_session};
 use crate::{times, tui};
 
 const STATUS_FORMAT: &str = "⚑ {waiting} ● {active} ◔ {snoozed}";
@@ -73,6 +73,31 @@ enum Command {
     Archive { task: Option<String> },
     /// Make an archived task active again and switch to it
     Reopen { task: String },
+    /// Delete a task, its session and its notes (asks first)
+    Delete {
+        task: String,
+        /// Do not ask
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Change a task's title, description or projects (a running session gets a workspace)
+    Edit {
+        task: String,
+        #[arg(long, allow_hyphen_values = true)]
+        title: Option<String>,
+        /// An empty value clears it
+        #[arg(long, allow_hyphen_values = true)]
+        description: Option<String>,
+        /// Set the projects; repeat for several, the first is where it starts
+        #[arg(long = "project", value_name = "PROJECT", conflicts_with = "no_project")]
+        projects: Vec<String>,
+        #[arg(long)]
+        no_project: bool,
+        #[arg(long = "add-project", value_name = "PROJECT")]
+        add: Vec<String>,
+        #[arg(long = "remove-project", value_name = "PROJECT")]
+        remove: Vec<String>,
+    },
     /// Task counts for a window title or bar
     Status {
         /// Fields: waiting, active, snoozed, archived, daemon
@@ -102,7 +127,7 @@ enum Command {
         #[arg(long, value_name = "TEXT", allow_hyphen_values = true)]
         append: Option<String>,
     },
-    /// Saved folders tasks start in
+    /// Saved git repositories and folders tasks can start in
     #[command(subcommand)]
     Project(ProjectCommand),
     /// Print the current session
@@ -120,26 +145,41 @@ enum Command {
 
 #[derive(Subcommand)]
 enum ProjectCommand {
-    /// Save a folder (git repositories are not in this version)
+    /// Clone and save a git repository, save a folder, or save a name only
     Add {
         #[arg(value_enum)]
         kind: ProjectKind,
-        /// The folder's path
+        /// Git URL, folder path, or (name) the project's name
         source: String,
-        /// Defaults to the folder's name
+        /// Defaults to the repository or folder name
         #[arg(long)]
         name: Option<String>,
     },
-    /// Saved projects with the number of tasks that have them
+    /// Give a project without a repository a folder, move it, or make it a name only
+    #[command(group(ArgGroup::new("folder").required(true).args(["dir", "no_dir"])))]
+    Set {
+        name: String,
+        #[arg(long, value_name = "PATH")]
+        dir: Option<String>,
+        #[arg(long)]
+        no_dir: bool,
+    },
+    /// Saved projects with their tasks and last use
     List {
         #[arg(long)]
         json: bool,
     },
-}
-
-#[derive(Clone, Copy, ValueEnum)]
-enum ProjectKind {
-    Dir,
+    /// Rename a project; its tasks keep it
+    Rename { name: String, new_name: String },
+    /// Forget a project no task uses
+    Remove {
+        name: String,
+        /// Delete a git project's clone without asking
+        #[arg(long, conflicts_with = "keep_clone")]
+        delete_clone: bool,
+        #[arg(long)]
+        keep_clone: bool,
+    },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -175,9 +215,7 @@ pub fn run(cli: Cli, itm: Itm) -> Result<()> {
             let title = title.join(" ");
             if title.trim().is_empty() {
                 // Without a title the New task form opens (R1.1), which needs a terminal.
-                if !terminal() {
-                    bail!("this needs a terminal; pass the missing values as options");
-                }
+                needs_terminal()?;
                 bail!("give the task a title: itm new \"<title>\" (the New task form is not built yet)");
             }
             // A snoozed task is not switched to (R1.7). Check that a switch can
@@ -186,7 +224,7 @@ pub fn run(cli: Cli, itm: Itm) -> Result<()> {
             if switch && itm.inside_herdr() {
                 itm.switchable_session(&itm.herdr.sessions()?)?;
             } else if switch && which("herdr").is_none() {
-                bail!("herdr not found; install it or add it to PATH");
+                return Err(Error::Missing("herdr"));
             }
             let name = itm.create_task(&title, description.as_deref(), &projects, until)?;
             println!("{name}");
@@ -200,9 +238,7 @@ pub fn run(cli: Cli, itm: Itm) -> Result<()> {
                 (false, Some(when)) => Until::parse(&when, now, &itm.tz)?,
                 // R4.1: without a time, the snooze dialog.
                 (false, None) => {
-                    if !terminal() {
-                        bail!("this needs a terminal; pass the missing values as options");
-                    }
+                    needs_terminal()?;
                     let agent = Itm::agent_snooze_problem(&name, &itm.herdr.sessions()?, &itm.status()).is_none();
                     let title = data.tasks.get(&name).map_or(name.as_str(), |t| t.title.as_str());
                     tui::snooze_dialog(&name, title, agent, &itm.tz)?.ok_or(Error::Cancelled)?
@@ -227,6 +263,34 @@ pub fn run(cli: Cli, itm: Itm) -> Result<()> {
         Command::Reopen { task } => {
             let name = itm.reopen_task(&task)?;
             itm.switch_to(&name)
+        }
+        Command::Delete { task, yes } => {
+            let data = itm.store().load()?;
+            let name = tasks::resolve_task(&data, &task)?;
+            // R5.3: after confirmation. No is said by the exit status alone.
+            if !yes && !(needs_terminal().and_then(|()| tui::confirm_delete(&name, &data.tasks[&name].title))?) {
+                return Err(Error::Exit(1));
+            }
+            itm.delete_task(&name)?;
+            println!("{name} deleted");
+            Ok(())
+        }
+        Command::Edit { task, title, description, projects, no_project, add, remove } => {
+            let name = tasks::resolve_task(&itm.store().load()?, &task)?;
+            let projects = (no_project || !projects.is_empty()).then_some(projects);
+            if projects.is_some() && !(add.is_empty() && remove.is_empty()) {
+                bail!("--project and --no-project set the projects; --add-project and --remove-project change them");
+            }
+            if title.is_none() && description.is_none() && projects.is_none() && add.is_empty() && remove.is_empty() {
+                // Without options the edit form opens (R5.4), which needs a terminal.
+                needs_terminal()?;
+                bail!(
+                    "say what to change: --title, --description, --project, --add-project, --remove-project (the edit form is not built yet)"
+                );
+            }
+            let said = itm.edit_task(&name, &Edit { title, description, projects, add, remove, ..Edit::default() })?;
+            println!("{name} updated{}", said.iter().map(|s| format!("; {s}")).collect::<String>());
+            Ok(())
         }
         Command::Status { format, json } => {
             let status = itm.status();
@@ -289,17 +353,31 @@ pub fn run(cli: Cli, itm: Itm) -> Result<()> {
         }
         Command::Notes { task, path, append } => {
             let data = itm.store().load()?;
-            let name = itm.target_or_current(&data, task.as_deref())?;
-            let notes = itm.ensure_notes(&name, &data)?;
+            let name = match task {
+                Some(task) => tasks::resolve_task(&data, &task)?,
+                // A Herdr failure here is said as such; only "not in a task" gets the hint.
+                None => match itm.inside_herdr() {
+                    true => itm.current_session(&itm.herdr.sessions()?),
+                    false => None,
+                }
+                .filter(|name| data.tasks.contains_key(name))
+                .ok_or_else(|| {
+                    Error::Other("not inside a task; name the task, or press ctrl+o on it in the switcher".into())
+                })?,
+            };
+            let notes = (itm.ensure_notes(&name, &data.tasks[&name], &data.projects))
+                .map_err(|e| Error::Other(format!("cannot create its notes: {e}")))?;
             if path {
                 println!("{}", notes.display());
             } else if let Some(text) = append {
-                let text = if text == "-" {
-                    std::io::read_to_string(std::io::stdin()).context(|| "cannot read stdin".into())?
-                } else {
-                    text
+                let text = match text.as_str() {
+                    "-" => std::io::read_to_string(std::io::stdin()).context(|| "cannot read stdin".into())?,
+                    _ => text,
                 };
-                itm.add_note(&name, &text, now)?;
+                match itm.add_note(&name, &text, now) {
+                    Err(Error::Other(e)) if e != "the note is empty" => bail!("cannot write its notes: {e}"),
+                    added => added?,
+                }
                 println!("note added to {name}");
             } else if terminal() {
                 itm.edit_notes(&notes)?;
@@ -308,8 +386,32 @@ pub fn run(cli: Cli, itm: Itm) -> Result<()> {
             }
             Ok(())
         }
-        Command::Project(ProjectCommand::Add { kind: ProjectKind::Dir, source, name }) => {
-            println!("{}", itm.add_folder_project(&source, name.as_deref())?);
+        Command::Project(ProjectCommand::Add { kind, source, name }) => {
+            let id = itm.add_project(kind, &source, name.as_deref())?;
+            println!("{}", itm.store().load()?.projects[&id].name);
+            Ok(())
+        }
+        Command::Project(ProjectCommand::Set { name, dir, .. }) => {
+            println!("{}", itm.set_project_folder(&name, dir.as_deref())?.join("; "));
+            Ok(())
+        }
+        Command::Project(ProjectCommand::Rename { name, new_name }) => {
+            let (old, new, note) = itm.rename_project(&name, &new_name)?;
+            println!("project {old} renamed to {new}{}", note.map(|n| format!("; {n}")).unwrap_or_default());
+            Ok(())
+        }
+        Command::Project(ProjectCommand::Remove { name, delete_clone, keep_clone }) => {
+            let (choice, notes) = match (delete_clone, keep_clone) {
+                (true, _) => (CloneChoice::Delete, vec![]),
+                (_, true) => (CloneChoice::Keep, vec![]),
+                _ => remove_choice(&itm, &name)?,
+            };
+            for note in itm.remove_project(&name, choice)?.into_iter().chain(notes) {
+                match note {
+                    RemovalNote::Done(line) => println!("{line}"),
+                    RemovalNote::Kept(line) => eprintln!("itm: {line}"),
+                }
+            }
             Ok(())
         }
         Command::Project(ProjectCommand::List { json }) => {
@@ -322,7 +424,7 @@ pub fn run(cli: Cli, itm: Itm) -> Result<()> {
             for row in rows {
                 let place = itm.paths.place(&data.projects[row.id]);
                 let plural = if row.tasks == 1 { "" } else { "s" };
-                println!("{}\t{}\t{place}\t{} task{plural}", row.name, row.kind, row.tasks);
+                println!("{}\t{}\t{place}\t{} task{plural}", row.name, row.kind.name(), row.tasks);
             }
             Ok(())
         }
@@ -338,6 +440,34 @@ pub fn run(cli: Cli, itm: Itm) -> Result<()> {
 /// Whether a person can answer: a dialog or an editor needs a terminal both ways.
 fn terminal() -> bool {
     std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
+}
+
+/// For a dialog: the error that says to pass options instead, without a terminal.
+fn needs_terminal() -> Result<()> {
+    match terminal() {
+        true => Ok(()),
+        false => bail!("this needs a terminal; pass the missing values as options"),
+    }
+}
+
+/// `project remove` without `--delete-clone` or `--keep-clone` (R8.7): only
+/// a clean clone itm may delete is asked about, keeping it by default;
+/// nothing is deleted without a yes. What else is kept is said.
+fn remove_choice(itm: &Itm, query: &str) -> Result<(CloneChoice, Vec<RemovalNote>)> {
+    let plan = itm.removal_plan(query)?;
+    let place = plan.project.folder().map(|f| itm.paths.display(f)).unwrap_or_default();
+    let kept = |why: &str| Ok((CloneChoice::Keep, vec![RemovalNote::Kept(format!("kept {place}: {why}"))]));
+    match &plan.clone {
+        Some(CloneState::Foreign) => kept("not a clone itm can delete"),
+        Some(CloneState::Deletable { local_work: Some(work) }) => {
+            kept(&format!("it has {work}; --delete-clone deletes it anyway"))
+        }
+        Some(CloneState::Deletable { local_work: None }) if plan.users.is_empty() => match terminal() {
+            true => Ok((tui::remove_project_dialog(&plan, &itm.paths)?.ok_or(Error::Cancelled)?, vec![])),
+            false => kept("no terminal to ask; --delete-clone deletes it"),
+        },
+        _ => Ok((CloneChoice::Keep, vec![])),
+    }
 }
 
 /// `snooze [task] [when…]`: the first word is the task when it names one.

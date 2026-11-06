@@ -11,7 +11,7 @@ expression: screen(&mut app)
  ACTIVE                ╭──────────────────────────────────────────────────────────────╮ng
  ● Write docs          │ Snooze “Write docs”                                          │
  ○ Old idea            │                                                              │
-                       │ › Type 2h, 14:30, fri 9:00… or pick below                    │
+                       │ › Type 2h, 14:30, fri 9:00… or pick below                    │t · ctrl+o writes
                        │                                                              │
                        │  1 hour                                               09:00  │
                        │  Until an agent needs me                           no timer  │

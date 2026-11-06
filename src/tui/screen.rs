@@ -13,7 +13,10 @@ use tui_input::Input;
 use tui_input::backend::crossterm::EventHandler;
 
 use super::app::{Action, Job};
+use crate::paths::Paths;
+use crate::projects::{CloneChoice, CloneState, RemovalPlan};
 use crate::snooze::Until;
+use crate::store::ProjectKind;
 
 #[derive(Debug, Clone)]
 pub enum Screen {
@@ -23,7 +26,13 @@ pub enum Screen {
         session: String,
         title: String,
     },
+    /// Deleting cannot be undone: ask first, saying what goes (R5.3).
+    ConfirmDelete {
+        session: String,
+        title: String,
+    },
     Snooze(SnoozeDialog),
+    RemoveProject(RemoveDialog),
 }
 
 /// What a key did to the screen on top.
@@ -52,8 +61,75 @@ impl Screen {
                 KeyCode::Char('n') | KeyCode::Esc => Outcome::Close,
                 _ => Outcome::Stay,
             },
+            Screen::ConfirmDelete { session, title } => match key.code {
+                KeyCode::Char('y') => {
+                    Outcome::CloseAnd(Action::Run(Job::Delete { session: session.clone(), title: title.clone() }))
+                }
+                KeyCode::Char('n') | KeyCode::Esc => Outcome::Close,
+                _ => Outcome::Stay,
+            },
             Screen::Snooze(dialog) => dialog.on_key(key, cx),
+            Screen::RemoveProject(dialog) => dialog.on_key(key),
         }
+    }
+}
+
+/// Removing a project (R8.7), following `itm project remove`: a clone is
+/// deleted only when it is itm's own and clean, and only when chosen; any
+/// other is only ever kept. Esc changes nothing.
+#[derive(Debug, Clone)]
+pub struct RemoveDialog {
+    pub id: String,
+    pub name: String,
+    pub kind: ProjectKind,
+    /// Its folder, `~` for the home folder.
+    pub folder: Option<String>,
+    /// Titles of the tasks that have it: then it cannot be removed.
+    pub users: Vec<String>,
+    pub clone: Option<CloneState>,
+    /// What Enter can do, the default first; none while tasks have it.
+    pub choices: Vec<CloneChoice>,
+    pub selected: usize,
+}
+
+impl RemoveDialog {
+    pub fn new(plan: &RemovalPlan, paths: &Paths) -> RemoveDialog {
+        let clean = matches!(plan.clone, Some(CloneState::Deletable { local_work: None }));
+        let choices = match () {
+            _ if !plan.users.is_empty() => vec![],
+            _ if clean => vec![CloneChoice::Keep, CloneChoice::IfClean],
+            _ => vec![CloneChoice::Keep],
+        };
+        RemoveDialog {
+            id: plan.id.clone(),
+            name: plan.project.name.clone(),
+            kind: plan.project.kind(),
+            folder: plan.project.folder().map(|f| paths.display(f)),
+            users: plan.users.clone(),
+            clone: plan.clone.clone(),
+            choices,
+            selected: 0,
+        }
+    }
+
+    fn on_key(&mut self, key: KeyEvent) -> Outcome {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let last = self.choices.len().saturating_sub(1);
+        match key.code {
+            KeyCode::Esc => return Outcome::Close,
+            KeyCode::Up => self.selected = self.selected.saturating_sub(1),
+            KeyCode::Char('k') if ctrl => self.selected = self.selected.saturating_sub(1),
+            KeyCode::Down => self.selected = (self.selected + 1).min(last),
+            KeyCode::Char('j') if ctrl => self.selected = (self.selected + 1).min(last),
+            KeyCode::Enter => {
+                if let Some(&choice) = self.choices.get(self.selected) {
+                    let job = Job::RemoveProject { id: self.id.clone(), name: self.name.clone(), choice };
+                    return Outcome::CloseAnd(Action::Run(job));
+                }
+            }
+            _ => {}
+        }
+        Outcome::Stay
     }
 }
 

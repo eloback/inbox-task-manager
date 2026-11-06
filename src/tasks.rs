@@ -6,9 +6,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use unicode_normalization::{UnicodeNormalization, char::canonical_combining_class};
 
 use crate::error::{Error, Result, bail};
+use crate::notes::Entry;
+use crate::projects::resolve_project;
 use crate::snooze::{MAX_SNOOZE, Until};
 use crate::status::Status;
-use crate::store::{Data, State, Task};
+use crate::store::{Data, Project, State, Task};
 
 /// Only sessions with this prefix are tasks; itm never adopts, stops or
 /// deletes any other session.
@@ -29,6 +31,8 @@ impl Task {
             last_used_at: now,
             description: None,
             projects: vec![],
+            found_projects: vec![],
+            workspace_projects: vec![],
             snoozed_until: None,
             archived_at: None,
             extra: BTreeMap::new(),
@@ -67,8 +71,140 @@ impl Task {
         self.state = State::Archived;
         self.archived_at = Some(now);
         self.snoozed_until = None;
-        self.extra.remove("workspace_projects"); // its workspaces close with the session
+        self.workspace_projects.clear(); // its workspaces close with the session
     }
+
+    /// Set the projects, once each, in order. `found` are the ones workspace
+    /// sync added (R10.1); None keeps those it added before that remain.
+    pub fn set_projects(&mut self, projects: Vec<String>, found: Option<Vec<String>>) {
+        let mut seen = BTreeSet::new();
+        self.projects = projects.into_iter().filter(|id| seen.insert(id.clone())).collect();
+        let found = found.unwrap_or_else(|| std::mem::take(&mut self.found_projects));
+        self.found_projects = found.into_iter().filter(|id| self.projects.contains(id)).collect();
+    }
+}
+
+/// A change to a task by hand (R5.4): `itm edit`, and later the form.
+#[derive(Debug, Clone, Default)]
+pub struct Edit {
+    pub title: Option<String>,
+    /// An empty one clears it.
+    pub description: Option<String>,
+    /// The projects (names or ids) instead of the task's; None keeps them.
+    pub projects: Option<Vec<String>>,
+    pub add: Vec<String>,
+    /// Removing a project the task does not have does nothing.
+    pub remove: Vec<String>,
+    /// Ids to put first, in this order (the form keeps the order of its projects).
+    pub order: Vec<String>,
+}
+
+/// What an edit changed.
+#[derive(Debug)]
+pub struct Edited {
+    /// The task as it was, for notes that do not exist yet (they start from it).
+    pub before: Task,
+    /// Title and description changes, for the task's notes (R9.3).
+    pub entries: Vec<Entry>,
+    /// The projects added, as saved.
+    pub added: Vec<Project>,
+    /// The names of the projects removed (the id of one no longer saved).
+    pub removed: Vec<String>,
+    /// The names of projects kept because their workspace is open.
+    pub kept: Vec<String>,
+}
+
+/// Apply `edit` to the task `session`. A project named here becomes the
+/// user's: closing its workspace no longer removes it (R10.1). `keep_open`
+/// (projects follow workspaces and the daemon runs): a project whose
+/// workspace is open in the session stays, since the daemon would add it
+/// back; the rest of the edit is applied.
+pub fn edit_task(data: &mut Data, session: &str, edit: &Edit, keep_open: bool, now: i64) -> Result<Edited> {
+    if edit.title.as_deref().is_some_and(|t| t.trim().is_empty()) {
+        bail!("task title cannot be empty");
+    }
+    let current = data.tasks.get(session).ok_or_else(|| Error::TaskGone(session.into()))?.projects.clone();
+    let resolve_all = |queries: &[String]| -> Result<Vec<String>> {
+        let mut ids: Vec<String> = vec![];
+        for query in queries {
+            let id = resolve_project(data, query)?;
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
+        Ok(ids)
+    };
+    let (mut wanted, claimed) = match &edit.projects {
+        Some(queries) => {
+            let ids = resolve_all(queries)?;
+            (ids.clone(), ids)
+        }
+        None => {
+            let claimed = resolve_all(&edit.add)?;
+            // An id the task holds counts, also of a project gone from a hand-edited file.
+            let mut gone = BTreeSet::new();
+            for query in &edit.remove {
+                gone.insert(if current.contains(query) { query.clone() } else { resolve_project(data, query)? });
+            }
+            let mut wanted = current.clone();
+            wanted.extend(claimed.iter().filter(|id| !current.contains(id)).cloned());
+            wanted.retain(|id| !gone.contains(id));
+            (wanted, claimed)
+        }
+    };
+    let Data { tasks, projects, .. } = data;
+    let task = tasks.get_mut(session).expect("found above");
+    let before = task.clone();
+    let mut entries = vec![];
+    if let Some(title) = &edit.title {
+        let title = title.trim();
+        if title != task.title {
+            entries.push(("Title changed", Some(title.to_string())));
+        }
+        task.title = title.into();
+    }
+    if let Some(description) = &edit.description {
+        let description = description.trim();
+        if description != task.description.as_deref().unwrap_or("") {
+            entries.push(match description {
+                "" => ("Description cleared", None),
+                text => ("Description changed", Some(text.to_string())),
+            });
+        }
+        task.description = Some(description.to_string()).filter(|d| !d.is_empty());
+    }
+    let kept: Vec<String> = match keep_open {
+        true => {
+            current.iter().filter(|id| !wanted.contains(id) && task.workspace_projects.contains(id)).cloned().collect()
+        }
+        false => vec![],
+    };
+    wanted.extend(kept.iter().cloned());
+    if !edit.order.is_empty() {
+        let (first, rest): (Vec<String>, Vec<String>) = wanted.into_iter().partition(|id| edit.order.contains(id));
+        wanted = edit.order.iter().filter(|id| first.contains(id)).cloned().chain(rest).collect();
+    }
+    let added: Vec<String> = wanted.iter().filter(|id| !current.contains(id)).cloned().collect();
+    let removed: Vec<String> = current.iter().filter(|id| !wanted.contains(id)).cloned().collect();
+    let found = task.found_projects.iter().filter(|id| !claimed.contains(id)).cloned().collect();
+    task.set_projects(wanted, Some(found));
+    let label =
+        |projects: &BTreeMap<String, Project>, id: &String| projects.get(id).map_or(id.clone(), |p| p.name.clone());
+    let added = added
+        .iter()
+        .map(|id| {
+            let project = projects.get_mut(id).expect("resolved");
+            project.last_used_at = now;
+            project.clone()
+        })
+        .collect();
+    Ok(Edited {
+        before,
+        entries,
+        added,
+        removed: removed.iter().map(|id| label(projects, id)).collect(),
+        kept: kept.iter().map(|id| label(projects, id)).collect(),
+    })
 }
 
 /// Track `task-*` sessions made outside itm, and forget tombstones whose
