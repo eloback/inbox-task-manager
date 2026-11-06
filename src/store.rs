@@ -198,11 +198,18 @@ pub fn write_atomic(path: &Path, text: &str) -> io::Result<()> {
 }
 
 /// JSON as Python's `json.dumps` writes it (`ensure_ascii`), pretty with a
-/// two-space indent and a final newline, or compact. Non-ASCII characters
-/// only occur inside strings, so escaping them after serializing is exact.
+/// two-space indent, or compact with Python's default separators (`, ` and
+/// `: `), with a final newline. Non-ASCII characters only occur inside
+/// strings, so escaping them after serializing is exact.
 pub fn python_json(value: &(impl Serialize + ?Sized), pretty: bool) -> String {
-    let text = if pretty { serde_json::to_string_pretty(value) } else { serde_json::to_string(value) };
-    let text = text.expect("JSON values always serialize");
+    let mut bytes = vec![];
+    let written = if pretty {
+        value.serialize(&mut serde_json::Serializer::pretty(&mut bytes))
+    } else {
+        value.serialize(&mut serde_json::Serializer::with_formatter(&mut bytes, PythonSeparators))
+    };
+    written.expect("JSON values always serialize");
+    let text = String::from_utf8(bytes).expect("serde_json writes UTF-8");
     let mut out = String::with_capacity(text.len() + 1);
     for c in text.chars() {
         if c.is_ascii() {
@@ -215,6 +222,23 @@ pub fn python_json(value: &(impl Serialize + ?Sized), pretty: bool) -> String {
     }
     out.push('\n');
     out
+}
+
+/// `json.dumps`'s default separators on one line: `, ` and `: `.
+struct PythonSeparators;
+
+impl serde_json::ser::Formatter for PythonSeparators {
+    fn begin_array_value<W: ?Sized + Write>(&mut self, writer: &mut W, first: bool) -> io::Result<()> {
+        if first { Ok(()) } else { writer.write_all(b", ") }
+    }
+
+    fn begin_object_key<W: ?Sized + Write>(&mut self, writer: &mut W, first: bool) -> io::Result<()> {
+        if first { Ok(()) } else { writer.write_all(b", ") }
+    }
+
+    fn begin_object_value<W: ?Sized + Write>(&mut self, writer: &mut W) -> io::Result<()> {
+        writer.write_all(b": ")
+    }
 }
 
 #[cfg(test)]
@@ -353,6 +377,15 @@ mod tests {
             .replace("      \"project\": \"a1b2c3d4\",\n", "      \"projects\": [\n        \"a1b2c3d4\"\n      ],\n")
             .replace("      \"kind\": \"dir\",\n", "");
         assert_eq!(fs::read_to_string(&store.path).unwrap(), expected);
+    }
+
+    #[test]
+    fn compact_json_has_pythons_separators() {
+        let value = serde_json::json!({"waiting": 1, "list": [1, 2], "empty": {}, "text": "café"});
+        assert_eq!(
+            python_json(&value, false),
+            "{\"empty\": {}, \"list\": [1, 2], \"text\": \"caf\\u00e9\", \"waiting\": 1}\n"
+        );
     }
 
     #[test]
