@@ -385,7 +385,10 @@ fn unexpected() -> Error {
 /// The loop: refresh every 2 s (the switcher only), one load at a time;
 /// keys to the app; jobs, listings and clones to threads, a job followed by
 /// a refresh. Returns what ended it: the session to switch to, or (a
-/// screen alone) the action its last screen closed with.
+/// screen alone) the action its last screen closed with. It returns only
+/// once the jobs that must finish have ([`Job::must_finish`]); until then
+/// it reads no keys, and a failure among them keeps the switcher open to
+/// show it (DESIGN.md section 3: errors stay visible).
 fn event_loop<B: Backend>(
     terminal: &mut Terminal<B>,
     mut app: App,
@@ -400,50 +403,73 @@ fn event_loop<B: Backend>(
     let mut signals: Option<ExitSignals> = None;
     // One load at a time; a job's result asks for another one right after.
     let (mut loading, mut reload, mut next_refresh) = (false, !app.alone, events.now().instant);
-    let (mut running, mut cloning) = (0, 0);
+    let (mut running, mut cloning, mut finishing) = (0, 0, 0);
+    // How the loop ends, once `finishing` is down to 0.
+    let mut leaving: Option<Result<Option<Action>>> = None;
     loop {
         app.now = events.now();
-        if !app.alone && !loading && (reload || app.now.instant >= next_refresh) {
-            (loading, reload) = (true, false);
-            let work = Arc::clone(&work);
-            in_worker(&tx, move || Input::Loaded(work.load()), Input::Loaded(Err(unexpected())));
-        }
-        while let Some(need) = app.needs() {
-            running += 1;
-            match need {
-                // A plain thread, never joined: a scan blocked on a slow filesystem holds up nothing.
-                Need::Listing(parent) => {
-                    let (tx, home) = (tx.clone(), app.paths.home.clone());
-                    thread::spawn(move || {
-                        let listing = list_folders(&parent, &home, SCAN_LIMIT);
-                        let _ = tx.send(Input::Listed(parent, listing));
-                    });
+        if leaving.is_none() {
+            if !app.alone && !loading && (reload || app.now.instant >= next_refresh) {
+                (loading, reload) = (true, false);
+                let work = Arc::clone(&work);
+                in_worker(&tx, move || Input::Loaded(work.load()), Input::Loaded(Err(unexpected())));
+            }
+            while let Some(need) = app.needs() {
+                running += 1;
+                match need {
+                    // A plain thread, never joined: a scan blocked on a slow filesystem holds up nothing.
+                    Need::Listing(parent) => {
+                        let (tx, home) = (tx.clone(), app.paths.home.clone());
+                        thread::spawn(move || {
+                            let listing = list_folders(&parent, &home, SCAN_LIMIT);
+                            let _ = tx.send(Input::Listed(parent, listing));
+                        });
+                    }
+                    Need::Job(job) => {
+                        finishing += usize::from(job.must_finish());
+                        start(job, &work, &tx, &clones)
+                    }
                 }
-                Need::Job(job) => start(job, &work, &tx, &clones),
             }
         }
         app.expire_message();
         let shown = app.now.epoch;
-        terminal.draw(|frame| draw::draw(frame, &mut app, shown)).context(|| "cannot draw".into())?;
+        let drawn = terminal.draw(|frame| draw::draw(frame, &mut app, shown));
+        if leaving.is_none() {
+            drawn.context(|| "cannot draw".into())?; // leaving, the terminal may be gone: the jobs finish anyway
+        }
         if exit_after_draw && app.snapshot.is_some() {
             return Ok(None);
         }
-        if let Some(signal) = signals.as_mut().and_then(ExitSignals::arrived) {
-            return Err(Error::Exit(128 + signal as u8)); // the clones stop on the way out
+        if leaving.is_none()
+            && let Some(signal) = signals.as_mut().and_then(ExitSignals::arrived)
+        {
+            leaving = Some(Err(Error::Exit(128 + signal as u8))); // the clones stop on the way out
         }
-        // Wake for the next refresh (unless one runs), for the message to go, for a screen's
-        // check, and while a clone runs, often enough to see a signal soon.
-        let refresh = (!loading && !app.alone).then_some(next_refresh);
-        let watch = (cloning > 0).then(|| app.now.instant + SIGNAL_POLL);
-        let deadline = [refresh, app.message.as_ref().map(|m| m.until), app.due(), watch].into_iter().flatten().min();
-        let deadline = deadline.unwrap_or(app.now.instant + Duration::from_secs(3600));
-        let input = events.next(&rx, deadline, loading || running > 0);
+        if let Some(ended) = leaving.take_if(|_| finishing == 0) {
+            return ended;
+        }
+        let input = if leaving.is_some() {
+            rx.recv().ok() // only the workers' results now: no keys, no refresh
+        } else {
+            // Wake for the next refresh (unless one runs), for the message to go, for a screen's
+            // check, and while a clone runs, often enough to see a signal soon.
+            let refresh = (!loading && !app.alone).then_some(next_refresh);
+            let watch = (cloning > 0).then(|| app.now.instant + SIGNAL_POLL);
+            let deadline =
+                [refresh, app.message.as_ref().map(|m| m.until), app.due(), watch].into_iter().flatten().min();
+            let deadline = deadline.unwrap_or(app.now.instant + Duration::from_secs(3600));
+            events.next(&rx, deadline, loading || running > 0)
+        };
         app.now = events.now();
         let action = match input {
             None | Some(Input::Resized) => Action::None,
             Some(Input::Key(key)) => app.on_key(key),
             Some(Input::Paste(text)) => app.on_paste(&text),
-            Some(Input::Failed(e)) => return Err(e),
+            Some(Input::Failed(e)) => {
+                leaving = Some(Err(e));
+                Action::None
+            }
             Some(Input::Loaded(snapshot)) => {
                 // Whatever the outcome, this refresh is over and the next one is scheduled.
                 (loading, next_refresh) = (false, app.now.instant + REFRESH);
@@ -461,6 +487,7 @@ fn event_loop<B: Backend>(
             }
             Some(Input::Done(job, result)) => {
                 running -= 1;
+                finishing -= usize::from(job.must_finish());
                 if matches!(job, Job::Clone { .. }) {
                     cloning -= 1;
                     if cloning == 0 {
@@ -468,34 +495,54 @@ fn event_loop<B: Backend>(
                     }
                 }
                 reload |= job.changes_tasks();
-                app.done(job, result)
+                let failed = result.is_err();
+                let action = app.done(job, result);
+                // The switcher stays to show what went wrong (a screen alone has nothing left to show it on).
+                if failed && !app.alone && matches!(leaving, Some(Ok(_))) {
+                    leaving = None;
+                }
+                action
             }
         };
-        // A screen alone is done once its last screen closed: its caller acts on what it said.
-        if app.alone && app.screens.is_empty() {
-            return Ok(Some(action).filter(|a| *a != Action::None));
+        if leaving.is_none() {
+            // A screen alone is done once its last screen closed: its caller acts on what it said.
+            if app.alone && app.screens.is_empty() {
+                leaving = Some(Ok(Some(action).filter(|a| *a != Action::None)));
+            } else {
+                match action {
+                    Action::None
+                    | Action::Answer(_)
+                    | Action::ProjectAdded(..)
+                    | Action::Picked(..)
+                    | Action::Filter(_) => {}
+                    Action::Quit => leaving = Some(Ok(None)),
+                    Action::Switch(session) => leaving = Some(Ok(Some(Action::Switch(session)))),
+                    Action::StopClone => clones.stop(),
+                    Action::Notes(session) => {
+                        // The one blocking call on the loop: nothing is drawn while the editor has the terminal.
+                        if let Err(e) = events.suspended(&mut || work.open_notes(&session)) {
+                            app.flash(e.to_string(), true);
+                        }
+                        terminal.clear().context(|| "cannot draw".into())?;
+                        reload = true; // the preview shows the notes as they are now
+                    }
+                    Action::Run(job) => {
+                        if matches!(job, Job::Clone { .. }) {
+                            cloning += 1;
+                            signals = signals.or_else(|| ExitSignals::catch().ok());
+                        }
+                        running += 1;
+                        finishing += usize::from(job.must_finish());
+                        start(job, &work, &tx, &clones);
+                    }
+                }
+            }
+            if leaving.is_some() && finishing > 0 {
+                app.flash("Finishing first…", false);
+            }
         }
-        match action {
-            Action::None | Action::Answer(_) | Action::ProjectAdded(..) | Action::Picked(..) | Action::Filter(_) => {}
-            Action::Quit => return Ok(None),
-            Action::Switch(session) => return Ok(Some(Action::Switch(session))),
-            Action::StopClone => clones.stop(),
-            Action::Notes(session) => {
-                // The one blocking call on the loop: nothing is drawn while the editor has the terminal.
-                if let Err(e) = events.suspended(&mut || work.open_notes(&session)) {
-                    app.flash(e.to_string(), true);
-                }
-                terminal.clear().context(|| "cannot draw".into())?;
-                reload = true; // the preview shows the notes as they are now
-            }
-            Action::Run(job) => {
-                if matches!(job, Job::Clone { .. }) {
-                    cloning += 1;
-                    signals = signals.or_else(|| ExitSignals::catch().ok());
-                }
-                running += 1;
-                start(job, &work, &tx, &clones);
-            }
+        if let Some(ended) = leaving.take_if(|_| finishing == 0) {
+            return ended;
         }
     }
 }
@@ -623,6 +670,9 @@ mod tests {
         notes: Mutex<Vec<String>>,
         /// How the last clone child ended.
         clone_ended: Mutex<Option<std::process::ExitStatus>>,
+        /// The tasks whose delete was done (a delete takes 300 ms, so keys can come meanwhile).
+        deleted: Mutex<Vec<String>>,
+        delete_fails: bool,
     }
 
     fn new_project(name: &str, path: Option<&str>) -> Project {
@@ -652,6 +702,14 @@ mod tests {
             }
             match job {
                 Job::Create { .. } => Ok(Reply::Created("task-new".into())),
+                Job::Delete { session, .. } => {
+                    thread::sleep(Duration::from_millis(300));
+                    self.deleted.lock().unwrap().push(session.clone());
+                    match self.delete_fails {
+                        true => Err(Error::Other(format!("deleted, but {session}'s session did not stop"))),
+                        false => Ok(Reply::Done),
+                    }
+                }
                 Job::SnoozeTime { text } if text == "next week" => Ok(Reply::Until(Until::Time(NOW + 7 * 86400))),
                 Job::SnoozeTime { text } => Err(Error::Other(format!("cannot understand snooze time: {text}"))),
                 Job::AddProject { kind: ProjectKind::Dir, source, .. } => {
@@ -710,6 +768,40 @@ mod tests {
 
     fn jobs(work: &FakeWork) -> Vec<Job> {
         work.jobs.lock().unwrap().clone()
+    }
+
+    /// R5.3, DESIGN.md section 2: Esc right after a delete closes the
+    /// switcher only once the delete is done. Stopped halfway, the task
+    /// would be gone and its session would run on, unseen.
+    #[test]
+    fn closing_the_switcher_waits_for_a_delete_to_finish() {
+        let work = Arc::new(FakeWork::default());
+        let steps = vec![Step::Key(ctrl('d')), press(KeyCode::Char('y')), Step::Meanwhile(key(KeyCode::Esc))];
+        let (ended, shown) = switcher(steps, &work, false);
+        assert_eq!(ended, Ok(None));
+        assert_eq!(*work.deleted.lock().unwrap(), ["task-fix-login"], "done before the switcher closed");
+        assert!(shown.contains("Finishing first…"), "{shown}");
+    }
+
+    /// The same when the terminal goes (a popup closed) during the delete.
+    #[test]
+    fn a_terminal_gone_during_a_delete_waits_for_it() {
+        let work = Arc::new(FakeWork::default());
+        let (ended, _) = switcher(vec![Step::Key(ctrl('d')), press(KeyCode::Char('y')), Step::Gone], &work, false);
+        assert_eq!(ended, Err(Error::Other("the terminal is gone".into())));
+        assert_eq!(*work.deleted.lock().unwrap(), ["task-fix-login"]);
+    }
+
+    /// DESIGN.md section 3, errors stay visible: a delete that fails while
+    /// the switcher closes keeps it open, saying why.
+    #[test]
+    fn a_failure_while_closing_keeps_the_switcher_open() {
+        let work = Arc::new(FakeWork { delete_fails: true, ..FakeWork::default() });
+        let mut steps = vec![Step::Key(ctrl('d')), press(KeyCode::Char('y')), Step::Meanwhile(key(KeyCode::Esc))];
+        steps.push(press(KeyCode::Esc));
+        let (ended, shown) = switcher(steps, &work, false);
+        assert_eq!(ended, Ok(None), "the second Esc closes it");
+        assert!(shown.contains("deleted, but task-fix-login's session did not stop"), "{shown}");
     }
 
     #[test]

@@ -263,6 +263,14 @@ impl Job {
     pub fn changes_tasks(&self) -> bool {
         !matches!(self, Job::CheckProject { .. } | Job::RemovalPlan { .. } | Job::SnoozeTime { .. })
     }
+
+    /// Whether the UI waits for it before it ends: a delete, an archive or a
+    /// project removal stopped halfway leaves a session running unseen or a
+    /// clone half deleted. Not a clone, which stops on the way out and keeps
+    /// nothing (R8.8), nor a job that only reads.
+    pub fn must_finish(&self) -> bool {
+        self.changes_tasks() && !matches!(self, Job::Clone { .. })
+    }
 }
 
 /// What a job that worked gives back.

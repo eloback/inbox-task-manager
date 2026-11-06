@@ -799,6 +799,14 @@ The switcher and its dialogs follow these principles.
     it looks at the results every 10 ms. One load runs at a time, and a
     job that can change tasks asks for a load once done. A worker that
     panics still sends a result, so a refresh always ends.
+  - The loop ends (Esc, a switch, a screen alone closing, the terminal
+    gone, a signal during a clone) only once the jobs that change state are
+    done (`Job::must_finish`): a delete, an archive or a project removal
+    stopped halfway leaves a session running unseen or a clone half
+    deleted (Textual joined its workers too). Meanwhile it reads no keys and
+    says "Finishing first…"; a failure among those jobs keeps the switcher
+    open to show it (UX principle 11). A clone is not waited for (it stops
+    on the way out and keeps nothing, R8.8), nor is a folder listing.
   - Keys are read on the loop's thread, only while it waits, never by a
     thread of their own: crossterm reads input while it polls, so a reader
     left running after the switcher closed would take keys meant for the
