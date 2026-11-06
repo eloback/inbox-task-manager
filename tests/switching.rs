@@ -81,6 +81,23 @@ fn a_switch_inside_herdr_moves_only_this_sessions_clients() {
     world.stop(&mut other);
 }
 
+/// R1.4: in a Herdr client not started by `itm attach`, `itm new` fails
+/// before saving; and a missing herdr saves nothing either (DESIGN.md
+/// section 2: a failed attach leaves no task).
+fn a_task_is_not_saved_when_switching_to_it_cannot_work() {
+    let world = World::new();
+    let _plain = world.listening("task-plain");
+    let socket = world.socket("task-plain");
+    let (ok, said) = world.try_itm(&["new", "Fresh"], &[("HERDR_SOCKET_PATH", socket.to_str().unwrap())]);
+    assert!(!ok && said.contains("not started by `itm attach`"), "{said}");
+    let (ok, said) = world.try_itm(&["new", "Fresh"], &[("PATH", "/nowhere")]);
+    assert!(!ok && said.contains("herdr not found; install it or add it to PATH"), "{said}");
+    let (ok, said) = world.try_itm(&["attach", "task-fresh"], &[("PATH", "/nowhere")]);
+    assert!(!ok && said.contains("herdr not found"), "{said}");
+    let tasks = fs::read_to_string(world.root.join("state/inbox-task-manager/tasks.json")).unwrap_or_default();
+    assert!(!tasks.contains("task-fresh"), "a task was saved: {tasks}");
+}
+
 /// SIGHUP (the terminal closed), SIGTERM and SIGINT end the loop like a
 /// detach: the client is detached and the markers are removed.
 fn signals_end_the_loop_and_remove_its_markers() {
@@ -169,20 +186,20 @@ fn a_failed_first_start_is_said_and_the_attach_goes_on() {
     );
 }
 
+/// The tests, each with its name.
+macro_rules! named {
+    ($($test:ident),* $(,)?) => { [$((stringify!($test), $test as fn())),*] };
+}
+
 fn run_tests() {
-    let tests: [(&str, fn()); 6] = [
-        ("the_attach_loop_follows_hand_offs_until_a_detach", the_attach_loop_follows_hand_offs_until_a_detach),
-        (
-            "a_switch_inside_herdr_moves_only_this_sessions_clients",
-            a_switch_inside_herdr_moves_only_this_sessions_clients,
-        ),
-        ("signals_end_the_loop_and_remove_its_markers", signals_end_the_loop_and_remove_its_markers),
-        (
-            "stale_markers_are_removed_and_their_processes_left_alone",
-            stale_markers_are_removed_and_their_processes_left_alone,
-        ),
-        ("a_first_start_runs_its_server_in_its_own_session", a_first_start_runs_its_server_in_its_own_session),
-        ("a_failed_first_start_is_said_and_the_attach_goes_on", a_failed_first_start_is_said_and_the_attach_goes_on),
+    let tests = named![
+        the_attach_loop_follows_hand_offs_until_a_detach,
+        a_switch_inside_herdr_moves_only_this_sessions_clients,
+        a_task_is_not_saved_when_switching_to_it_cannot_work,
+        signals_end_the_loop_and_remove_its_markers,
+        stale_markers_are_removed_and_their_processes_left_alone,
+        a_first_start_runs_its_server_in_its_own_session,
+        a_failed_first_start_is_said_and_the_attach_goes_on,
     ];
     // `cargo test <filter>` passes the filter on; options are for libtest, which this is not.
     let filters: Vec<String> = env::args().skip(1).filter(|a| !a.starts_with('-')).collect();

@@ -512,6 +512,21 @@ pub mod tests {
         assert_eq!(app.done(create, Ok("task-brand-new".into())), Action::Switch("task-brand-new".into()));
     }
 
+    /// R1.4: in a client that cannot be switched, the switcher saves the task without switching and says why.
+    #[test]
+    fn a_task_created_where_switching_cannot_work_is_saved_and_says_why() {
+        let mut snap = snapshot();
+        snap.switch_problem = Some("this Herdr client was not started by `itm attach`".into());
+        let mut app = app(snap);
+        typed(&mut app, "Brand new");
+        let create = Job::Create { title: "Brand new".into() };
+        assert_eq!(app.on_key(key(KeyCode::Enter)), Action::Run(create.clone()));
+        assert_eq!(app.done(create, Ok("task-brand-new".into())), Action::None);
+        let message = app.message.as_ref().expect("a message");
+        assert!(message.error && message.text.starts_with("Saved “Brand new” without switching: this Herdr client"));
+        assert_eq!(app.search.value(), "", "the search is cleared for the next one");
+    }
+
     #[test]
     fn archiving_a_running_task_asks_first_and_the_dialog_takes_every_key() {
         let mut app = app(snapshot());

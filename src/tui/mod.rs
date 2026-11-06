@@ -446,6 +446,32 @@ mod tests {
         assert!(screen.contains("Fix login"), "{screen}");
     }
 
+    /// DESIGN.md section 2: without a session list (Herdr not answering),
+    /// nothing is adopted and no tombstone expires; sessions are unknown, not absent.
+    #[test]
+    fn a_refresh_without_a_session_list_adopts_nothing_and_expires_no_tombstone() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_tmp, itm) = crate::itm::tests::itm();
+        let sessions = itm.paths.herdr_config.join("sessions");
+        std::fs::create_dir_all(sessions.join("task-made-elsewhere")).unwrap();
+        itm.store().edit(|data| Ok(data.deleted.insert("task-being-deleted".into(), 1))).unwrap();
+        std::fs::set_permissions(&sessions, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let unreadable = std::fs::read_dir(&sessions).is_err(); // root reads it anyway
+        let snapshot = itm.load();
+        std::fs::set_permissions(&sessions, std::fs::Permissions::from_mode(0o755)).unwrap();
+        if !unreadable {
+            return;
+        }
+        let snapshot = snapshot.unwrap();
+        assert!(!snapshot.listed);
+        let data = itm.store().load().unwrap();
+        assert!(data.tasks.is_empty() && data.deleted.contains_key("task-being-deleted"));
+        // Once Herdr answers, the session made elsewhere is adopted and the tombstone of a gone session goes.
+        let snapshot = itm.load().unwrap();
+        assert!(snapshot.listed && snapshot.data.tasks.contains_key("task-made-elsewhere"));
+        assert!(snapshot.data.deleted.is_empty());
+    }
+
     /// R4.1: `itm snooze` without a time opens the dialog alone; it returns the choice, or None on Esc.
     #[test]
     fn the_snooze_dialog_alone_returns_the_choice() {
