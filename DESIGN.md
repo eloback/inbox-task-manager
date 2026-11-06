@@ -945,7 +945,12 @@ The switcher and its dialogs follow these principles.
   build's inner entry point (`.itm-wrapped`: the wrapper puts its own git
   first on `PATH`) with a git whose clone makes an empty checkout of the
   URL, so no network is needed; where each side adds its own projects,
-  their random ids are replaced by names before comparing.
+  their random ids are replaced by names before comparing. For Herdr
+  workspaces (R10) each side gets its own headless Herdr session with the
+  same workspaces, made in the same order (so their ids match), and its
+  own daemon runs for a few passes at a time (the first pass over a
+  session only adds). What the Rust itm printed at each step is kept in
+  `cross/steps.log`, so a step that passes can be read too.
 
 ## 7. Packaging
 

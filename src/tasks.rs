@@ -395,6 +395,11 @@ mod tests {
         assert_eq!((&task.projects, &task.found_projects), (&ids(&["api"]), &vec![]));
         task.sync_projects(&[], true, true); // api was added by hand: it stays
         assert_eq!((&task.projects, &task.workspace_projects), (&ids(&["api"]), &vec![]));
+        // DESIGN.md section 2: archiving drops the record at once (its workspaces close with the session).
+        task.sync_projects(&ids(&["api"]), true, true);
+        task.archive(2);
+        assert!(task.workspace_projects.is_empty());
+        assert_eq!(task.projects, ids(&["api"]));
     }
 
     /// R10.3: with "remove a project when its workspace closes" off, projects are only added.
