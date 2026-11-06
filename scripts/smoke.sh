@@ -186,6 +186,65 @@ check "notes start with the task" sh -c "head -1 '$notes' | grep -qx '# Old idea
 echo "from an agent" | "$itm" notes old-idea --append - >/dev/null
 check "notes --append adds a dated note" sh -c "tail -2 '$notes' | grep -qx 'from an agent'"
 
+echo "== edit and delete in running sessions (R5.4, R5.3)"
+mkdir -p "$HOME/code/docs"
+"$itm" project add dir '~/code/docs' >/dev/null
+"$itm" project add name "Client X" >/dev/null
+check "edit opens a named workspace in a running session" \
+  test "$("$itm" edit "Two repos" --add-project docs --add-project "Client X")" \
+  = "task-two-repos updated; Client X has no folder, so it gets no workspace; opened a workspace in ~/code/docs"
+labels_are() { test "$(workspaces 2>/dev/null)" = "$1"; }
+check "the new workspace is named after its project" labels_are "api web docs"
+check "the edit is in the notes" contains "$("$itm" notes two-repos --path)" "Project added"
+check "delete --yes of a running task" test "$("$itm" delete write-docs --yes)" = "task-write-docs deleted"
+check "its session stops and Herdr deletes it" wait_for 10 sh -c "! test -d '$sessions/task-write-docs'"
+check "its tombstone expires once the session is gone" sh -c "'$itm' list >/dev/null; ! grep -q task-write-docs '$XDG_STATE_HOME/inbox-task-manager/tasks.json'"
+type_in_pane "$itm delete old-idea"
+check "itm delete asks first" wait_for 5 shows 'Delete “Old idea”?'
+keys n
+check "n keeps the task" wait_for 5 sh -c "'$itm' list | grep -q task-old-idea"
+wait_for 5 gone 'y delete'
+type_in_pane "$itm delete old-idea"
+wait_for 5 shows 'Delete “Old idea”?'
+keys y
+check "y deletes it, its session and its notes" wait_for 10 sh -c "! test -d '$sessions/task-old-idea' && ! test -e '$notes'"
+
+echo "== the switcher's notes and delete keys (R9.4, R9.5)"
+printf '#!/bin/sh\necho "written in the editor" >>"$1"\n' >"$root/editor.sh"
+chmod +x "$root/editor.sh"
+type_in_pane "EDITOR=$root/editor.sh $itm ui"
+wait_for 5 shows 'esc close'
+keys -l "Two repos"
+wait_for 5 shows '› Two repos'
+keys Tab
+wait_for 5 shows 'wake & open'
+keys C-o
+check "Ctrl+O runs the editor on the highlighted task's notes" wait_for 5 contains "$("$itm" notes two-repos --path)" "written in the editor"
+check "the switcher comes back with the notes in the preview" wait_for 5 shows 'written in the editor'
+keys C-d
+check "Ctrl+D asks before deleting" wait_for 5 shows 'Delete “Two repos”?'
+keys n
+wait_for 5 gone 'y delete'
+keys Escape
+check "Esc closes the switcher" wait_for 5 gone 'esc close'
+
+echo "== git projects (R8.6, R8.7), cloned without the network"
+mkdir -p "$root/bin"
+real_git=$(command -v git)
+printf '#!/bin/sh\nif [ "$1" = clone ]; then "%s" init -q "$5" && exec "%s" -C "$5" remote add origin "$4"; fi\nexec "%s" "$@"\n' \
+  "$real_git" "$real_git" "$real_git" >"$root/bin/git"
+chmod +x "$root/bin/git"
+clone=$XDG_DATA_HOME/inbox-task-manager/projects/example.com/acme/tool
+check "project add git clones under the projects folder" \
+  test "$(PATH="$root/bin:$PATH" "$itm" project add git https://example.com/acme/tool.git)" = tool
+check "the clone is in place" test -d "$clone/.git"
+type_in_pane "PATH=$root/bin:\$PATH $itm project remove tool"
+check "removing a clean clone asks, keeping it by default" wait_for 5 shows 'Keep the clone  (default)'
+keys Down
+keys Enter
+check "the clone is deleted when chosen" wait_for 5 sh -c "! test -e '$clone' && ! test -e '$(dirname "$clone")'"
+check "the project is forgotten" sh -c "! '$itm' project list | grep -q tool"
+
 echo "== the Python itm reads this state"
 if [ -x "$python_itm" ]; then
   check "python itm list agrees" test "$("$python_itm" list | cut -f1,2 | sort)" = "$("$itm" list | cut -f1,2 | sort)"

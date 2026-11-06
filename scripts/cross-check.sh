@@ -18,13 +18,17 @@
 #
 # ITM (default target/release/itm) and ITM_PYTHON (default the pinned
 # Python build at /tmp/itm-standoff-cache/python-ref/bin/itm) choose the
-# binaries. Prints PASS/FAIL per check; exits 1 if any failed. Later
-# milestones add their commands here.
+# binaries. The Nix build of the Python itm puts its own git first on PATH,
+# so git projects run its inner entry point, `.itm-wrapped` next to it
+# (ITM_PYTHON_BARE), with a git whose clone makes an empty checkout of the
+# URL instead of fetching it (no network). Prints PASS/FAIL per check;
+# exits 1 if any failed. Later milestones add their commands here.
 set -u
 root=${ITM_SANDBOX:?run this through scripts/sandbox.sh}
 repo=$(cd "$(dirname "$0")/.." && pwd)
 rust=${ITM:-$repo/target/release/itm}
 python=${ITM_PYTHON:-/tmp/itm-standoff-cache/python-ref/bin/itm}
+python_bare=${ITM_PYTHON_BARE:-$(dirname "$python")/.itm-wrapped}
 [ -x "$rust" ] || { echo "no Rust itm at $rust (cargo build --release, or set ITM)"; exit 2; }
 [ -x "$python" ] || { echo "no Python itm at $python (set ITM_PYTHON)"; exit 2; }
 work=$root/cross
@@ -54,19 +58,44 @@ same() { # same <file> <file>: equal once normalized; shows the difference other
 }
 same_bytes() { cmp -s "$1" "$2" || { diff "$1" "$2" | sed 's/^/    /' | head -20; return 1; }; }
 
+# Project ids are random: where each side adds its own projects, tasks.json
+# compares with every id replaced by its project's name.
+canon() { # canon <tasks.json>
+  python3 - "$1" <<'EOF'
+import json, sys
+data = json.load(open(sys.argv[1]))
+names = {pid: "<" + p["name"] + ">" for pid, p in data.get("projects", {}).items()}
+data["projects"] = {names[pid]: p for pid, p in data.get("projects", {}).items()}
+for task in data.get("tasks", {}).values():
+    for key in ("projects", "found_projects", "workspace_projects"):
+        if isinstance(task.get(key), list):
+            task[key] = [names.get(pid, pid) for pid in task[key]]
+print(json.dumps(data, indent=2, sort_keys=True))
+EOF
+}
+
 step=0
-both() { # both <args...>: the same command on side py (Python) and side rs (Rust)
+ids=same # "canon" once the sides have added their own projects
+both() { # both <args...>: the same command on side py (Python) and side rs (Rust); stdin from $STDIN
   step=$((step + 1))
   local name
   for name in py rs; do
     local itm=$python; [ $name = rs ] && itm=$rust
-    side $name "$itm" "$@" >"$work/$name.out" 2>"$work/$name.err" </dev/null
+    side $name "$itm" "$@" >"$work/$name.out" 2>"$work/$name.err" <"${STDIN:-/dev/null}"
     echo "exit $?" >>"$work/$name.out"
-    cp "$(tasks $name)" "$work/$name.tasks" 2>/dev/null || : >"$work/$name.tasks"
+    if [ ! -f "$(tasks $name)" ]; then : >"$work/$name.tasks"
+    elif [ $ids = canon ]; then
+      canon "$(tasks $name)" >"$work/$name.tasks"
+      sed -i -E 's/"id": "[0-9a-f]{8}"/"id": "<id>"/' "$work/$name.out"
+    else cp "$(tasks $name)" "$work/$name.tasks"; fi
   done
   check "itm $* -- same output" same "$work/py.out" "$work/rs.out"
   check "itm $* -- same errors" same "$work/py.err" "$work/rs.err"
   check "itm $* -- same tasks.json" same "$work/py.tasks" "$work/rs.tasks"
+}
+notes_same() { # notes_same <session>: both sides' notes of a task, the same once normalized
+  check "$1's notes are the same" same "$work/py/data/inbox-task-manager/tasks/$1/notes.md" \
+    "$work/rs/data/inbox-task-manager/tasks/$1/notes.md"
 }
 
 reads() { # reads <side> <args...>: both implementations on one side's state print the same
@@ -136,6 +165,122 @@ both project add dir '~/code/api'
 both project add dir '~/elsewhere/api' --name API
 both project list
 both project list --json
+
+echo "== edit (R5.4) and the notes it writes (R9.3)"
+both edit "Two repos" --title "  Two repos, renamed " --description "  why it matters  "
+both edit "two repos, renamed" --title "Two repos" --description ""
+both edit "Two repos" --remove-project api --add-project "Client X"
+both edit "Two repos" --add-project api
+both edit "Two repos" --remove-project nope
+both edit "Two repos" --project web --add-project api
+both edit "Two repos" --title " "
+both edit "Two repos"
+both edit nope --title x
+both edit "Fix login" --project api --project WEB --project api
+both edit "Fix login" --no-project
+notes_same task-two-repos
+notes_same task-fix-login
+
+echo "== notes (R9.4)"
+both notes "Two repos" --path
+both notes "Two repos" --append " "
+printf 'from stdin\nsecond line\n' >"$work/stdin"
+STDIN=$work/stdin both notes "Two repos" --append -
+both notes "Two repos"
+both notes
+both notes nope --append x
+notes_same task-two-repos
+
+echo "== project set and rename (R8.2)"
+both project set "client x" --dir '~/elsewhere/api'
+both project set "Client X" --dir '~/elsewhere/api'
+both project set "Client X" --dir '~/code/api'
+both project set "Client X" --dir '~/nowhere'
+both project set "Client X" --no-dir
+both project set "Client X" --no-dir
+both project set web --dir '~/elsewhere/api'
+both project rename "Client X" "Client Z"
+both project rename "client z" "CLIENT Z"
+both project rename "Client Z" web
+both project rename web " "
+both project rename nope x
+both project remove web
+both project list
+both project list --json
+
+echo "== delete (R5.3)"
+both new "Doomed" --no-switch
+both notes doomed --append "a finding"
+both delete doomed
+both delete doomed --yes
+both delete doomed --yes
+check "py: the notes went with the task" test ! -e "$work/py/data/inbox-task-manager/tasks/task-doomed"
+check "rs: the notes went with the task" test ! -e "$work/rs/data/inbox-task-manager/tasks/task-doomed"
+both list
+
+echo "== projects each side adds (ids differ from here on)"
+ids=canon
+both project add name "Client Y"
+both project add name "client y"
+both project add name "  "
+both project add name Other --name another
+both project add dir '~/code/api' --name again
+both project add dir '~/nowhere'
+both project remove "Client Y"
+
+echo "== git projects (R8.4 to R8.7), cloned without the network"
+mkdir -p "$work/bin"
+real_git=$(command -v git)
+cat >"$work/bin/git" <<EOF
+#!/bin/sh
+# git, but a clone makes an empty checkout of the URL instead of fetching it
+if [ "\$1" = clone ]; then
+  "$real_git" init -q "\$5" && exec "$real_git" -C "\$5" remote add origin "\$4"
+fi
+exec "$real_git" "\$@"
+EOF
+chmod +x "$work/bin/git"
+python_wrapped=$python
+python=$python_bare
+saved_path=$PATH
+export PATH="$work/bin:$PATH" GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_COUNT=2 \
+  GIT_CONFIG_KEY_0=url.https://example.com/.insteadOf GIT_CONFIG_VALUE_0=ex: \
+  GIT_CONFIG_KEY_1=init.defaultBranch GIT_CONFIG_VALUE_1=main
+both project add git git@example.com:acme/api.git
+both project add git git@example.com:acme/api.git --name acme-api
+both project add git https://example.com/acme/api
+both project add git ssh://git@EXAMPLE.com:22/acme/api.git --name x
+both project add git ex:acme/web --name acme-web
+both project add git https://example.com/acme/web.git/ --name y
+both project add git https://dev.azure.com/Acme/Platform/_git/api --name azure
+both project add git git@ssh.dev.azure.com:v3/acme/Platform/api --name z
+both project add git https://acme.visualstudio.com/DefaultCollection/Platform/_git/api --name z
+both project add git git@my-alias:acme/api.git --name alias
+both project add git /home/me/repo
+both project add git 'ext::sh -c touch% /tmp/x'
+both project add git https://example.com/acme/team/
+both project set acme-api --no-dir
+both project list
+both project list --json
+clones() { (cd "$work/$1/data/inbox-task-manager/projects" && find . | sort); }
+check "both cloned into the same places" same <(clones py) <(clones rs)
+both new "Uses azure" -p azure --no-switch
+both project remove azure --delete-clone
+both project remove acme-api
+both project remove acme-web --delete-clone
+both project remove alias --keep-clone
+check "both kept and deleted the same clones" same <(clones py) <(clones rs)
+both edit "Uses azure" --no-project
+touch "$work/py/data/inbox-task-manager/projects/dev.azure.com/acme/Platform/api/draft"
+touch "$work/rs/data/inbox-task-manager/projects/dev.azure.com/acme/Platform/api/draft"
+both project remove azure
+check "a clone with local work is kept" same <(clones py) <(clones rs)
+both project add git https://dev.azure.com/acme/Platform/_git/api --name azure
+both project remove azure --delete-clone
+check "--delete-clone deletes it anyway" same <(clones py) <(clones rs)
+python=$python_wrapped
+export PATH=$saved_path
+unset GIT_CONFIG_COUNT
 
 echo "== each reads the other's state"
 for state in py rs; do
