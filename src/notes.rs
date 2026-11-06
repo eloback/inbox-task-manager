@@ -114,7 +114,8 @@ impl Itm {
         if text.is_empty() {
             bail!("the note is empty");
         }
-        self.append_notes(session, &[("Note", Some(text.into()))], now)
+        (self.append_notes(session, &[("Note", Some(text.into()))], now))
+            .map_err(|e| Error::Other(format!("cannot write its notes: {e}")))
     }
 
     /// Delete a task's notes, and its folder when nothing else is in it.

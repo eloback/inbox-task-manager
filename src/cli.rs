@@ -365,6 +365,7 @@ pub fn run(cli: Cli, itm: Itm) -> Result<()> {
                     Error::Other("not inside a task; name the task, or press ctrl+o on it in the switcher".into())
                 })?,
             };
+            itm.notes_path(&name)?; // a name that cannot have notes says so as it is
             let notes = (itm.ensure_notes(&name, &data.tasks[&name], &data.projects))
                 .map_err(|e| Error::Other(format!("cannot create its notes: {e}")))?;
             if path {
@@ -374,10 +375,7 @@ pub fn run(cli: Cli, itm: Itm) -> Result<()> {
                     "-" => std::io::read_to_string(std::io::stdin()).context(|| "cannot read stdin".into())?,
                     _ => text,
                 };
-                match itm.add_note(&name, &text, now) {
-                    Err(Error::Other(e)) if e != "the note is empty" => bail!("cannot write its notes: {e}"),
-                    added => added?,
-                }
+                itm.add_note(&name, &text, now)?;
                 println!("note added to {name}");
             } else if terminal() {
                 itm.edit_notes(&notes)?;

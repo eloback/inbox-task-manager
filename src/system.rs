@@ -182,18 +182,32 @@ fn signal_mask(text: &str) -> Option<u64> {
 /// [`ExitSignals::catch`] until dropped instead of ending the process at
 /// once, so it can clean up first; more of them meanwhile change nothing.
 /// Those ignored already (`nohup`) stay ignored.
-pub struct ExitSignals(Signals);
+pub struct ExitSignals {
+    signals: Signals,
+    caught: Vec<i32>,
+}
 
 impl ExitSignals {
     pub fn catch() -> io::Result<ExitSignals> {
         let ignored = ignored_signals().unwrap_or(0);
-        let caught = [SIGHUP, SIGTERM, SIGINT].into_iter().filter(|&sig| ignored & (1 << (sig - 1)) == 0);
-        Ok(ExitSignals(Signals::new(caught)?))
+        let caught: Vec<i32> =
+            [SIGHUP, SIGTERM, SIGINT].into_iter().filter(|&sig| ignored & (1 << (sig - 1)) == 0).collect();
+        Ok(ExitSignals { signals: Signals::new(&caught)?, caught })
     }
 
     /// The first one that arrived since the last look, if any.
     pub fn arrived(&mut self) -> Option<i32> {
-        self.0.pending().next()
+        self.signals.pending().next()
+    }
+}
+
+impl Drop for ExitSignals {
+    /// They end the process again, as before: signal-hook keeps its handler
+    /// once the last action goes, which would leave them ignored.
+    fn drop(&mut self) {
+        for &signal in &self.caught {
+            let _ = signal_hook::flag::register_conditional_default(signal, Arc::new(AtomicBool::new(true)));
+        }
     }
 }
 

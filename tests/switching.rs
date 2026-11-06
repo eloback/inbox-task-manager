@@ -16,7 +16,8 @@
 //! "clone <pid> <session id> <url> <GIT_TERMINAL_PROMPT>", writes part of
 //! the checkout and progress, and then, for a URL with `slow`, waits for
 //! SIGTERM or SIGINT; for one with `password` it fails as git does when it
-//! may not ask; else it finishes the checkout. `ls-remote --get-url` and
+//! may not ask; for one with `pause` it waits for a file `go` next to the
+//! log; else it finishes the checkout. `ls-remote --get-url` and
 //! `remote get-url origin` answer as git would for such a checkout.
 //!
 //! Every process gets a temporary home and XDG folders, and no `HERDR_*`
@@ -260,6 +261,27 @@ fn a_clone_child_has_its_own_session_and_can_always_be_cancelled() {
     assert_eq!(world.projects_left(), Vec::<String>::new());
 }
 
+/// Once the clone is done, the signals end itm again as they did before
+/// it: one waiting for the store lock is stopped by SIGTERM (the clone is
+/// kept, and a later add reuses it, R8.6).
+fn after_a_clone_signals_end_itm_again() {
+    let world = World::new();
+    let mut add = world.spawn(Command::new(ITM).args(["project", "add", "git", "git@example.com:acme/pause.git"]));
+    world.cloning();
+    let lock = fs::File::create(world.root.join("state/inbox-task-manager/.tasks.lock")).unwrap();
+    lock.lock().unwrap();
+    fs::write(world.root.join("go"), "").unwrap();
+    let clone = world.root.join("data/inbox-task-manager/projects/example.com/acme/pause");
+    assert!(wait_until(|| clone.join(".git/origin").exists()), "the clone did not finish");
+    thread::sleep(Duration::from_millis(200)); // itm waits for the store lock now
+    signal(add.id(), Signal::TERM);
+    let status = world.ended(&mut add);
+    assert_eq!(std::os::unix::process::ExitStatusExt::signal(&status), Some(15), "{status}");
+    drop(lock);
+    let (ok, said) = world.try_itm(&["project", "add", "git", "https://example.com/acme/pause"], &[]);
+    assert!(ok && said == "pause\n", "the checkout is reused: {said}");
+}
+
 /// R8.2, R8.6: a clone finishes into place and is saved under the
 /// repository's name; the same repository by another URL is refused.
 fn a_clone_is_saved_once() {
@@ -327,6 +349,7 @@ fn run_tests() {
         signals_ignored_before_a_clone_stay_ignored,
         a_clone_child_has_its_own_session_and_can_always_be_cancelled,
         a_clone_is_saved_once,
+        after_a_clone_signals_end_itm_again,
         deleting_a_task_stops_its_session_and_has_herdr_delete_it,
         deleting_the_task_a_client_is_on_moves_it_to_the_next_task,
     ];
@@ -604,6 +627,11 @@ fn fake_git(args: Vec<String>) {
                 signals.forever().next();
                 log("git stopped".into());
                 process::exit(128 + 15);
+            }
+            // A URL with "pause" finishes once the test says go.
+            let go = PathBuf::from(env::var("ITM_TEST_LOG").unwrap()).with_file_name("go");
+            while url.contains("pause") && !go.exists() {
+                thread::sleep(Duration::from_millis(20));
             }
             fs::write(Path::new(dest).join(".git/origin"), url).unwrap();
             eprintln!("Receiving objects: 100% (50/50), done.");

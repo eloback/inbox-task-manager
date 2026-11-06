@@ -356,8 +356,10 @@ Verified against Herdr 0.9.3. Re-check them after a Herdr upgrade.
   closed), SIGTERM and SIGINT into a clean exit for this, and ignores further
   signals while cleaning up. Signals already ignored when the clone starts
   (`nohup`) stay ignored. In Rust, `ExitSignals` catches them (signal-hook)
-  until the cleanup is done; git gets SIGTERM, then SIGKILL after 10 s, and
-  itm exits with 128 + the signal (`Error::Exit`). Which signals are ignored
+  until the cleanup is done, and then lets them end itm again (signal-hook
+  alone would leave them ignored once its last action goes); git gets
+  SIGTERM, then SIGKILL after 10 s, and itm exits with 128 + the signal
+  (`Error::Exit`). Which signals are ignored
   is read from `/proc/self/status` (`SigIgn`), else `ps -o sigignore=`: no
   safe call asks for a signal's disposition.
 - Python installs signal handlers only in the main thread. A TUI must not
