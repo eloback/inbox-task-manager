@@ -267,9 +267,12 @@ pub fn run(cli: Cli, itm: Itm) -> Result<()> {
         Command::Delete { task, yes } => {
             let data = itm.store().load()?;
             let name = tasks::resolve_task(&data, &task)?;
-            // R5.3: after confirmation. No is said by the exit status alone.
-            if !yes && !(needs_terminal().and_then(|()| tui::confirm_delete(&name, &data.tasks[&name].title))?) {
-                return Err(Error::Exit(1));
+            if !yes {
+                // R5.3: after confirmation. A no is said by the exit status alone, as in the Python itm.
+                needs_terminal()?;
+                if !tui::confirm_delete(&name, &data.tasks[&name].title)? {
+                    return Err(Error::Exit(1));
+                }
             }
             itm.delete_task(&name)?;
             println!("{name} deleted");
