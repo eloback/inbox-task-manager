@@ -6,8 +6,9 @@
 //!   "<pid> <name> <folder>" to `$ITM_TEST_LOG` and stays until a signal
 //!   detaches it, as a real client does on SIGTERM;
 //! - `herdr server` (with `HERDR_SESSION`): a headless session that logs
-//!   "server <pid> <session id> <name>" and each workspace it is asked to
-//!   open, and answers on its socket until `server.stop`.
+//!   "server <pid> <session id> <name> <HERDR_* variables>" and each
+//!   workspace it is asked to open, and answers on its socket until
+//!   `server.stop`; for a session named `*-broken` it exits with 1 instead.
 //!
 //! Every process gets a temporary home and XDG folders, and no `HERDR_*`
 //! variable but the ones a test sets. The unit tests describe the process
@@ -126,13 +127,15 @@ fn a_first_start_runs_its_server_in_its_own_session() {
     fs::create_dir_all(&api).unwrap();
     world.itm(&["project", "add", "dir", api.to_str().unwrap()]);
     world.itm(&["new", "Fix", "-p", "api", "--no-switch"]);
-    let mut attach = world.attach("task-fix");
+    // Herdr variables from wherever itm runs must not point the new server elsewhere.
+    let mut attach = world.attach_with("task-fix", &[("HERDR_WORKSPACE_ID", "w9")]);
     world.attached(&attach, "task-fix");
 
     let log = world.log();
     let server = log.iter().find_map(|line| line.strip_prefix("server ")).expect("no server started");
-    let [pid, sid, name] = server.split(' ').collect::<Vec<_>>()[..] else { panic!("{server}") };
+    let [pid, sid, name, herdr_vars] = server.split(' ').collect::<Vec<_>>()[..] else { panic!("{server}") };
     assert_eq!(name, "task-fix");
+    assert_eq!(herdr_vars, "HERDR_SESSION", "no other HERDR_* variable");
     assert_eq!(pid, sid, "the server leads its own session");
     let itm_sid = getsid(Pid::from_raw(attach.id() as i32)).unwrap().as_raw_nonzero().get();
     assert_ne!(sid, itm_sid.to_string(), "the server is not in the attach loop's session");
@@ -144,8 +147,30 @@ fn a_first_start_runs_its_server_in_its_own_session() {
     signal(pid.parse().unwrap(), Signal::TERM);
 }
 
+/// A first start whose server fails is not waited for: it is said, and the
+/// attach goes on (Herdr then starts the session as usual).
+fn a_failed_first_start_is_said_and_the_attach_goes_on() {
+    let world = World::new();
+    fs::create_dir_all(world.home.join("api")).unwrap();
+    world.itm(&["project", "add", "dir", "~/api"]);
+    world.itm(&["new", "Broken", "-p", "api", "--no-switch"]);
+    let started = Instant::now();
+    let mut attach =
+        world.command(&["attach", "task-broken"], &[]).stdin(Stdio::null()).stderr(Stdio::piped()).spawn().unwrap();
+    world.started.borrow_mut().push(attach.id());
+    world.attached(&attach, "task-broken");
+    assert!(started.elapsed() < Duration::from_secs(4), "waited {:?} for a server that exited", started.elapsed());
+    world.stop(&mut attach);
+    let mut said = String::new();
+    std::io::Read::read_to_string(&mut attach.stderr.take().unwrap(), &mut said).unwrap();
+    assert!(
+        said.contains("herdr server for task-broken exited with") && said.contains("workspaces may be missing"),
+        "{said}"
+    );
+}
+
 fn run_tests() {
-    let tests: [(&str, fn()); 5] = [
+    let tests: [(&str, fn()); 6] = [
         ("the_attach_loop_follows_hand_offs_until_a_detach", the_attach_loop_follows_hand_offs_until_a_detach),
         (
             "a_switch_inside_herdr_moves_only_this_sessions_clients",
@@ -157,6 +182,7 @@ fn run_tests() {
             stale_markers_are_removed_and_their_processes_left_alone,
         ),
         ("a_first_start_runs_its_server_in_its_own_session", a_first_start_runs_its_server_in_its_own_session),
+        ("a_failed_first_start_is_said_and_the_attach_goes_on", a_failed_first_start_is_said_and_the_attach_goes_on),
     ];
     // `cargo test <filter>` passes the filter on; options are for libtest, which this is not.
     let filters: Vec<String> = env::args().skip(1).filter(|a| !a.starts_with('-')).collect();
@@ -239,7 +265,11 @@ impl World {
 
     /// `itm attach <task>` in the background.
     fn attach(&self, task: &str) -> Child {
-        let child = self.command(&["attach", task], &[]).stdin(Stdio::null()).spawn().unwrap();
+        self.attach_with(task, &[])
+    }
+
+    fn attach_with(&self, task: &str, env: &[(&str, &str)]) -> Child {
+        let child = self.command(&["attach", task], env).stdin(Stdio::null()).spawn().unwrap();
         self.started.borrow_mut().push(child.id());
         child
     }
@@ -377,7 +407,13 @@ fn fake_herdr(args: Vec<String>) {
         ["server"] => {
             let name = env::var("HERDR_SESSION").expect("HERDR_SESSION");
             let sid = getsid(None).unwrap().as_raw_nonzero().get();
-            log(format!("server {} {sid} {name}", process::id()));
+            let mut herdr_vars: Vec<String> =
+                env::vars().map(|(key, _)| key).filter(|key| key.starts_with("HERDR_")).collect();
+            herdr_vars.sort();
+            log(format!("server {} {sid} {name} {}", process::id(), herdr_vars.join(",")));
+            if name.ends_with("-broken") {
+                process::exit(1);
+            }
             let config = PathBuf::from(env::var("XDG_CONFIG_HOME").unwrap()).join("herdr");
             let socket = config.join("sessions").join(&name).join("herdr.sock");
             fs::create_dir_all(socket.parent().unwrap()).unwrap();
