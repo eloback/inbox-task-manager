@@ -2,6 +2,7 @@
 //! paths as the Python itm, so either can run on the other's state.
 
 use std::env;
+use std::ffi::OsString;
 use std::fs::{self, DirBuilder};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -30,14 +31,16 @@ pub struct Paths {
 
 impl Paths {
     pub fn from_env() -> Paths {
-        let home = env::home_dir().unwrap_or_else(|| PathBuf::from("/"));
-        let xdg = |var: &str, fallback: &str| match env::var_os(var) {
-            Some(value) if !value.is_empty() => PathBuf::from(value),
-            _ => home.join(fallback),
-        };
-        let var = |name: &str| env::var_os(name).filter(|v| !v.is_empty()).map(PathBuf::from);
+        Paths::from_vars(env::home_dir().unwrap_or_else(|| PathBuf::from("/")), |name| env::var_os(name))
+    }
+
+    /// The folders, given the home folder and how to read a variable (set
+    /// and empty counts as unset, as in the Python itm).
+    fn from_vars(home: PathBuf, var: impl Fn(&str) -> Option<OsString>) -> Paths {
+        let var = |name: &str| var(name).filter(|v| !v.is_empty()).map(PathBuf::from);
+        let xdg = |name: &str, fallback: &str| var(name).unwrap_or_else(|| home.join(fallback));
         let data = xdg("XDG_DATA_HOME", ".local/share").join(APP);
-        let projects = var("ITM_PROJECTS_DIR").unwrap_or_else(|| data.join("projects"));
+        let projects = var("ITM_PROJECTS_DIR").map_or_else(|| data.join("projects"), |dir| expand_home(&dir, &home));
         Paths {
             state: xdg("XDG_STATE_HOME", ".local/state").join(APP),
             projects: std::path::absolute(&projects).unwrap_or(projects),
@@ -104,6 +107,14 @@ impl Paths {
     }
 }
 
+/// `~` and `~/…` as the shell reads them (`~user` is not read).
+pub fn expand_home(path: &Path, home: &Path) -> PathBuf {
+    match path.strip_prefix("~") {
+        Ok(rest) => home.join(rest),
+        Err(_) => path.to_path_buf(),
+    }
+}
+
 /// `$XDG_RUNTIME_DIR/inbox-task-manager`, else `/run/user/<uid>/…` when that
 /// folder is ours, else a private `/tmp/inbox-task-manager-<uid>`. The daemon
 /// (started by a service manager) and every client (started from a shell)
@@ -163,6 +174,24 @@ mod tests {
         let link = tmp.path().join("link");
         std::os::unix::fs::symlink(&open, &link).unwrap();
         assert!(private_dir(&link).unwrap_err().to_string().contains("not a folder owned by you"));
+    }
+
+    #[test]
+    fn the_projects_folder_reads_a_tilde_like_python() {
+        let home = PathBuf::from("/h");
+        let with = |value: &'static str| {
+            let var = move |name: &str| match name {
+                "ITM_PROJECTS_DIR" => Some(value.into()),
+                "XDG_RUNTIME_DIR" => Some("/run/test".into()), // no fallback folder made
+                _ => None,
+            };
+            Paths::from_vars(home.clone(), var).projects
+        };
+        assert_eq!(with("~/clones"), PathBuf::from("/h/clones"));
+        assert_eq!(with("~"), PathBuf::from("/h"));
+        assert_eq!(with("/srv/clones"), PathBuf::from("/srv/clones"));
+        assert_eq!(with("~other/x"), std::path::absolute("~other/x").unwrap(), "only the shell's own ~ is read");
+        assert_eq!(with(""), PathBuf::from("/h/.local/share/inbox-task-manager/projects"), "empty is unset");
     }
 
     #[test]

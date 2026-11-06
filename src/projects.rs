@@ -11,6 +11,7 @@ use serde::Serialize;
 
 use crate::error::{Context, Error, Result, bail};
 use crate::itm::Itm;
+use crate::paths::expand_home;
 use crate::store::{Data, Project, flocked};
 use crate::times;
 
@@ -21,7 +22,7 @@ impl Itm {
         if source.is_empty() {
             bail!("empty folder path");
         }
-        let folder = expand_home(source, &self.paths.home);
+        let folder = expand_home(Path::new(source), &self.paths.home);
         if !folder.is_dir() {
             bail!("not a folder: {source}");
         }
@@ -158,15 +159,6 @@ fn new_project_id(data: &Data) -> Result<String> {
         if !data.projects.contains_key(&id) {
             return Ok(id);
         }
-    }
-}
-
-/// `~` and `~/…` as the shell reads them.
-fn expand_home(path: &str, home: &Path) -> PathBuf {
-    match path.strip_prefix('~') {
-        Some("") => home.to_path_buf(),
-        Some(rest) if rest.starts_with('/') => home.join(&rest[1..]),
-        _ => PathBuf::from(path),
     }
 }
 
