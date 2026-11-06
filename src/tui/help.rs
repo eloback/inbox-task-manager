@@ -2,14 +2,16 @@
 //! most seven (UX principle 5), the rest are here. It scrolls when the
 //! popup is shorter than the list; the close hint stays visible.
 
+use std::cell::Cell;
+
 use ratatui::Frame;
 use ratatui::crossterm::event::{KeyCode, KeyEvent};
 use ratatui::layout::Rect;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::Paragraph;
+use ratatui::widgets::{Paragraph, Wrap};
 
-use super::draw::{ACCENT, WIDE, bold, dialog_box, key_hints};
+use super::draw::{ACCENT, WIDE, bold, dialog_box, key_hints, wrapped_rows};
 use super::screen::{Outcome, moves};
 
 /// Sections of (keys, what they do).
@@ -90,8 +92,10 @@ pub fn lines() -> usize {
 
 #[derive(Debug, Clone, Default)]
 pub struct Help {
-    /// The first line shown.
+    /// The first row shown.
     pub scroll: usize,
+    /// How far it scrolls in the popup it was last drawn in (the rest fits).
+    pub most: Cell<Option<usize>>,
 }
 
 impl Help {
@@ -102,7 +106,8 @@ impl Help {
             KeyCode::PageDown => 10,
             _ => moves(key),
         };
-        self.scroll = self.scroll.saturating_add_signed(by).min(lines().saturating_sub(1));
+        let most = self.most.get().unwrap_or_else(|| lines().saturating_sub(1));
+        self.scroll = self.scroll.saturating_add_signed(by).min(most);
         Outcome::Stay
     }
 }
@@ -120,11 +125,15 @@ impl Help {
                 lines.push(Line::from(vec![key, Span::raw(format!(" {what}"))]));
             }
         }
-        let inside = dialog_box(frame, area, WIDE, lines.len() as u16 + 4);
+        let width = area.width.min(WIDE).saturating_sub(4) as usize; // inside the border and margin
+        let rows: usize = lines.iter().map(|line| wrapped_rows(line, width)).sum();
+        let inside = dialog_box(frame, area, WIDE, rows as u16 + 4);
         let body = Rect { height: inside.height.saturating_sub(2), ..inside };
         // Scrolled no further than the last line at the bottom.
-        let scroll = self.scroll.min(lines.len().saturating_sub(body.height as usize));
-        frame.render_widget(Paragraph::new(lines).scroll((scroll as u16, 0)), body);
+        let most = rows.saturating_sub(body.height as usize);
+        self.most.set(Some(most));
+        let scroll = self.scroll.min(most);
+        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }).scroll((scroll as u16, 0)), body);
         let keys = Rect { y: inside.bottom().saturating_sub(1), height: 1, ..inside };
         frame.render_widget(Paragraph::new(key_hints(&[("esc", "close"), ("↑ ↓", "scroll")])), keys);
     }

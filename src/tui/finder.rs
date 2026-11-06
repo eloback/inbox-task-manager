@@ -318,7 +318,7 @@ impl Finder {
         let rows = self.rows.as_deref().unwrap_or_default();
         let shown = rows.len().min(ROWS) as u16;
         let status = self.status();
-        let inside = dialog_box(frame, area, WIDE, 4 + shown + 1 + u16::from(status.is_some()) * 2 + 2 + 2);
+        let inside = dialog_box(frame, area, WIDE, 4 + shown + u16::from(status.is_some()) * 2 + 2 + 2);
         let mut head = vec![Line::from(bold("Projects")), Line::default()];
         let typed = match self.query.value() {
             "" => muted("Search projects, or type ~/folder, /folder or a git URL"),
@@ -376,5 +376,196 @@ impl Finder {
                 spans
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tui::app::tests::{ctrl, key, with_projects};
+
+    fn finder(chosen: &[&str], typed: &str) -> Finder {
+        let chosen = chosen.iter().map(|c| c.to_string()).collect();
+        Finder::new(chosen, typed, with_projects().saved(), &Paths::under("/r".as_ref()))
+    }
+
+    fn typing(finder: &mut Finder, text: &str) {
+        for c in text.chars() {
+            finder.on_key(key(KeyCode::Char(c)));
+        }
+    }
+
+    fn names(finder: &Finder) -> Vec<String> {
+        let name = |id: &str| finder.saved.projects[id].name.clone();
+        (finder.rows.clone().unwrap().iter())
+            .map(|row| match row {
+                Pick::Project { id, saved: true, .. } => format!("{} saved", name(id)),
+                Pick::Project { id, .. } => name(id),
+                Pick::Folder { path, named: true, project } => {
+                    format!("Use {path}{}", project.as_ref().map_or(String::new(), |p| format!(" ◆ {}", name(p))))
+                }
+                Pick::Folder { path, project, .. } => {
+                    format!("{path}{}", project.as_ref().map_or(String::new(), |p| format!(" ◆ {}", name(p))))
+                }
+                other => format!("{other:?}"),
+            })
+            .collect()
+    }
+
+    fn picked(outcome: Outcome) -> Vec<String> {
+        match outcome {
+            Outcome::CloseAnd(Action::Picked(ids, None)) => ids,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// R1.6, after Python's test_picker_finds_projects_fuzzily: letters in
+    /// order in any case, a name's prefix first; the add rows, "+ New
+    /// project" last; Enter adds; on a ✓ project it removes it.
+    #[test]
+    fn r1_6_projects_are_found_by_their_letters() {
+        let mut found = finder(&[], "BAC");
+        assert_eq!(names(&found), ["backend", "AddGit", "AddFolder", "NewName(\"BAC\")"]);
+        assert_eq!(found.selected, 0, "a match first, never the new project");
+        assert_eq!(picked(found.on_key(key(KeyCode::Enter))), ["p-backend"]);
+        let mut found = finder(&["p-backend"], "");
+        assert_eq!(names(&found)[..3], ["RemoveAll", "api", "web"], "most recently used first");
+        assert_eq!(
+            found.highlighted(),
+            Some(&Pick::Project { id: "p-api".into(), matched: vec![], saved: false }),
+            "the most recent one not chosen"
+        );
+        typing(&mut found, "zzz");
+        assert!(found.status().unwrap().starts_with("No project matches “zzz”. Type a path"));
+        let mut both = finder(&["p-backend", "p-api"], "backend");
+        assert_eq!(picked(both.on_key(key(KeyCode::Enter))), ["p-api"], "picking a chosen one removes it");
+        let empty = finder(&[], "");
+        assert_eq!(empty.highlighted(), Some(&Pick::Project { id: "p-api".into(), matched: vec![], saved: false }));
+        assert!(matches!(finder(&[], "ap").rows.unwrap()[0], Pick::Project { ref matched, .. } if matched == &[0, 1]));
+    }
+
+    /// R1.6: "remove all" is never what Enter picks first, and never offered for a search.
+    #[test]
+    fn r1_6_remove_all_is_never_the_default() {
+        let all = ["p-api", "p-web", "p-backend", "p-gone", "p-x"];
+        assert_eq!(finder(&all, "").highlighted(), Some(&Pick::AddGit));
+        assert!(!finder(&all, "res").rows.unwrap().contains(&Pick::RemoveAll));
+        assert_eq!(picked(finder(&["p-api"], "").pick(Pick::RemoveAll)), Vec::<String>::new());
+    }
+
+    /// R1.6: ↑↓ and Ctrl+J/K move, Tab does nothing on a project, Esc goes
+    /// back without changing the task's projects.
+    #[test]
+    fn r1_6_finder_keys() {
+        let mut found = finder(&[], "");
+        found.on_key(ctrl('j'));
+        found.on_key(key(KeyCode::Down));
+        found.on_key(ctrl('k'));
+        assert_eq!(found.selected, 1);
+        found.on_key(key(KeyCode::Tab));
+        assert_eq!(found.text(), "");
+        assert!(matches!(found.on_key(key(KeyCode::Esc)), Outcome::Close));
+    }
+
+    /// R1.6, R8.4: a git URL picks the saved project of that repository, in
+    /// any of its forms; another offers to clone it, first.
+    #[test]
+    fn r1_6_a_git_url_picks_its_saved_repository_or_offers_a_clone() {
+        let found = finder(&[], "https://github.com/acme/backend");
+        assert_eq!(names(&found)[0], "backend saved");
+        assert!(!found.rows.as_ref().unwrap().iter().any(|r| matches!(r, Pick::Clone(_) | Pick::NewName(_))));
+        let new = finder(&[], "git@github.com:acme/tool.git");
+        assert_eq!(new.rows.as_ref().unwrap()[0], Pick::Clone("git@github.com:acme/tool.git".into()));
+        let add = |outcome: Outcome| match outcome {
+            Outcome::Open(screen) => match *screen {
+                Screen::AddProject(dialog) => {
+                    (dialog.kind, dialog.source.value().to_string(), dialog.name.value().to_string(), dialog.focus)
+                }
+                other => panic!("{other:?}"),
+            },
+            other => panic!("{other:?}"),
+        };
+        let mut new = new;
+        let clone = add(new.on_key(key(KeyCode::Enter)));
+        assert_eq!(clone, (ProjectKind::Git, "git@github.com:acme/tool.git".into(), String::new(), Field::Name));
+        // "+ New project" opens the add dialog on its name: one Enter on a typo saves nothing.
+        let mut typo = finder(&[], "zz top");
+        let last = typo.rows.as_ref().unwrap().len() - 1;
+        typo.selected = last;
+        assert_eq!(
+            add(typo.on_key(key(KeyCode::Enter))),
+            (ProjectKind::Name, String::new(), "zz top".into(), Field::Name)
+        );
+        let project = crate::tui::app::tests::project("zz top", None, 1);
+        let done = typo.returned(Action::ProjectAdded("p-zz".into(), project.clone()));
+        assert!(
+            matches!(done, Outcome::CloseAnd(Action::Picked(ids, Some((id, _)))) if ids == ["p-zz"] && id == "p-zz")
+        );
+    }
+
+    fn listing(real: &str, names: &[&str], links: &[(&str, &str)]) -> Option<Listing> {
+        Some(Listing {
+            real: real.into(),
+            names: names.iter().map(|n| n.to_string()).collect(),
+            links: links.iter().map(|(n, t)| (n.to_string(), PathBuf::from(t))).collect(),
+        })
+    }
+
+    /// R1.6, after test_picker_completes_folders_and_adds_one and
+    /// test_picker_waits_for_a_slow_folder: a typed path lists folders once
+    /// its parent was read (nothing to act on before); a saved one names
+    /// its project; Tab goes into a folder, which is offered itself
+    /// ("Use"); Enter adds a new one through the add dialog, or picks the
+    /// saved one's project.
+    #[test]
+    fn r1_6_typed_paths_list_folders_once_they_are_read() {
+        let mut found = finder(&[], "");
+        found.saved.folders.insert("/r/home/work/beta".into(), "p-web".into());
+        typing(&mut found, "~/work/b");
+        assert_eq!(found.needs(), Some(Need::Listing("~/work/".into())));
+        assert_eq!(found.needs(), None, "asked once");
+        assert_eq!((found.rows.clone(), found.status().as_deref()), (None, Some("Reading the folder…")));
+        assert!(matches!(found.on_key(key(KeyCode::Enter)), Outcome::Stay), "nothing to act on yet");
+        found.on_key(key(KeyCode::Tab));
+        assert_eq!(found.text(), "~/work/b");
+        found.listed("~/work/", &listing("/r/home/work", &["alpha", "beta", "bravo"], &[]));
+        assert_eq!(names(&found), ["~/work/beta/ ◆ web", "~/work/bravo/"]);
+        assert_eq!(
+            found.status().as_deref(),
+            Some("Enter adds the folder (or picks it when saved); tab goes into it.")
+        );
+        assert_eq!(picked(found.clone().on_key(key(KeyCode::Enter))), ["p-web"], "a saved folder picks its project");
+        found.query = Input::new("~/work/al".into());
+        found.rebuild();
+        found.on_key(key(KeyCode::Tab));
+        assert_eq!(found.text(), "~/work/alpha/");
+        assert_eq!(found.needs(), Some(Need::Listing("~/work/alpha/".into())));
+        found.listed("~/work/", &listing("/r/home/work", &["late"], &[])); // asked already: changes nothing
+        assert_eq!(found.rows, None);
+        found.listed("~/work/alpha/", &listing("/r/home/work/alpha", &["inner"], &[]));
+        assert_eq!(names(&found), ["Use ~/work/alpha/", "~/work/alpha/inner/"]);
+        let outcome = found.on_key(key(KeyCode::Enter));
+        assert!(
+            matches!(outcome, Outcome::Open(s) if matches!(&*s, Screen::AddProject(d) if d.source.value() == "~/work/alpha/" && d.focus == Field::Name))
+        );
+        typing(&mut found, "x");
+        assert_eq!(found.status().as_deref(), Some("No folder there matches."));
+        found.query = Input::new("~/missing/".into());
+        found.rebuild();
+        found.needs();
+        found.listed("~/missing/", &None);
+        assert_eq!(names(&found), Vec::<String>::new());
+    }
+
+    /// R1.6: a saved folder reached through a symlink is found (the listing
+    /// resolves links in its thread).
+    #[test]
+    fn r1_6_a_saved_folder_is_known_through_a_symlink() {
+        let mut found = finder(&[], "~/work/lin");
+        found.saved.folders.insert("/r/home/work/real".into(), "p-web".into());
+        found.needs();
+        found.listed("~/work/", &listing("/r/home/work", &["link", "real"], &[("link", "/r/home/work/real")]));
+        assert_eq!(names(&found), ["~/work/link/ ◆ web"]);
+        assert_eq!(picked(found.on_key(key(KeyCode::Enter))), ["p-web"]);
     }
 }

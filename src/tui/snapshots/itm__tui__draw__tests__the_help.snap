@@ -1,0 +1,27 @@
+---
+source: src/tui/draw.rs
+assertion_line: 1190
+expression: screen(&mut app)
+---
+  Inbox 3   S╭──────────────────────────────────────────────────────────────────────────────────╮ 1 needs you
+             │ Task list                                                                        │
+ › Search tas│   typing               search titles; @name or @"a name" shows one project's     │
+             │ tasks                                                                            │
+ NEEDS YOU   │   ↑ ↓ / ctrl+k ctrl+j  move                                                      │
+ ⚑ Fix login │   enter                open · wake & open · reopen · create                      │
+ ACTIVE      │   tab / shift+tab      next / previous view                                      │
+ ● Write docs│   alt+1…9              open row 1–9                                              │
+ ○ Old idea  │   ctrl+n               new task form                                             │
+             │   ctrl+e               edit title, description, projects                         │
+             │   ctrl+z               snooze                                                    │
+             │   ctrl+u               wake a snoozed task                                       │
+             │   ctrl+a               archive (asks when running)                               │ writes
+             │   ctrl+d               delete                                                    │
+             │   ctrl+o               the task's notes, in your editor                          │
+             │   ctrl+p               projects                                                  │
+             │   ctrl+s               settings (Herdr integration)                              │
+             │   ? / F1               this help (? while the search is empty)                   │
+             │   esc                  close                                                     │
+             │                                                                                  │
+             │ esc close  ↑ ↓ scroll                                                            │
+ enter open  ╰──────────────────────────────────────────────────────────────────────────────────╯

@@ -833,6 +833,40 @@ pub mod tests {
         snap
     }
 
+    pub fn project(name: &str, path: Option<&str>, used: i64) -> Project {
+        Project {
+            name: name.into(),
+            path: path.map(Into::into),
+            url: None,
+            added_at: 1,
+            last_used_at: used,
+            extra: <_>::default(),
+        }
+    }
+
+    /// [`snapshot`] with saved projects: api (Fix login has it), web,
+    /// backend (a clone), gone (its folder is missing) and Client X (a name only).
+    pub fn with_projects() -> Snapshot {
+        let mut snap = snapshot();
+        let mut backend = project("backend", Some("/r/data/projects/github.com/acme/backend"), NOW - 50);
+        backend.url = Some("git@github.com:acme/backend.git".into());
+        for (id, project) in [
+            ("p-api", project("api", Some("/r/home/code/api"), NOW - 10)),
+            ("p-web", project("web", Some("/r/home/code/web"), NOW - 20)),
+            ("p-backend", backend),
+            ("p-gone", project("gone", Some("/r/home/code/gone"), NOW - 60)),
+            ("p-x", project("Client X", None, NOW - 70)),
+        ] {
+            if let Some(folder) = project.folder() {
+                snap.folders.insert(folder.to_path_buf(), id.into());
+            }
+            snap.data.projects.insert(id.into(), project);
+        }
+        snap.missing.insert("p-gone".into());
+        snap.data.tasks.get_mut("task-fix-login").unwrap().projects = vec!["p-api".into()];
+        snap
+    }
+
     pub fn app(snap: Snapshot) -> App {
         let now = Moment { instant: Instant::now(), epoch: NOW };
         let mut app = App::new(View::Inbox, Paths::under(std::path::Path::new("/r")), TimeZone::UTC, now);
@@ -1147,5 +1181,135 @@ pub mod tests {
         assert_eq!(app.on_key(key(KeyCode::Enter)), Action::None, "nothing to choose");
         assert_eq!(app.on_key(key(KeyCode::Esc)), Action::None);
         assert!(app.screens.is_empty(), "esc changes nothing");
+    }
+
+    /// R6.2: `@name` and `@"a name"` filter by project; the rest searches titles.
+    #[test]
+    fn r6_2_queries_read_project_filters() {
+        let query = Query::parse(r#"@"my app" fix @api"#);
+        assert_eq!((query.projects, query.text.as_str()), (vec!["my app".to_string(), "api".to_string()], "fix"));
+        assert_eq!(Query::parse("@ x @\"  \"").projects, Vec::<String>::new(), "blank tokens are none");
+        assert_eq!((filter_token("api"), filter_token("Client X")), ("@api".to_string(), "@\"Client X\"".to_string()));
+    }
+
+    /// R6.2, after test_create_row_uses_the_filtered_project and
+    /// test_unknown_project_filter: a filter shows the tasks that have the
+    /// project among any of theirs, a task created from it gets the project,
+    /// and one that names no project says so and creates without one.
+    #[test]
+    fn r6_2_project_filters_and_the_create_row() {
+        let mut snap = with_projects();
+        snap.data.tasks.get_mut("task-write-docs").unwrap().projects = vec!["p-api".into(), "p-web".into()];
+        let mut app = app(snap);
+        typed(&mut app, "@web");
+        assert_eq!(app.rows, [Row::Header("ACTIVE"), Row::Task("task-write-docs".into())], "any of its projects");
+        app.search = Input::new("@API Rate limits".into());
+        app.rebuild();
+        assert_eq!(app.rows, [Row::Create]);
+        let create =
+            Job::Create { title: "Rate limits".into(), description: None, projects: vec!["p-api".into()], until: None };
+        assert_eq!(app.on_key(key(KeyCode::Enter)), Action::Run(create));
+        app.search = Input::new("@nope Fix".into());
+        app.rebuild();
+        assert_eq!(app.rows, [Row::UnknownProject("nope".into()), Row::Create]);
+        assert_eq!(app.highlighted(), Some(&Row::Create));
+        assert_eq!(app.default_projects(), Vec::<String>::new());
+        app.on_key(ctrl('n'));
+        let [Screen::Form(form)] = &app.screens[..] else { panic!("no form") };
+        assert_eq!((form.title.value(), form.projects.clone()), ("Fix", vec![]));
+    }
+
+    /// R1.6: without a filter, a new task starts with the first project of the task this switcher runs in.
+    #[test]
+    fn r1_6_a_new_task_starts_with_the_current_tasks_first_project() {
+        let mut snap = with_projects();
+        snap.current = Some("task-fix-login".into());
+        let mut app = app(snap);
+        assert_eq!(app.default_projects(), ["p-api"]);
+        app.on_key(ctrl('n'));
+        assert!(matches!(&app.screens[..], [Screen::Form(form)] if form.projects == ["p-api"]));
+    }
+
+    /// UX principle 5, after test_vim_keys_and_help: `?` opens the help only
+    /// while the search is empty (then it is typed), F1 always; the help
+    /// closes with `?`, F1 or Esc; list keys do nothing behind a screen.
+    #[test]
+    fn help_opens_with_a_question_mark_on_an_empty_search_or_f1() {
+        let mut app = app(snapshot());
+        app.on_key(key(KeyCode::Char('?')));
+        assert!(matches!(app.screens[..], [Screen::Help(_)]));
+        app.on_key(key(KeyCode::Char('?')));
+        assert!(app.screens.is_empty());
+        typed(&mut app, "why?");
+        assert_eq!((app.search.value(), app.screens.len()), ("why?", 0));
+        app.on_key(key(KeyCode::F(1)));
+        assert!(matches!(app.screens[..], [Screen::Help(_)]));
+        app.on_key(key(KeyCode::Esc));
+        app.on_key(ctrl('p'));
+        assert_eq!(app.on_key(ctrl('z')), Action::None, "snooze is no Projects key");
+        assert!(matches!(app.screens[..], [Screen::Projects(_)]));
+        app.on_key(ctrl('s'));
+        assert!(matches!(app.screens[..], [Screen::Projects(_)]), "nor are the settings");
+    }
+
+    /// R5.4: Ctrl+E edits the highlighted task, knowing its session runs;
+    /// what the edit did is said, as an error when something failed.
+    #[test]
+    fn r5_4_ctrl_e_edits_and_says_what_happened() {
+        let mut app = app(with_projects());
+        app.on_key(ctrl('e'));
+        let [Screen::Form(form)] = &app.screens[..] else { panic!("no form") };
+        let editing = form.editing.as_ref().unwrap();
+        assert_eq!(
+            (editing.session.as_str(), editing.effect),
+            ("task-fix-login", Some(super::super::form::Effect::Running))
+        );
+        assert_eq!(form.projects, ["p-api"]);
+        let edit = |notes: &[&str]| {
+            let job = Job::Edit {
+                session: "task-fix-login".into(),
+                title: "Fix login".into(),
+                description: String::new(),
+                add: vec![],
+                remove: vec![],
+                order: vec![],
+            };
+            (job, Reply::Said(notes.iter().map(|n| n.to_string()).collect()))
+        };
+        app.screens.clear();
+        let (job, said) = edit(&["opened a workspace in ~/code/web"]);
+        app.done(job, Ok(said));
+        let message = app.message.as_ref().unwrap();
+        assert_eq!((message.text.as_str(), message.error), ("Saved; opened a workspace in ~/code/web.", false));
+        let (job, said) = edit(&["could not open a workspace in ~/code/web: no answer"]);
+        app.done(job, Ok(said));
+        assert!(app.message.as_ref().unwrap().error);
+    }
+
+    /// R1.1, R1.7: a task the form created snoozed is said, not switched to.
+    #[test]
+    fn r1_7_a_task_created_snoozed_is_said_not_switched_to() {
+        let mut app = app(snapshot());
+        typed(&mut app, "Plan");
+        let create = Job::Create {
+            title: "Plan".into(),
+            description: None,
+            projects: vec![],
+            until: Some(Until::Time(NOW + 3600)),
+        };
+        assert_eq!(app.done(create, Ok(Reply::Created("task-plan".into()))), Action::None);
+        assert_eq!(app.message.as_ref().unwrap().text, "Saved “Plan”, snoozed until 09:00.");
+        assert_eq!(app.search.value(), "");
+    }
+
+    /// R8.3: Enter on the Projects screen shows the project's tasks.
+    #[test]
+    fn r8_3_enter_on_a_project_filters_the_list_by_it() {
+        let mut app = app(with_projects());
+        app.on_key(ctrl('p'));
+        app.on_key(key(KeyCode::Enter));
+        assert!(app.screens.is_empty());
+        assert_eq!(app.search.value(), "@api ");
+        assert_eq!(app.rows, [Row::Header("NEEDS YOU"), Row::Task("task-fix-login".into())]);
     }
 }

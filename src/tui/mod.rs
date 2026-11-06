@@ -518,6 +518,10 @@ mod tests {
         Wait(Duration),
         /// A key pressed while a worker runs (Esc during a clone), once no result came for a while.
         Meanwhile(KeyEvent),
+        /// Text pasted into the terminal.
+        Paste(&'static str),
+        /// The terminal is gone (a popup closed), while a worker runs.
+        Gone,
     }
 
     fn secs(n: u64) -> Step {
@@ -560,10 +564,17 @@ mod tests {
                         return Some(input);
                     }
                     let mut steps = self.steps.borrow_mut();
-                    if let Some(Step::Meanwhile(key)) = steps.front() {
-                        let key = *key;
-                        steps.pop_front();
-                        return Some(Input::Key(key));
+                    match steps.front() {
+                        Some(Step::Meanwhile(key)) => {
+                            let key = *key;
+                            steps.pop_front();
+                            return Some(Input::Key(key));
+                        }
+                        Some(Step::Gone) => {
+                            steps.pop_front();
+                            return Some(Input::Failed(Error::Other("the terminal is gone".into())));
+                        }
+                        _ => {}
                     }
                 }
                 panic!("a worker never answered");
@@ -574,6 +585,8 @@ mod tests {
             let step = self.steps.borrow_mut().pop_front().expect("the switcher wanted more input than the script has");
             match step {
                 Step::Key(key) | Step::Meanwhile(key) => Some(Input::Key(key)),
+                Step::Paste(text) => Some(Input::Paste(text.into())),
+                Step::Gone => Some(Input::Failed(Error::Other("the terminal is gone".into()))),
                 Step::Wait(time) => {
                     let left = deadline.saturating_duration_since(self.now().instant);
                     if time > left {
@@ -600,6 +613,8 @@ mod tests {
         jobs: Mutex<Vec<Job>>,
         /// The tasks whose notes were opened.
         notes: Mutex<Vec<String>>,
+        /// How the last clone child ended.
+        clone_ended: Mutex<Option<std::process::ExitStatus>>,
     }
 
     fn new_project(name: &str, path: Option<&str>) -> Project {
@@ -638,6 +653,7 @@ mod tests {
                     let pid =
                         run.clones.spawn(Command::new("sleep").arg(if url.ends_with("slow") { "30" } else { "0" }));
                     let status = run.clones.wait(pid.unwrap()).unwrap();
+                    *self.clone_ended.lock().unwrap() = Some(status);
                     match status.success() {
                         true => Ok(Reply::Added("p-new".into(), new_project("backend", Some("/r/clones/backend")))),
                         false => Err(Error::Other("itm: could not clone".into())),
@@ -960,5 +976,46 @@ mod tests {
             alone_screen(screen, steps, Arc::clone(&work) as Arc<dyn Work>, Paths::under("/r".as_ref()));
         assert_eq!(chosen, None);
         assert!(shown.contains("Project added.") && shown.contains("◆ backend"), "{shown}");
+    }
+
+    /// R1.6, R8.8, after Python's test_clone_runs_as_a_child_and_selects_the_project:
+    /// a git URL pasted on the form's project field opens the finder, whose
+    /// first row clones it; the add dialog opens ready on the name, and once
+    /// the clone is done the form has the project.
+    #[test]
+    fn r1_6_a_pasted_git_url_is_cloned_and_given_to_the_task() {
+        let paths = Paths::under("/r".as_ref());
+        let form = TaskForm::new_task("Plan", vec![], Saved::default(), vec![], &paths);
+        let mut steps =
+            vec![press(KeyCode::Tab), press(KeyCode::Tab), Step::Paste(" git@github.com:acme/backend.git\n")];
+        steps.extend([press(KeyCode::Enter), press(KeyCode::Enter)]); // "+ Clone …", then the dialog's add
+        steps.push(Step::Key(ctrl('s')));
+        let work = Arc::new(FakeWork::default());
+        let (chosen, _) = alone_screen(Screen::Form(Box::new(form)), steps, Arc::clone(&work) as Arc<dyn Work>, paths);
+        let clone = Job::Clone { url: "git@github.com:acme/backend.git".into(), name: None };
+        assert_eq!(jobs(&work), [clone]);
+        let create =
+            Job::Create { title: "Plan".into(), description: None, projects: vec!["p-new".into()], until: None };
+        assert_eq!(chosen, Some(Action::Run(create)));
+    }
+
+    /// R8.8: whenever the UI ends during a clone (here its terminal went),
+    /// the clone child is stopped: in a session of its own, nothing else would.
+    #[test]
+    fn r8_8_a_clone_stops_when_the_ui_ends() {
+        let work = Arc::new(FakeWork::default());
+        let dialog = add::AddDialog::new(ProjectKind::Git, "https://github.com/acme/slow", "", screen::Field::Name);
+        let mut terminal = Terminal::new(TestBackend::new(90, 26)).unwrap();
+        let clock = Script::new([press(KeyCode::Enter), Step::Gone]);
+        let app =
+            App::alone(Screen::AddProject(Box::new(dialog)), Paths::under("/r".as_ref()), TimeZone::UTC, clock.now());
+        let ended = event_loop(&mut terminal, app, Arc::clone(&work) as Arc<dyn Work>, &clock, false);
+        assert_eq!(ended, Err(Error::Other("the terminal is gone".into())));
+        let stopped = (0..100).find_map(|_| {
+            thread::sleep(Duration::from_millis(20));
+            *work.clone_ended.lock().unwrap()
+        });
+        let signal = stopped.and_then(|s| std::os::unix::process::ExitStatusExt::signal(&s));
+        assert_eq!(signal, Some(15), "stopped with SIGTERM");
     }
 }

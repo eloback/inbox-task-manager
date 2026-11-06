@@ -1,0 +1,27 @@
+---
+source: src/tui/draw.rs
+assertion_line: 1154
+expression: screen(&mut app)
+---
+  Inbox 3   Snoozed 1   Archived 1   All 5                                                      ⚑ 1 needs you
+
+ › Search tasks · @project filters · or type a new title
+
+ NEEDS YOU                                                           │  Fix login
+ ⚑ Fix login                                claude waiting · 4m      │
+ ACTIVE      ╭──────────────────────────────────────────────────────────────────────────────────╮
+ ● Write docs│ Add project                                                                      │
+ ○ Old idea  │  Git repository   Local folder   Name only                                       │
+             │                                                                                  │
+             │ Source  https://github.com/acme/tool.git                                         │
+             │ Name    defaults to the repository or folder name                                │
+             │                                                                                  │ writes
+             │ Cloning… Receiving objects:  50% (10/20)                                         │
+             │                                                                                  │
+             │ enter add  tab complete  ←→ kind (empty source)  esc back                        │
+             ╰──────────────────────────────────────────────────────────────────────────────────╯
+                                                                     │
+                                                                     │
+                                                                     │  enter open  ctrl+o notes
+
+ enter open  tab view  ^n new  ^e edit  ^z snooze  ^p projects  ? all keys

@@ -1,6 +1,6 @@
 ---
 source: src/tui/draw.rs
-assertion_line: 850
+assertion_line: 861
 expression: screen(&mut app)
 ---
   Inbox 3   Snoozed 1   Archived 1   All 5                                                      ⚑ 1 needs you
@@ -8,17 +8,17 @@ expression: screen(&mut app)
  › Search tasks · @project filters · or type a new title
 
  NEEDS YOU                                                           │  Fix login
- ⚑ Fix login ╭──────────────────────────────────────────────────────────────────────────────────╮
- ACTIVE      │ Add project                                                                      │
- ● Write docs│  Git repository   Local folder   Name only                                       │
- ○ Old idea  │                                                                                  │
+ ⚑ Fix login                                claude waiting · 4m      │
+ ACTIVE      ╭──────────────────────────────────────────────────────────────────────────────────╮
+ ● Write docs│ Add project                                                                      │
+ ○ Old idea  │  Git repository   Local folder   Name only                                       │
+             │                                                                                  │
              │ Source  ~/code/new-thing                                                         │
              │ Name    My Thing                                                                 │
-             │                                                                                  │
-             │ project already exists: My Thing (no folder); choose another name                │ writes
+             │                                                                                  │ writes
+             │ project already exists: My Thing (no folder); choose another name                │
              │                                                                                  │
              │ enter add  tab complete  ←→ kind (empty source)  esc back                        │
-             │                                                                                  │
              ╰──────────────────────────────────────────────────────────────────────────────────╯
                                                                      │
                                                                      │

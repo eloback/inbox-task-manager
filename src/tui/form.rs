@@ -496,18 +496,25 @@ impl TaskForm {
         lines.push(Line::default());
         lines.push(key_hints(keys));
         frame.render_widget(Paragraph::new(lines), inside);
-        // The description is a widget of its own, over its three rows.
-        let mut description = self.description.clone();
-        let cursor = if self.focus == Part::Description { Style::new().reversed() } else { Style::new() };
-        description.set_cursor_style(cursor);
-        description.set_placeholder_style(Style::new().fg(MUTED));
+        // The description is a widget of its own, over its three rows. Empty
+        // and elsewhere, its placeholder is drawn here: the widget draws its
+        // cursor before it.
         let rows = Rect {
             x: inside.x + LABEL as u16,
             y: inside.y + description_row as u16,
             width: inside.width.saturating_sub(LABEL as u16),
             height: 3,
-        };
-        frame.render_widget(&description, rows.intersection(inside));
+        }
+        .intersection(inside);
+        if self.focus == Part::Description || !self.description.is_empty() {
+            let mut description = self.description.clone();
+            let cursor = if self.focus == Part::Description { Style::new().reversed() } else { Style::new() };
+            description.set_cursor_style(cursor);
+            description.set_placeholder_style(Style::new().fg(MUTED));
+            frame.render_widget(&description, rows);
+        } else {
+            frame.render_widget(Paragraph::new(muted("Optional. Enter adds a line.")), rows);
+        }
         let typing = match self.focus {
             Part::Title => Some((2, &self.title)),
             Part::Other => Some((self.parts().len() as u16 + 3, &self.other)),
@@ -603,4 +610,272 @@ fn description(text: &str) -> TextArea<'static> {
     area.set_placeholder_text("Optional. Enter adds a line.");
     area.set_cursor_line_style(ratatui::style::Style::new());
     area
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tui::app::Moment;
+    use crate::tui::app::tests::{NOW, ctrl, key, with_projects};
+    use std::time::Instant;
+
+    fn paths() -> Paths {
+        Paths::under("/r".as_ref())
+    }
+
+    fn press(form: &mut TaskForm, keys: &[KeyEvent]) -> Outcome {
+        let paths = paths();
+        let cx = Context { tz: &TimeZone::UTC, now: Moment { instant: Instant::now(), epoch: NOW }, paths: &paths };
+        keys.iter().fold(Outcome::Stay, |_, key| form.on_key(*key, &cx))
+    }
+
+    fn typed(text: &str) -> Vec<KeyEvent> {
+        text.chars().map(|c| key(KeyCode::Char(c))).collect()
+    }
+
+    fn new_form(projects: &[&str]) -> TaskForm {
+        let presets = vec![("1 hour", Until::Time(NOW + 3600)), ("Tomorrow morning", Until::Time(NOW + 86400))];
+        let projects = projects.iter().map(|p| p.to_string()).collect();
+        TaskForm::new_task("", projects, with_projects().saved(), presets, &paths())
+    }
+
+    fn edit_form(effect: Option<Effect>, follows: bool, broken: Option<&str>) -> TaskForm {
+        let snap = with_projects();
+        let mut task = snap.data.tasks["task-fix-login"].clone();
+        (task.projects, task.workspace_projects) = (vec!["p-api".into(), "p-web".into()], vec!["p-api".into()]);
+        let editing = Editing::with("task-fix-login".into(), &task, effect, follows, broken.map(Into::into));
+        TaskForm::edit(&task, snap.saved(), editing)
+    }
+
+    fn effects(form: &TaskForm) -> Vec<String> {
+        form.effects(&paths(), NOW, &TimeZone::UTC)
+            .into_iter()
+            .map(|(l, t, _)| format!("{l}{}{t}", if l.is_empty() { "" } else { " " }))
+            .collect()
+    }
+
+    fn saved_job(outcome: Outcome) -> Job {
+        match outcome {
+            Outcome::CloseAnd(Action::Run(job)) => job,
+            other => panic!("not saved: {other:?}"),
+        }
+    }
+
+    /// R1.1: Esc closes an empty form at once, and asks first once something was typed.
+    #[test]
+    fn r1_1_esc_asks_only_after_typing() {
+        let mut form = new_form(&[]);
+        assert!(matches!(press(&mut form, &[key(KeyCode::Esc)]), Outcome::Close));
+        press(&mut form, &typed("x"));
+        assert!(
+            matches!(press(&mut form, &[key(KeyCode::Esc)]), Outcome::Open(s) if matches!(*s, Screen::ConfirmDiscard))
+        );
+        assert!(matches!(form.returned(Action::Answer(true)), Outcome::Close), "y discards");
+        let mut edit = edit_form(Some(Effect::Running), false, None);
+        assert!(matches!(press(&mut edit, &[key(KeyCode::Esc)]), Outcome::Close));
+        edit.returned(Action::Picked(vec!["p-api".into()], None));
+        assert!(edit.typed(), "only the projects changed: still asks");
+    }
+
+    /// R1.1: Enter in the title creates with the defaults; Tab reaches the
+    /// description (Enter adds a line there), Ctrl+S saves from any field,
+    /// and a title is needed.
+    #[test]
+    fn r1_1_the_form_creates_from_any_field() {
+        let mut form = new_form(&[]);
+        let outcome = press(&mut form, &[key(KeyCode::Enter)]);
+        assert!(matches!(outcome, Outcome::Stay));
+        assert_eq!((form.error.as_deref(), form.focus), (Some("The task needs a title."), Part::Title));
+        press(&mut form, &typed("Plan launch"));
+        press(&mut form, &[ctrl('a'), key(KeyCode::Tab)]); // ctrl+a moves the cursor, it stays in the form
+        press(&mut form, &typed("one"));
+        press(&mut form, &[key(KeyCode::Enter)]);
+        press(&mut form, &typed("two"));
+        let job = saved_job(press(&mut form, &[ctrl('s')]));
+        let create = Job::Create {
+            title: "Plan launch".into(),
+            description: Some("one\ntwo".into()),
+            projects: vec![],
+            until: None,
+        };
+        assert_eq!(job, create);
+        let mut quick = new_form(&["p-api"]);
+        press(&mut quick, &typed("Quick"));
+        let job = saved_job(press(&mut quick, &[key(KeyCode::Enter)]));
+        assert!(matches!(job, Job::Create { projects, until: None, .. } if projects == ["p-api"]));
+    }
+
+    /// R1.1, R4.1: the snooze field: ←→ through the presets (time order, no
+    /// "until an agent" for a new task), typing a time on it, and what
+    /// does not read (or "agent") refused while it is on screen.
+    #[test]
+    fn r1_1_snooze_presets_and_a_time_typed() {
+        let mut form = new_form(&[]);
+        press(&mut form, &typed("Later"));
+        press(&mut form, &[key(KeyCode::Tab), key(KeyCode::Tab), key(KeyCode::Tab)]);
+        assert_eq!(form.focus, Part::Snooze);
+        press(&mut form, &[key(KeyCode::Right)]);
+        assert!(effects(&form).contains(&"Saved snoozed; the session starts when you open it".to_string()));
+        let job = saved_job(press(&mut form, &[ctrl('s')]));
+        assert!(matches!(job, Job::Create { until: Some(Until::Time(t)), .. } if t == NOW + 3600));
+
+        let mut form = new_form(&[]);
+        press(&mut form, &typed("Soon"));
+        press(&mut form, &[key(KeyCode::Tab), key(KeyCode::Tab), key(KeyCode::Tab)]);
+        press(&mut form, &typed("soonish")); // typing on the snooze is typing a time
+        assert_eq!((form.focus, form.other.value()), (Part::Other, "soonish"));
+        assert!(matches!(press(&mut form, &[key(KeyCode::Enter)]), Outcome::Stay));
+        assert_eq!(form.error.as_deref(), Some("cannot understand snooze time: soonish"));
+        form.other = Input::new("agent".into());
+        assert!(matches!(press(&mut form, &[key(KeyCode::Enter)]), Outcome::Stay));
+        assert_eq!(form.error.as_deref(), Some("a new task has no agents yet, so none could wake it; pick a time"));
+        assert_eq!(form.title.value(), "Soon", "nothing typed is lost");
+        form.other = Input::new("2h".into());
+        let job = saved_job(press(&mut form, &[key(KeyCode::Enter)]));
+        assert!(matches!(job, Job::Create { until: Some(Until::Time(t)), .. } if t == NOW + 7200));
+        assert!(form.presets.iter().all(|p| p.1 != Until::Agent));
+    }
+
+    /// R1.6: on the projects field Enter or Space opens the finder empty, a
+    /// key typed opens it with that key, and Backspace removes the last project.
+    #[test]
+    fn r1_6_the_project_field_opens_the_finder() {
+        let mut form = new_form(&["p-api", "p-web"]);
+        press(&mut form, &[key(KeyCode::Tab), key(KeyCode::Tab)]);
+        let finder = |outcome: Outcome| match outcome {
+            Outcome::Open(screen) => match *screen {
+                Screen::Finder(finder) => finder,
+                other => panic!("{other:?}"),
+            },
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(finder(press(&mut form, &[key(KeyCode::Char(' '))])).text(), "");
+        let opened = finder(press(&mut form, &[key(KeyCode::Char('b'))]));
+        assert_eq!((opened.text(), opened.chosen.clone()), ("b", vec!["p-api".to_string(), "p-web".to_string()]));
+        press(&mut form, &[key(KeyCode::Backspace)]);
+        assert_eq!(form.projects, ["p-api"]);
+        let added = project_named("new", Some("/r/home/new"));
+        form.returned(Action::Picked(vec!["p-api".into(), "p-new".into()], Some(("p-new".into(), added))));
+        assert_eq!(form.projects, ["p-api", "p-new"]);
+        assert_eq!(form.saved.folders.get(std::path::Path::new("/r/home/new")).map(String::as_str), Some("p-new"));
+    }
+
+    fn project_named(name: &str, path: Option<&str>) -> Project {
+        crate::tui::app::tests::project(name, path, NOW)
+    }
+
+    /// R1.2, R1.6: the form says where the session really starts: the first
+    /// project whose folder is there, a workspace each; what gets none and why.
+    #[test]
+    fn r1_6_the_new_task_form_says_where_it_starts() {
+        let lines = effects(&new_form(&["p-gone", "p-api"]));
+        assert_eq!(lines[0], "Starts in ~/code/api");
+        assert!(lines.contains(&"Missing, so no workspace: gone".to_string()), "{lines:?}");
+        let lines = effects(&new_form(&["p-x"]));
+        assert_eq!(lines[0], "Starts in ~");
+        assert!(lines.contains(&"No folder, so no workspace: Client X".to_string()), "{lines:?}");
+        let mut form = new_form(&["p-api", "p-web"]);
+        assert!(effects(&form).contains(&"Workspaces api · web".to_string()));
+        press(&mut form, &typed("Fix: the API"));
+        assert!(effects(&form).contains(&"Session   task-fix-the-api".to_string()));
+        assert_eq!(effects(&form).last().unwrap(), "Then switches you to it");
+        let cannot = form.cannot_switch(Some("this Herdr client was not started by `itm attach`".into()));
+        assert!(effects(&cannot).last().unwrap().starts_with("Saved without switching: this Herdr client"));
+    }
+
+    /// R5.4: the edit form says what a project added does to the session.
+    #[test]
+    fn r5_4_the_edit_form_says_what_a_new_project_does() {
+        let cases = [
+            (Some(Effect::Starts), "Its session will start with a workspace in ~/code/backend"),
+            (Some(Effect::Running), "A workspace opens in ~/code/backend, in its running session"),
+            (
+                Some(Effect::Stopped),
+                "Its stopped session keeps its workspaces; open one in ~/code/backend when you need it",
+            ),
+            (None, "Herdr did not answer, so it is unknown whether its session runs"),
+        ];
+        for (effect, said) in cases {
+            let mut form = edit_form(effect, false, None);
+            let mut projects = form.projects.clone();
+            projects.extend(["p-new".into(), "p-x".into(), "p-gone".into()]);
+            form.returned(Action::Picked(
+                projects,
+                Some(("p-new".into(), project_named("backend", Some("/r/home/code/backend")))),
+            ));
+            let lines = effects(&form);
+            assert_eq!(lines[0], "Session   task-fix-login");
+            assert!(lines.contains(&said.to_string()), "{effect:?}: {lines:?}");
+            assert!(lines.contains(&"Client X: no folder, so no workspace".to_string()), "{lines:?}");
+            assert!(lines.contains(&"~/code/gone missing, so no workspace opens there".to_string()), "{lines:?}");
+        }
+    }
+
+    /// R5.4: while projects follow workspaces and the daemon runs, a project
+    /// whose workspace is open in the running session cannot be removed
+    /// here; with that setting off it can. A broken settings file is said
+    /// and counts as off (R10.4).
+    #[test]
+    fn r5_4_a_project_with_an_open_workspace_stays() {
+        let mut form = edit_form(Some(Effect::Running), true, None);
+        form.returned(Action::Picked(vec!["p-web".into()], None));
+        assert!(
+            effects(&form).contains(&"api still has a workspace in this task; close it in Herdr first".to_string())
+        );
+        assert!(matches!(press(&mut form, &[ctrl('s')]), Outcome::Stay));
+        assert!(
+            form.error
+                .as_deref()
+                .unwrap()
+                .starts_with("api still has a workspace in this task; close it in Herdr first, or turn off")
+        );
+        let mut off = edit_form(Some(Effect::Running), false, None);
+        off.returned(Action::Picked(vec!["p-web".into()], None));
+        let job = saved_job(press(&mut off, &[ctrl('s')]));
+        assert!(matches!(job, Job::Edit { ref remove, .. } if remove == &["p-api"]), "{job:?}");
+        let mut broken = edit_form(Some(Effect::Running), false, Some("~/c.toml is not valid TOML: x"));
+        broken.returned(Action::Picked(vec!["p-web".into()], None));
+        let lines = effects(&broken);
+        assert!(lines.contains(
+            &"Settings ignored, projects do not follow workspaces: ~/c.toml is not valid TOML: x".to_string()
+        ));
+        assert!(!lines.iter().any(|l| l.contains("still has a workspace")), "off, as for the daemon");
+        let stopped = edit_form(Some(Effect::Stopped), true, Some("x"));
+        assert!(
+            stopped.editing.as_ref().unwrap().pinned.is_empty()
+                && stopped.editing.as_ref().unwrap().config_error.is_none()
+        );
+    }
+
+    /// R5.4: the edit saves the title, the description and the projects in
+    /// the form's order; unchanged projects send no order.
+    #[test]
+    fn r5_4_the_edit_keeps_the_order() {
+        let mut form = edit_form(Some(Effect::Running), false, None);
+        let job = saved_job(press(&mut form, &[ctrl('s')]));
+        assert!(
+            matches!(job, Job::Edit { ref order, ref add, ref remove, .. } if order.is_empty() && add.is_empty() && remove.is_empty())
+        );
+        form.returned(Action::Picked(vec!["p-web".into(), "p-api".into()], None));
+        form.title = Input::new("Fix login fast".into());
+        let job = saved_job(press(&mut form, &[ctrl('s')]));
+        let edit = Job::Edit {
+            session: "task-fix-login".into(),
+            title: "Fix login fast".into(),
+            description: "Users get logged out\nafter 5 min".into(),
+            add: vec![],
+            remove: vec![],
+            order: vec!["p-web".into(), "p-api".into()],
+        };
+        assert_eq!(job, edit);
+    }
+
+    /// Keys that edit text stay in the form: Home then Ctrl+K clears the title.
+    #[test]
+    fn line_editing_keys_stay_in_the_form() {
+        let mut form = new_form(&[]);
+        press(&mut form, &typed("abc"));
+        press(&mut form, &[key(KeyCode::Home), ctrl('k')]);
+        assert_eq!(form.title.value(), "");
+    }
 }

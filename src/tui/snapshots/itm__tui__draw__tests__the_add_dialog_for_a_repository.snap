@@ -1,0 +1,27 @@
+---
+source: src/tui/draw.rs
+assertion_line: 1143
+expression: screen(&mut app)
+---
+  Inbox 3   Snoozed 1   Archived 1   All 5                                                      ⚑ 1 needs you
+
+ › Search tasks · @project filters · or type a new title
+
+ NEEDS YOU                                                           │  Fix login
+ ⚑ Fix login ╭──────────────────────────────────────────────────────────────────────────────────╮
+ ACTIVE      │ Add project                                                                      │
+ ● Write docs│  Git repository   Local folder   Name only                                       │
+ ○ Old idea  │                                                                                  │
+             │ Source  https://github.com/acme/tool.git                                         │
+             │ Name    tool                                                                     │
+             │                                                                                  │
+             │ Clones to /r/data/inbox-task-manager/projects/github.com/acme/tool               │ writes
+             │ Esc stops the clone and removes what it copied.                                  │
+             │                                                                                  │
+             │ enter add  tab complete  ←→ kind (empty source)  esc back                        │
+             ╰──────────────────────────────────────────────────────────────────────────────────╯
+                                                                     │
+                                                                     │
+                                                                     │  enter open  ctrl+o notes
+
+ enter open  tab view  ^n new  ^e edit  ^z snooze  ^p projects  ? all keys

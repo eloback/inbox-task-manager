@@ -19,7 +19,7 @@ use tui_input::backend::crossterm::EventHandler;
 
 use super::app::{Action, Job, Reply};
 use super::completion::Folders;
-use super::draw::{ACCENT, Tone, WIDE, bold, dialog_box, field_line, key_hints, muted};
+use super::draw::{ACCENT, Tone, WIDE, bold, dialog_box, field_line, key_hints, muted, wrapped_rows};
 use super::screen::{Context, Field, Need, Outcome};
 use crate::error::Error;
 use crate::paths::Paths;
@@ -307,8 +307,9 @@ impl AddDialog {
     pub fn draw(&self, frame: &mut Frame, area: Rect, paths: &Paths) {
         let status = self.status(paths);
         let fields: u16 = if self.kind == ProjectKind::Name { 1 } else { 2 };
-        // The status wraps in a narrow popup: room for it twice over.
-        let inside = dialog_box(frame, area, WIDE, 3 + fields + 1 + 2 * status.len() as u16 + 2 + 2);
+        let width = area.width.min(WIDE).saturating_sub(4) as usize; // inside the border and margin
+        let rows: usize = status.iter().map(|(text, _)| wrapped_rows(&Line::from(text.as_str()), width)).sum();
+        let inside = dialog_box(frame, area, WIDE, 3 + fields + 1 + rows as u16 + 2 + 2);
         let mut tabs = vec![];
         for kind in KINDS {
             let label = match kind {

@@ -782,13 +782,17 @@ fn draw_snooze(frame: &mut Frame, dialog: &SnoozeDialog, area: Rect, tz: &TimeZo
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tui::app::tests::{NOW, app, ctrl, key, snapshot};
+    use crate::tui::app::tests::{NOW, app, ctrl, key, snapshot, with_projects};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::crossterm::event::KeyCode;
 
     fn screen(app: &mut App) -> String {
-        let mut terminal = Terminal::new(TestBackend::new(110, 22)).unwrap();
+        sized(app, 110, 22)
+    }
+
+    fn sized(app: &mut App, width: u16, height: u16) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal.draw(|frame| draw(frame, app, NOW)).unwrap();
         let buffer = terminal.backend().buffer();
         let rows = buffer.content.chunks(buffer.area.width as usize);
@@ -1032,5 +1036,195 @@ mod tests {
         let now = super::super::app::Moment { instant: std::time::Instant::now(), epoch: NOW };
         let mut app = App::new(View::Inbox, crate::paths::Paths::under("/r".as_ref()), TimeZone::UTC, now);
         assert!(screen(&mut app).contains("Loading…"));
+    }
+
+    fn typed(app: &mut App, text: &str) {
+        for c in text.chars() {
+            app.on_key(key(KeyCode::Char(c)));
+        }
+    }
+
+    fn top(app: &mut App) -> &mut Screen {
+        app.screens.last_mut().expect("a screen")
+    }
+
+    /// R1.1, R1.6: the New task form: what saving does under the fields, the
+    /// projects (a missing folder, a name only), the focused field's hint.
+    #[test]
+    fn the_new_task_form() {
+        let mut app = app(with_projects());
+        app.on_key(ctrl('n'));
+        typed(&mut app, "Plan launch");
+        app.on_key(key(KeyCode::Tab));
+        app.on_key(key(KeyCode::Tab));
+        let ids = ["p-api", "p-gone", "p-x"].map(String::from).to_vec();
+        if let Screen::Form(form) = top(&mut app) {
+            form.returned(crate::tui::app::Action::Picked(ids, None));
+        }
+        insta::assert_snapshot!(sized(&mut app, 100, 30));
+    }
+
+    /// R5.4: the edit form says what a project added does to the running session.
+    #[test]
+    fn the_edit_form() {
+        let mut app = app(with_projects());
+        app.on_key(ctrl('e'));
+        if let Screen::Form(form) = top(&mut app) {
+            form.returned(crate::tui::app::Action::Picked(vec!["p-api".into(), "p-web".into(), "p-x".into()], None));
+        }
+        insta::assert_snapshot!(sized(&mut app, 100, 30));
+    }
+
+    /// R1.6: many projects give way to the field's hint, counted as "+n".
+    #[test]
+    fn the_project_field_fits_many_projects_and_its_hint() {
+        let mut snap = with_projects();
+        let mut ids = vec![];
+        for n in 0..5 {
+            let id = format!("p-long-{n}");
+            let project = crate::tui::app::tests::project(&format!("project-with-a-long-name-{n}"), None, 1);
+            snap.data.projects.insert(id.clone(), project);
+            ids.push(id);
+        }
+        let mut app = app(snap);
+        app.on_key(ctrl('n'));
+        app.on_key(key(KeyCode::Tab));
+        app.on_key(key(KeyCode::Tab));
+        if let Screen::Form(form) = top(&mut app) {
+            form.returned(crate::tui::app::Action::Picked(ids, None));
+        }
+        let shown = sized(&mut app, 90, 30);
+        let field = shown.lines().find(|l| l.contains("Projects")).unwrap();
+        assert!(field.contains("enter or type to add · ⌫ removes the last"), "the hint is never cut off: {field}");
+        assert!(field.contains("+4") || field.contains("+3"), "the others are counted: {field}");
+        assert!(field.ends_with('│'), "the field stays in its box: {field}");
+    }
+
+    /// R1.6: the finder over the form, a search typed on the field.
+    #[test]
+    fn the_finder() {
+        let mut app = app(with_projects());
+        app.on_key(ctrl('n'));
+        app.on_key(key(KeyCode::Tab));
+        app.on_key(key(KeyCode::Tab));
+        typed(&mut app, "a");
+        insta::assert_snapshot!(sized(&mut app, 100, 26));
+    }
+
+    /// R1.6: folders while their parent is read, then listed, a saved one named.
+    #[test]
+    fn the_finder_with_folders() {
+        use crate::folders::Listing;
+        let mut app = app(with_projects());
+        app.on_key(ctrl('n'));
+        app.on_key(key(KeyCode::Tab));
+        app.on_key(key(KeyCode::Tab));
+        typed(&mut app, "~/code/");
+        while app.needs().is_some() {}
+        let reading = sized(&mut app, 100, 26);
+        assert!(reading.contains("Reading the folder…"), "{reading}");
+        let names = ["api", "web", "new"].map(String::from).to_vec();
+        let listing = Listing { real: "/r/home/code".into(), names, links: Default::default() };
+        app.listed("~/code/", &Some(listing));
+        insta::assert_snapshot!(sized(&mut app, 100, 26));
+    }
+
+    /// R8.3, R8.5: the add dialog's git kind once what was typed was checked.
+    #[test]
+    fn the_add_dialog_for_a_repository() {
+        use crate::projects::Check;
+        use crate::tui::add::AddDialog;
+        let mut app = app(snapshot());
+        let mut dialog =
+            AddDialog::new(ProjectKind::Git, "https://github.com/acme/tool.git", "", super::super::screen::Field::Name);
+        let folder = Some("/r/data/inbox-task-manager/projects/github.com/acme/tool".into());
+        let check = Check { folder, default_name: "tool".into(), problem: None };
+        dialog.check = Some((dialog.typed(), Ok(check)));
+        app.screens.push(Screen::AddProject(Box::new(dialog)));
+        insta::assert_snapshot!(screen(&mut app));
+    }
+
+    /// R8.8: a clone shows what git says; a failed one says why and how to go on.
+    #[test]
+    fn the_add_dialog_while_cloning_and_after_a_failure() {
+        use crate::tui::add::{AddDialog, Busy, Said};
+        let mut app = app(snapshot());
+        let mut dialog =
+            AddDialog::new(ProjectKind::Git, "https://github.com/acme/tool.git", "", super::super::screen::Field::Name);
+        dialog.busy = Some(Busy::Cloning { last: Some("Receiving objects:  50% (10/20)".into()), stopping: false });
+        app.screens.push(Screen::AddProject(Box::new(dialog.clone())));
+        insta::assert_snapshot!(screen(&mut app));
+        dialog.busy = None;
+        dialog.said = Some(Said::Failed(crate::projects::clone_failure(
+            "fatal: could not read Username\nitm: could not clone x\n",
+        )));
+        app.screens = vec![Screen::AddProject(Box::new(dialog))];
+        let shown = screen(&mut app);
+        assert!(shown.contains("could not clone x") && shown.contains("in a terminal"), "{shown}");
+    }
+
+    /// R8.3: the Projects screen, a name-only project highlighted.
+    #[test]
+    fn the_projects_screen() {
+        let mut app = app(with_projects());
+        app.on_key(ctrl('p'));
+        for _ in 0..4 {
+            app.on_key(key(KeyCode::Down));
+        }
+        if let Screen::Projects(screen) = top(&mut app) {
+            screen.message = Some(("Renamed api2 to api.".into(), false));
+        }
+        insta::assert_snapshot!(sized(&mut app, 110, 16));
+    }
+
+    #[test]
+    fn the_rename_dialog() {
+        let mut app = app(with_projects());
+        app.on_key(ctrl('p'));
+        app.on_key(ctrl('r'));
+        typed(&mut app, "2");
+        insta::assert_snapshot!(screen(&mut app));
+    }
+
+    /// UX principle 5: every key, scrolled in a short popup with the close hint kept.
+    #[test]
+    fn the_help() {
+        let mut app = app(snapshot());
+        app.on_key(key(KeyCode::Char('?')));
+        insta::assert_snapshot!(screen(&mut app));
+        for _ in 0..100 {
+            app.on_key(key(KeyCode::Down));
+        }
+        let end = screen(&mut app);
+        assert!(
+            end.contains("ctrl+d               remove") && end.contains("esc close"),
+            "scrolled to the end:\n{end}"
+        );
+        app.on_key(key(KeyCode::Up));
+        let up = screen(&mut app);
+        assert_ne!(up, end, "one ↑ moves at once from the end");
+    }
+
+    /// R1.1: Esc in a form with something typed in it asks first.
+    #[test]
+    fn the_discard_question() {
+        let mut app = app(snapshot());
+        app.on_key(ctrl('n'));
+        typed(&mut app, "x");
+        app.on_key(key(KeyCode::Esc));
+        insta::assert_snapshot!(sized(&mut app, 100, 26));
+    }
+
+    /// R6.2: a filter that names no project says so, and offers to create the task without one.
+    #[test]
+    fn an_unknown_project_filter() {
+        let mut app = app(with_projects());
+        typed(&mut app, "@nope Fix");
+        let shown = screen(&mut app);
+        assert!(shown.contains("No project named “nope”") && shown.contains("+ Create task “Fix”"), "{shown}");
+        assert!(!shown.contains("“Fix” in"), "{shown}");
+        app.search = tui_input::Input::default();
+        typed(&mut app, "@api Rate limits");
+        assert!(screen(&mut app).contains("+ Create task “Rate limits” in ◆ api"));
     }
 }

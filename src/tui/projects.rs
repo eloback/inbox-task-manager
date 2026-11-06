@@ -195,7 +195,12 @@ impl ProjectsScreen {
         let ids = self.ids();
         let items: Vec<ListItem> = match ids.is_empty() {
             true => vec![ListItem::new(muted("No projects yet. Ctrl+N adds a repository, a folder or a name."))],
-            false => ids.iter().map(|id| ListItem::new(Line::from(self.row(id, paths, now)))).collect(),
+            false => {
+                // One width for where they are, as wide as the longest end of a row lets it be.
+                let tail = ids.iter().map(|id| self.used(id, now).chars().count()).max().unwrap_or(0);
+                let room = (list.width as usize).saturating_sub(14 + 5 + 1 + tail).clamp(12, 45);
+                ids.iter().map(|id| ListItem::new(Line::from(self.row(id, paths, now, room)))).collect()
+            }
         };
         let at = self.selected.as_ref().and_then(|id| ids.iter().position(|i| i == id));
         let mut state = ListState::default().with_selected(at);
@@ -222,9 +227,8 @@ impl ProjectsScreen {
         ))
     }
 
-    /// Its name, kind, where it is, its tasks (how many are open) and when it was last used.
-    fn row(&self, id: &str, paths: &Paths, now: i64) -> Vec<Span<'static>> {
-        let project = &self.data.projects[id];
+    /// Its tasks (how many are open), when it was last used, and whether its folder is missing.
+    fn used(&self, id: &str, now: i64) -> String {
         let tasks: Vec<_> = self.data.tasks.values().filter(|t| t.projects.iter().any(|p| p == id)).collect();
         let open = tasks.iter().filter(|t| t.state != State::Archived).count();
         let plural = if tasks.len() == 1 { "" } else { "s" };
@@ -232,18 +236,26 @@ impl ProjectsScreen {
         if !tasks.is_empty() {
             count.push_str(&format!(" · {open} open"));
         }
+        let missing = if self.missing.contains(id) { " · folder missing" } else { "" };
+        format!("{count:<16} used {}{missing}", rel(self.data.projects[id].last_used_at, now))
+    }
+
+    /// Its name, kind, where it is in `room` columns (its end kept in a
+    /// narrow popup), its tasks and when it was last used, which is never cut.
+    fn row(&self, id: &str, paths: &Paths, now: i64, room: usize) -> Vec<Span<'static>> {
+        let project = &self.data.projects[id];
+        let used = self.used(id, now);
         let place = paths.place(project);
         let chars: Vec<char> = place.chars().collect();
-        let place = match chars.len() > 44 {
-            true => format!("…{}", chars[chars.len() - 43..].iter().collect::<String>()),
+        let place = match chars.len() >= room {
+            true => format!("…{}", chars[chars.len() + 2 - room..].iter().collect::<String>()),
             false => place,
         };
-        let missing = if self.missing.contains(id) { " · folder missing" } else { "" };
         let mut spans = name_badge(&project.name, 14, &[]);
         spans.extend([
             muted(format!("{:<4} ", project.kind().name())),
-            Span::raw(format!("{place:<45} ")),
-            muted(format!("{count:<16} used {}{missing}", rel(project.last_used_at, now))),
+            Span::raw(format!("{place:<room$} ")),
+            muted(used),
         ]);
         spans
     }
@@ -267,5 +279,109 @@ impl RenameDialog {
         let inside = wrapped_dialog(frame, area, WIDE, lines);
         let x = (inside.x + 10 + self.name.visual_cursor() as u16).min(inside.right().saturating_sub(1));
         frame.set_cursor_position((x, inside.y + 2));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::projects::RemovalPlan;
+    use crate::tui::app::Moment;
+    use crate::tui::app::tests::{NOW, ctrl, key, with_projects};
+    use jiff::tz::TimeZone;
+    use std::time::Instant;
+
+    fn cx_paths() -> Paths {
+        Paths::under("/r".as_ref())
+    }
+
+    fn with_cx<T>(f: impl FnOnce(&Context) -> T) -> T {
+        let paths = cx_paths();
+        f(&Context { tz: &TimeZone::UTC, now: Moment { instant: Instant::now(), epoch: NOW }, paths: &paths })
+    }
+
+    /// R8.3, after Python's test_projects_rename_remove_and_filter: a
+    /// project a task has cannot be removed (nothing to choose); a rename
+    /// to a name taken in any case waits; Enter shows the project's tasks.
+    #[test]
+    fn r8_3_rename_remove_and_show_its_tasks() {
+        let mut screen = ProjectsScreen::new(&with_projects());
+        assert_eq!(screen.selected.as_deref(), Some("p-api"), "the most recently used first");
+        let plan = Job::RemovalPlan { id: "p-api".into() };
+        assert!(matches!(screen.on_key(ctrl('d')), Outcome::Act(Action::Run(ref job)) if *job == plan));
+        let users = RemovalPlan {
+            id: "p-api".into(),
+            project: screen.data.projects["p-api"].clone(),
+            users: vec!["Fix login".into()],
+            clone: None,
+        };
+        let opened = with_cx(|cx| screen.done(&plan, Ok(Reply::Plan(users)), cx));
+        let Outcome::Open(dialog) = opened else { panic!("{opened:?}") };
+        assert!(
+            matches!(&*dialog, Screen::RemoveProject(d) if d.choices.is_empty()),
+            "nothing to choose while a task has it"
+        );
+
+        let Outcome::Open(rename) = screen.on_key(ctrl('r')) else { panic!("no rename dialog") };
+        let Screen::Rename(mut rename) = *rename else { panic!() };
+        let typed = |dialog: &mut RenameDialog, keys: Vec<KeyEvent>| {
+            keys.into_iter().fold(Outcome::Stay, |_, k| with_cx(|cx| dialog.on_key(k, cx)))
+        };
+        let clear: Vec<KeyEvent> = (0..3).map(|_| key(KeyCode::Backspace)).collect();
+        typed(&mut rename, clear.clone());
+        typed(&mut rename, "WEB".chars().map(|c| key(KeyCode::Char(c))).collect());
+        assert!(
+            rename.problem.as_deref().unwrap().starts_with("project already exists: web (~/code/web)"),
+            "taken, any case"
+        );
+        assert!(matches!(typed(&mut rename, vec![key(KeyCode::Enter)]), Outcome::Stay));
+        typed(&mut rename, clear);
+        typed(&mut rename, "backend2".chars().map(|c| key(KeyCode::Char(c))).collect());
+        let Outcome::CloseAnd(action) = typed(&mut rename, vec![key(KeyCode::Enter)]) else { panic!() };
+        let job = Job::RenameProject { id: "p-api".into(), name: "backend2".into() };
+        assert_eq!(action, Action::Run(job.clone()));
+        assert!(matches!(screen.returned(action), Outcome::Act(Action::Run(_))), "the switcher runs it");
+        with_cx(|cx| screen.done(&job, Ok(Reply::Renamed("api".into(), "backend2".into(), None)), cx));
+        assert_eq!(screen.message, Some(("Renamed api to backend2.".into(), false)));
+        assert!(matches!(screen.on_key(key(KeyCode::Enter)), Outcome::CloseAnd(Action::Filter(name)) if name == "api"));
+    }
+
+    /// R8.3: the list follows each refresh, keeping the highlighted project;
+    /// ↑↓ and Ctrl+J/K move; a name only says how to give it a folder, and
+    /// that goes with it; an added project is said and highlighted.
+    #[test]
+    fn r8_3_the_list_follows_refreshes() {
+        let mut snap = with_projects();
+        let mut screen = ProjectsScreen::new(&snap);
+        screen.on_key(ctrl('j'));
+        screen.on_key(key(KeyCode::Down));
+        screen.on_key(ctrl('k'));
+        assert_eq!(screen.selected.as_deref(), Some("p-web"));
+        screen.reread(&snap);
+        assert_eq!(screen.selected.as_deref(), Some("p-web"));
+        screen.selected = Some("p-x".into());
+        assert!(screen.hint().unwrap().starts_with(
+            "Client X has no folder: press prefix+shift+a in its workspace, or run itm project set 'Client X' --dir"
+        ));
+        snap.data.projects.remove("p-x");
+        screen.reread(&snap);
+        assert_eq!(
+            (screen.selected.as_deref(), screen.hint()),
+            (Some("p-api"), None),
+            "gone: the first one, and its hint went"
+        );
+        let added = crate::tui::app::tests::project("tool", Some("/r/data/projects/x/tool"), NOW);
+        screen.returned(Action::ProjectAdded("p-tool".into(), added));
+        assert_eq!(
+            (screen.selected.as_deref(), screen.message.clone()),
+            (Some("p-tool"), Some(("Project added.".into(), false)))
+        );
+        let removed =
+            Job::RemoveProject { id: "p-web".into(), name: "web".into(), choice: crate::projects::CloneChoice::Keep };
+        let notes = vec![RemovalNote::Done("project web removed".into()), RemovalNote::Kept("kept ~/x: y".into())];
+        with_cx(|cx| screen.done(&removed, Ok(Reply::Removed(notes)), cx));
+        assert_eq!(screen.message, Some(("project web removed · kept ~/x: y".into(), false)));
+        with_cx(|cx| screen.done(&removed, Err(Error::Other("no".into())), cx));
+        assert_eq!(screen.message, Some(("no".into(), true)));
     }
 }
