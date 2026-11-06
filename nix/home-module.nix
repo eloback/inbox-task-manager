@@ -1,6 +1,6 @@
-# home-manager module: installs itm and runs its daemon as a user service
-# (systemd on Linux, launchd on macOS). Herdr's key bindings stay in your own
-# Herdr config; README.md lists them.
+# home-manager module: installs itm and runs its daemon as a systemd user
+# service. Herdr's key bindings stay in your own Herdr config; README.md
+# lists them.
 self:
 {
   config,
@@ -21,7 +21,6 @@ let
       "${config.home.profileDirectory}/bin"
       "/etc/profiles/per-user/${config.home.username}/bin"
       "/run/current-system/sw/bin"
-      "/opt/homebrew/bin"
       "/usr/local/bin"
       "/usr/bin"
       "/bin"
@@ -57,7 +56,7 @@ in
     lib.mkMerge [
       { home.packages = [ cfg.package ]; }
 
-      (lib.mkIf (cfg.daemon.enable && pkgs.stdenv.hostPlatform.isLinux) {
+      (lib.mkIf cfg.daemon.enable {
         systemd.user.services.inbox-task-manager = {
           Unit = {
             Description = "inbox-task-manager agent notifications and snooze timers";
@@ -71,23 +70,6 @@ in
             RestartSec = 5;
           };
           Install.WantedBy = [ "default.target" ];
-        };
-      })
-
-      (lib.mkIf (cfg.daemon.enable && pkgs.stdenv.hostPlatform.isDarwin) {
-        launchd.agents.inbox-task-manager = {
-          enable = true;
-          config = {
-            ProgramArguments = [
-              exe
-              "daemon"
-            ];
-            RunAtLoad = true;
-            KeepAlive.SuccessfulExit = false;
-            ProcessType = "Background";
-            StandardErrorPath = "${config.home.homeDirectory}/Library/Logs/inbox-task-manager.log";
-            EnvironmentVariables = daemonEnvironment;
-          };
         };
       })
     ]

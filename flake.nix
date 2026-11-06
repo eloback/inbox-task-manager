@@ -7,12 +7,10 @@
   outputs =
     { self, nixpkgs }:
     let
-      # nixpkgs 26.11 dropped x86_64-darwin; the overlay and the home-manager
-      # module still build itm there from your own nixpkgs.
+      # itm runs on Linux (NixOS included); DESIGN.md section 4.
       systems = [
         "x86_64-linux"
         "aarch64-linux"
-        "aarch64-darwin"
       ];
       forAllSystems = f: nixpkgs.lib.genAttrs systems (system: f nixpkgs.legacyPackages.${system});
     in

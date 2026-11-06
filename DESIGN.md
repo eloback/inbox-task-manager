@@ -17,7 +17,7 @@ Herdr upgrade.
   socket. `HERDR_SESSION` does not override an inherited `HERDR_SOCKET_PATH`.
 - **Session discovery.** No socket method lists sessions: `herdr session
   list` reads `<config>/herdr/sessions/` (`<config>` is `$XDG_CONFIG_HOME`,
-  else `~/.config`, on macOS too), whose folder names are 1–64 bytes of
+  else `~/.config`), whose folder names are 1–64 bytes of
   `[A-Za-z0-9._-]` (not `.`, `..` or `default`), adds the default session
   (`<config>/herdr/herdr.sock`), and calls a session running when a
   connect to its `herdr.sock` succeeds. itm does the same (`Herdr::sessions`).
@@ -145,7 +145,7 @@ Herdr upgrade.
   private `/tmp/inbox-task-manager-<uid>`. The daemon (started by a service
   manager) and every client (started from a shell) must find the same
   folder, so the fallbacks do not depend on the environment: not `$TMPDIR`,
-  which differs between a macOS login and a launchd agent. The `/tmp` folder
+  which a service manager may set differently from a login. The `/tmp` folder
   is created `0700` and refused when someone else owns it or it is a link.
 
 ### Switching protocol
@@ -169,11 +169,10 @@ Herdr upgrade.
   session.)
 - Validate a marker by its process's command line, since pids are reused.
   A marker whose process is alive but whose command line cannot be read
-  (`ps` failed) is neither a client nor stale: it is skipped, not deleted.
-  Retry finding the attach child briefly, because the loop may be between
-  two attaches. The process table comes from `system.rs` (`process_table`):
-  `/proc` on Linux, `ps -ww` elsewhere. `ps` joins the arguments with spaces, so there a
-  `herdr` path containing a space is not recognized as an attach child.
+  (`/proc` refused it) is neither a client nor stale: it is skipped, not
+  deleted. Retry finding the attach child briefly, because the loop may be
+  between two attaches. The process table comes from `/proc`
+  (`system::process_table`).
 - Snoozing, archiving or deleting a task moves every itm client on it to the
   next task: one with waiting agents first, then the most recently used, else
   `default`.
@@ -497,10 +496,9 @@ Herdr upgrade.
 - Herdr's own toasts cover the attached session; the daemon notifies only for
   other sessions. Delivery order: Herdr toast in an attached session, else a
   desktop notification (`system::notify_command`): `$ITM_NOTIFY_COMMAND` with
-  the title and body as arguments, else `osascript` on macOS (the text goes
-  in as arguments, never into the script), else `notify-send`. Only
-  `notify-send` offers the Open action. With none of them the daemon logs
-  the notification and carries on.
+  the title and body as arguments, else `notify-send`, which also offers
+  the Open action. With neither the daemon logs the notification and
+  carries on.
 - A blocked agent in a snoozed task notifies and wakes the task.
 
 ## 3. UX principles
@@ -578,6 +576,8 @@ The switcher and its dialogs follow these principles.
   whole name; the CLI's `--project` takes a name or id, not a fuzzy query.
 
 ### 2026-11-05: portability beyond Linux
+- **Superseded** by "2026-11-06: Linux only" (the end of this section);
+  kept for its history. The snooze phrases itm reads itself stay.
 - **Why.** itm first assumed Linux and Nix: `/proc`, `notify-send`, GNU
   `date -d`, `bash`, and a Nix wrapper that put every tool on `PATH`.
 - **`system.rs`** (in the Python itm, `system.py`) holds what differs
@@ -702,18 +702,10 @@ The switcher and its dialogs follow these principles.
   does not take a connection in time counts as running (stuck), so its
   requests time out instead of it looking stopped, which would wake tasks
   snoozed until an agent asks. Linux refuses a connection to a full backlog
-  with EAGAIN; macOS and the BSDs refuse it with ECONNREFUSED, as they
-  refuse a socket nobody listens on. There itm asks the session's other
-  socket, `herdr-client.sock` (`refused_by_a_live_server`): a stuck server
-  still listens on it, while a session that stopped removed both sockets,
-  and one whose server crashed left both with nothing listening (checked
-  against Herdr 0.9.3 on Linux; the macOS path has its unit tests but has
-  not run on macOS yet). Each check queues a connection the stuck server
-  never takes, so a process remembers a session found running that way
-  for a minute (`LiveRefusers`): with a check a minute from each itm that
-  runs (the daemon, an open switcher) and one per CLI command, the client
-  socket's backlog (128 on macOS) lasts an hour or more of a hang, after
-  which the session looks stopped, as it does to `herdr session list`.
+  with EAGAIN, which is retried until the connect timeout; a refusal
+  (ECONNREFUSED) means nothing listens: a session that stopped removes its
+  sockets, and one whose server crashed leaves them with nothing listening
+  (checked against Herdr 0.9.3).
 - **Stopping a session** is a `server.stop` request, not a detached
   `/bin/sh herdr session stop`: Herdr answers before it shuts down, so the
   caller may run inside the session it stops (archiving the current task).
@@ -936,17 +928,11 @@ The switcher and its dialogs follow these principles.
     again in full; nothing reads keys meanwhile, and no lock is held. The
     preview's notes are read by the load worker with the rest of the
     snapshot, so drawing stays pure.
-- **Other systems.** `system.rs` keeps `system.py`'s split: the process
-  table from `/proc`, else `ps -ww` with one `-o` per column (bounded by a
-  5 s timeout), notifications through `osascript` on macOS (title and
-  body as arguments, no Open action), else `notify-send`, and the snooze
-  phrases itm does not read itself through `gdate`, else `date`, whichever
-  reads a relative phrase (`date_reads`, as `gnu_date` probes). Which one is
-  chosen at run time, not at compile time, so the `ps` reader and the
-  macOS notifier are built and tested on Linux too (captured macOS and
-  FreeBSD `ps` output, and Linux's own `ps`). The non-blocking socket
-  needs a macOS variant (no `SOCK_NONBLOCK` there); it was compiled on
-  Linux by swapping the `cfg`, but no Rust build has run on macOS yet.
+- **The system.** `system.rs` holds what itm needs from Linux: the process
+  table from `/proc`, notifications through `notify-send`, and the snooze
+  phrases itm does not read itself through `date` when it reads a relative
+  phrase (`date_reads`; BusyBox's does not). Linux only since 2026-11-06
+  (the end of this section).
 - **Layout.** One crate, binary `itm` (the process-name rule): `cli.rs`
   (arguments and output), `itm.rs` (the `Itm` context: folders, Herdr, the
   process table and the time zone of one run, and the task operations the
@@ -1027,10 +1013,25 @@ The switcher and its dialogs follow these principles.
   colors); the Settings screen edits dotted keys and inline tables;
   errors from the system read as Rust words them; the form's snooze is a
   field, not a drop-down; no mouse.
-- **Not done.** No macOS build has linked or run (CI's macOS job is
-  written; the code type-checks for macOS and FreeBSD, section 6), the
-  BSDs are untested, and the oldest Rust it claims (1.89) is checked only
-  by CI.
+- **Not done.** The oldest Rust it claims (1.89) is checked only by CI.
+
+### 2026-11-06: Linux only
+- **Why.** The user runs itm on Linux and NixOS only. The first macOS CI
+  run failed in 25 tests (most of them test fixtures under `/tmp`, a link
+  to `/private/tmp` there; one reading ignored signals from `ps`), and
+  keeping macOS and the BSDs working would mean a second process table,
+  a second notifier, a second service manager and socket behavior of their
+  own, all tested only in CI.
+- **Removed.** The `ps` process table and its parsing, `osascript`
+  notifications, the `gdate` lookup, the macOS check of a refusing session
+  (`refused_by_a_live_server`: macOS refuses a full backlog with
+  ECONNREFUSED), the macOS socket variant, the launchd agent (contrib and
+  the home-manager module), the flake's `aarch64-darwin` outputs and CI's
+  macOS job. `nix/package.nix` lists `lib.platforms.linux`.
+- **Kept.** `/proc`, `notify-send` and GNU `date`; NixOS works as any Linux
+  (the home-manager module's `PATH` includes `/run/current-system/sw/bin`).
+  Supporting another system again means bringing those pieces back: they
+  are in the history before this commit.
 
 ## 5. Known gaps
 
@@ -1055,14 +1056,6 @@ The switcher and its dialogs follow these principles.
 - **Settings files** are rewritten with LF line endings.
 - **Alt+3…9.** Alt+1, Alt+2 and Alt+5 were sent to a Herdr popup; the others
   are assumed to arrive the same way.
-- **Ignored signals on macOS and the BSDs** come from `ps -o sigignore=`,
-  which was run on Linux's `ps` only.
-- **macOS and the BSDs.** The `ps` paths and `osascript` are covered by
-  unit tests run on Linux, not by end-to-end runs with Herdr. itm
-  type-checks and passes clippy for `aarch64-apple-darwin` and
-  `x86_64-unknown-freebsd` (section 6), but it has not been linked or run
-  on either: CI's macOS job (build and tests) and the launchd agent are
-  written and have not run yet. The BSDs are untested.
 - **The Rust switcher's loop** wakes every 100 ms while a clone runs, to look
   for signals, and redraws each time; while a worker runs it looks at the
   results every 10 ms. Neither is measurable in the daemon's or the
@@ -1080,42 +1073,32 @@ The switcher and its dialogs follow these principles.
   it has seen.
 - **`Error::Other`** carries every error callers do not tell apart, as a
   sentence; matching on its text would be a bug.
-- **Open action on macOS.** `osascript` notifications cannot run an action,
-  so the Open action exists only with `notify-send`.
-- **Socket path length on macOS.** Herdr puts a session's sockets in
+- **Socket path length.** Herdr puts a session's sockets in
   `<config>/herdr/sessions/<name>/` (longest: `herdr-client.sock`), and
-  macOS allows 104 bytes (Linux 108). Session names reach 46 characters
-  (`task-` plus a 40-character slug plus a suffix), so a long title with a
-  home folder longer than about `/Users/` plus 8 characters can make attach
-  hang (section 1). Shorter session names, or a budget computed from the
-  config folder, would fix it.
+  Linux allows 108 bytes. Session names reach 46 characters (`task-` plus a
+  40-character slug plus a suffix), so a very deep `XDG_CONFIG_HOME` can
+  make attach hang (section 1). Shorter session names, or a budget computed
+  from the config folder, would fix it.
 
 ## 6. Testing
 
 - Tests: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`
   and `cargo test` must pass at every commit (`nix develop` has the
   toolchain; `nix flake check` runs all three in Nix's build sandbox, and
-  CI on Linux and macOS, section 7). Unit tests sit at the end of each
+  CI, section 7). Unit tests sit at the end of each
   module (`#[cfg(test)] mod tests`) and need no Herdr: a fake session is a
   unix socket answering canned JSON (`herdr::fake`), the process table a
   `FakeProcs`, the folders a temporary root (`Itm::under`: every folder of
   itm's under it, the settings too, so no test reads or writes the real
   `config.toml`). Tests never change the test process's environment
-  (tests run in parallel threads): what varies is injected. Both
-  process-table readers run where they exist (`/proc`, and `ps` when it
-  takes BSD-style options). Screens are drawn on ratatui's `TestBackend`,
+  (tests run in parallel threads): what varies is injected. The `/proc`
+  reader runs against real processes. Fixtures make their folders in the
+  resolved `/tmp`, as itm stores resolved folders. Screens are drawn on ratatui's `TestBackend`,
   some pinned as insta snapshots in `src/tui/snapshots/` (`INSTA_UPDATE=always
   cargo test` rewrites them after an intended change; review the diff). A
   test that pins a requirement names it (`R4.1` in its name or a comment).
   The Python itm's tests (`tests/*.py` until the cutover) were the most
   precise spec; their cases were ported as Rust tests (`PARITY.md`).
-- Other systems are type-checked on Linux, every `cfg` path compiled
-  without linking or running, with the standard library built for the
-  target from nixpkgs' `rustPlatform.rustLibSrc` (the variable is cargo's
-  own, for its tests):
-  `RUSTC_BOOTSTRAP=1 __CARGO_TESTS_ONLY_SRC_ROOT=<rust-lib-src> cargo clippy
-  --target aarch64-apple-darwin -Zbuild-std=std,panic_abort --all-targets
-  -- -D warnings` (and `x86_64-unknown-freebsd`).
 - Manual end-to-end checks run in a sandbox, never against real sessions:
   - separate `XDG_CONFIG_HOME` (short path: symlink it under
     `$XDG_RUNTIME_DIR`, see the socket path limit), `XDG_STATE_HOME` and
@@ -1192,31 +1175,30 @@ The switcher and its dialogs follow these principles.
   itself. Without it they run the running binary.
 - The Nix package (`nix/package.nix`, `rustPlatform.buildRustPackage` with
   `cargoLock.lockFile`, so there is no vendor hash to update) runs `cargo
-  test` in its check phase, with git and `ps` as check inputs, and wraps
-  `itm` (`wrapProgram`, which keeps argv[0], `…/bin/itm`, for the
-  process-name rule) with git, `gdate` (coreutils-prefixed) and, on Linux,
-  `notify-send` first on `PATH`. Herdr goes last (`--suffix`): the client
+  test` in its check phase, with git as a check input, and wraps `itm`
+  (`wrapProgram`, which keeps argv[0], `…/bin/itm`, for the process-name
+  rule) with git, GNU `date` (coreutils) and `notify-send` first on
+  `PATH`. Herdr goes last (`--suffix`): the client
   must match the server's version, so a `herdr` the user already runs
   wins, and the bundled one serves services started without the user's
   `PATH`. `herdr = null` leaves it out.
 - The flake has `packages` (the default is the package), `overlays.default`,
   `homeModules.default` (`nix/home-module.nix`: the package and the daemon
-  as a systemd or launchd user service, running `lib.getExe`, which is
+  as a systemd user service, running `lib.getExe`, which is
   `bin/itm`), `checks` (the package, so its tests; clippy with warnings
   denied, on the same sources and crates; rustfmt), a `devShells.default`
   with cargo, rustc, clippy and rustfmt and what the end-to-end scripts
   drive (git, tmux, socat, python3, herdr), and `formatter` (nixfmt).
 - The flake follows nixos-unstable, where Herdr is packaged (its lock of
-  2026-11-06 has Rust 1.99 and Herdr 0.9.5). It lists no x86_64-darwin,
-  which nixpkgs 26.11 dropped; there the overlay and the module's default
-  package (`callPackage` with the user's nixpkgs) still work. A
+  2026-11-06 has Rust 1.99 and Herdr 0.9.5), for x86_64-linux and
+  aarch64-linux. A
   configuration that installs Herdr from another nixpkgs should make the
   flake's `nixpkgs` input follow that one, so both use the same Herdr.
 - CI (`.github/workflows/ci.yml`): `cargo fmt --check`, `cargo clippy
   --all-targets -- -D warnings` and `cargo test` with Rust 1.95.0 (the
   toolchain the crate is developed and checked with, pinned by
-  `dtolnay/rust-toolchain@1.95.0`) on Linux and macOS, and `nix build` and
-  `nix flake check` on Linux.
+  `dtolnay/rust-toolchain@1.95.0`), `cargo check` with the `rust-version`
+  (1.89), and `nix build` and `nix flake check`, all on Linux.
 - New files need `git add` (`-N` is enough) before a flake build can see them.
 - The source fileset is `Cargo.toml`, `Cargo.lock`, `rustfmt.toml`, `src/`
   and the `.rs` files of `tests/`.

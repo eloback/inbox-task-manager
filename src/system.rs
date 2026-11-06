@@ -1,11 +1,7 @@
-//! What differs between operating systems, and what itm needs from them:
-//! the process table (to validate attach-loop markers and find their `herdr
-//! session attach` children), signals, programs on `PATH`, sessions of
-//! their own, the desktop notification command, and a `date` that reads
-//! snooze phrases. Linux reads the
-//! process table from `/proc`; macOS and the BSDs ask `ps` (DESIGN.md
-//! section 4, portability). Which one is a run-time choice, so both are
-//! built and tested everywhere.
+//! What itm needs from the system (Linux): the process table (to validate
+//! attach-loop markers and find their `herdr session attach` children) from
+//! `/proc`, signals, programs on `PATH`, sessions of their own, the desktop
+//! notification command, and a `date` that reads snooze phrases.
 
 use std::env;
 use std::ffi::OsStr;
@@ -39,12 +35,12 @@ pub trait Processes: Send + Sync {
     fn terminate(&self, pid: u32);
 }
 
-/// This system's process table: `/proc` where there is one, else `ps`.
+/// This system's process table.
 pub fn process_table() -> Box<dyn Processes> {
-    if fs::metadata("/proc/self/cmdline").is_ok() { Box::new(Proc) } else { Box::new(Ps) }
+    Box::new(Proc)
 }
 
-/// The process table from `/proc` (Linux).
+/// The process table from `/proc`.
 pub struct Proc;
 
 impl Processes for Proc {
@@ -72,65 +68,6 @@ impl Processes for Proc {
     fn terminate(&self, pid: u32) {
         terminate(pid)
     }
-}
-
-/// The process table from `ps -ww` (macOS, the BSDs). `ps` joins a command
-/// line's arguments with spaces, so an argument containing a space comes
-/// back as several: a `herdr` whose path has a space is not recognized as
-/// an attach child there.
-pub struct Ps;
-
-/// How long `ps` may take.
-const PS_TIMEOUT: Duration = Duration::from_secs(5);
-
-impl Ps {
-    /// What `ps -ww <args>` printed, when it succeeded.
-    fn run(args: &[&str]) -> Option<String> {
-        match output_within(Command::new("ps").arg("-ww").args(args), PS_TIMEOUT) {
-            Ok(Some((status, text))) if status.success() => Some(text),
-            _ => None,
-        }
-    }
-}
-
-impl Processes for Ps {
-    fn argv(&self, pid: u32) -> Option<Vec<String>> {
-        ps_command(&Ps::run(&["-o", "command=", "-p", &pid.to_string()])?)
-    }
-
-    fn alive(&self, pid: u32) -> bool {
-        alive(pid)
-    }
-
-    fn children(&self, parent: u32) -> Vec<(u32, Vec<String>)> {
-        // One -o per column: FreeBSD reads everything after the first "=" of a list as its header.
-        Ps::run(&["-A", "-o", "pid=", "-o", "ppid=", "-o", "command="])
-            .map_or(vec![], |table| ps_children(&table, parent))
-    }
-
-    fn terminate(&self, pid: u32) {
-        terminate(pid)
-    }
-}
-
-/// The command line `ps -o command= -p <pid>` printed; None for nothing.
-fn ps_command(output: &str) -> Option<Vec<String>> {
-    let argv: Vec<String> = output.split_whitespace().map(str::to_string).collect();
-    (!argv.is_empty()).then_some(argv)
-}
-
-/// (pid, command line) of each child of `parent` in `ps -A -o pid= -o ppid= -o command=` output.
-fn ps_children(table: &str, parent: u32) -> Vec<(u32, Vec<String>)> {
-    table
-        .lines()
-        .filter_map(|line| {
-            let mut fields = line.split_whitespace();
-            let pid = fields.next()?.parse().ok()?;
-            let ppid: u32 = fields.next()?.parse().ok()?;
-            let argv: Vec<String> = fields.map(str::to_string).collect();
-            (ppid == parent && !argv.is_empty()).then_some((pid, argv))
-        })
-        .collect()
 }
 
 /// Whether `pid` runs; someone else's process counts (EPERM).
@@ -163,20 +100,15 @@ pub fn stop_child(child: &mut Child, patience: Duration) -> io::Result<ExitStatu
 }
 
 /// The signals this process ignores, a bit each (SIGHUP is bit 0), as
-/// `nohup` or a parent left them: from `/proc` on Linux, else from `ps`.
-/// None when neither says.
+/// `nohup` or a parent left them, from `/proc`. None when it does not say.
 pub fn ignored_signals() -> Option<u64> {
-    match fs::read_to_string("/proc/self/status") {
-        Ok(status) => status.lines().find_map(|l| l.strip_prefix("SigIgn:")).and_then(signal_mask),
-        Err(_) => {
-            Ps::run(&["-o", "sigignore=", "-p", &std::process::id().to_string()]).as_deref().and_then(signal_mask)
-        }
-    }
+    let status = fs::read_to_string("/proc/self/status").ok()?;
+    status.lines().find_map(|l| l.strip_prefix("SigIgn:")).and_then(signal_mask)
 }
 
-/// A mask of signals as `/proc` and `ps -o sigignore=` print it, in hex.
+/// A mask of signals as `/proc` prints it, in hex.
 fn signal_mask(text: &str) -> Option<u64> {
-    u64::from_str_radix(text.trim().trim_start_matches("0x"), 16).ok()
+    u64::from_str_radix(text.trim(), 16).ok()
 }
 
 /// SIGHUP (a popup closed), SIGTERM (a cancel) and SIGINT, caught from
@@ -335,11 +267,10 @@ pub fn which(program: &str) -> Option<PathBuf> {
 }
 
 /// The epoch second `date -d` reads `phrase` as (`next week`, `+3 days`;
-/// R4.1), with a `date` that reads relative phrases: GNU's (`gdate` on
-/// macOS, where `date` is BSD's) or uutils'. None when there is no such
-/// `date`, or it does not read `phrase`.
+/// R4.1), when `date` reads relative phrases (GNU's or uutils'; BusyBox's
+/// does not). None when it does not read `phrase`.
 pub fn date_reads(phrase: &str) -> Option<i64> {
-    let date = ["gdate", "date"].into_iter().filter_map(which).find(|date| reads_relative(date))?;
+    let date = which("date").filter(|date| reads_relative(date))?;
     date_epoch(&date, &["-d", phrase, "+%s"])
 }
 
@@ -349,18 +280,19 @@ fn reads_relative(date: &Path) -> bool {
     date_epoch(date, &["-u", "-d", "1970-01-01 +1 day", "+%s"]) == Some(86400)
 }
 
+/// How long `date` may take.
+const DATE_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// The epoch second `date <args>` printed.
 fn date_epoch(date: &Path, args: &[&str]) -> Option<i64> {
-    match output_within(Command::new(date).args(args), PS_TIMEOUT) {
+    match output_within(Command::new(date).args(args), DATE_TIMEOUT) {
         Ok(Some((status, text))) if status.success() => text.trim().parse().ok(),
         _ => None,
     }
 }
 
 /// How to show a desktop notification: `$ITM_NOTIFY_COMMAND` (split like a
-/// shell would) with the title and body as arguments, else `osascript` on
-/// macOS (the text goes in as arguments, never into the script), else
-/// `notify-send`. `open` asks `notify-send` for an Open action; it then
+/// shell would) with the title and body as arguments, else `notify-send`. `open` asks `notify-send` for an Open action; it then
 /// waits until the notification closes and prints `open` when it was
 /// chosen (R3.3). None when this system has no way to notify.
 #[derive(Debug, PartialEq)]
@@ -370,18 +302,14 @@ pub struct NotifyCommand {
 }
 
 pub fn notify_command(custom: Option<&str>, title: &str, body: &str, open: bool) -> Result<Option<NotifyCommand>> {
-    let here = Notifiers { macos: env::consts::OS == "macos", have: &|program| which(program).is_some() };
+    let here = Notifiers { have: &|program| which(program).is_some() };
     here.command(custom, title, body, open)
 }
 
 /// What this system offers to notify with.
 struct Notifiers<'a> {
-    macos: bool,
     have: &'a dyn Fn(&str) -> bool,
 }
-
-/// Shows its second argument as a notification titled with its first.
-const OSASCRIPT: &str = "on run argv\ndisplay notification (item 2 of argv) with title (item 1 of argv)\nend run";
 
 impl Notifiers<'_> {
     fn command(&self, custom: Option<&str>, title: &str, body: &str, open: bool) -> Result<Option<NotifyCommand>> {
@@ -389,10 +317,6 @@ impl Notifiers<'_> {
             let Some(mut argv) = shlex::split(custom) else { bail!("cannot read $ITM_NOTIFY_COMMAND: {custom}") };
             argv.extend([title.into(), body.into()]);
             return Ok(Some(NotifyCommand { argv, offers_open: false }));
-        }
-        if self.macos {
-            let argv = ["osascript", "-e", OSASCRIPT, title, body].map(String::from).into();
-            return Ok((self.have)("osascript").then_some(NotifyCommand { argv, offers_open: false }));
         }
         if !(self.have)("notify-send") {
             return Ok(None);
@@ -489,18 +413,12 @@ pub mod tests {
     }
 
     /// DESIGN.md section 2: signals ignored before a clone (`nohup`) stay
-    /// ignored. Rust ignores SIGPIPE in every program, which shows each reader works.
+    /// ignored. Rust ignores SIGPIPE in every program, which shows the reading works.
     #[test]
     fn ignored_signals_are_read_from_the_process_table() {
         let sigpipe = 1 << (13 - 1);
-        let ps = Ps::run(&["-o", "sigignore=", "-p", &std::process::id().to_string()]);
-        let read = ignored_signals();
-        assert!(read.is_some_and(|mask| mask & sigpipe != 0), "read {read:x?}; ps printed {ps:?}");
-        if let Some(ps) = ps {
-            assert!(signal_mask(&ps).is_some_and(|mask| mask & sigpipe != 0), "{ps:?}");
-        }
+        assert!(ignored_signals().is_some_and(|mask| mask & sigpipe != 0));
         assert_eq!(signal_mask("\t0000000000001000\n"), Some(sigpipe));
-        assert_eq!(signal_mask(" 1000"), Some(sigpipe), "ps pads with spaces");
         assert_eq!(signal_mask("-"), None);
     }
 
@@ -529,8 +447,8 @@ pub mod tests {
             assert!(!reads_relative(&fails));
         }
         assert!(!reads_relative(Path::new("/nonexistent/date")));
-        let Some(date) = ["gdate", "date"].into_iter().filter_map(which).find(|d| reads_relative(d)) else {
-            return; // no GNU date here (macOS without coreutils): itm's own phrases only
+        let Some(date) = which("date").filter(|d| reads_relative(d)) else {
+            return; // no GNU date here (BusyBox): itm's own phrases only
         };
         let now = crate::times::now();
         let week = date_reads("next week").expect("GNU date reads next week");
@@ -547,18 +465,11 @@ pub mod tests {
         assert!(notify_command(Some("notify 'open"), "T", "B", false).is_err());
     }
 
-    /// R3.2, R3.3: osascript on macOS, with the text as arguments and no Open action;
-    /// notify-send elsewhere, offering Open; nothing when neither is there.
+    /// R3.2, R3.3: notify-send, offering Open; nothing without it.
     #[test]
-    fn each_system_notifies_with_its_own_program() {
+    fn notify_send_notifies_and_offers_open() {
         let everything = |_: &str| true;
-        let mac = Notifiers { macos: true, have: &everything };
-        let command = mac.command(None, r#"say "hi""#, "B", true).unwrap().unwrap();
-        assert_eq!(command.argv[..2], ["osascript", "-e"]);
-        assert_eq!(command.argv[3..], [r#"say "hi""#, "B"], "arguments, never script text");
-        assert!(!command.offers_open);
-
-        let linux = Notifiers { macos: false, have: &everything };
+        let linux = Notifiers { have: &everything };
         let command = linux.command(Some("  \t"), "T", "B", true).unwrap().unwrap();
         assert_eq!(
             command.argv,
@@ -568,54 +479,11 @@ pub mod tests {
         assert!(!linux.command(None, "T", "B", false).unwrap().unwrap().offers_open);
 
         let nothing = |_: &str| false;
-        for macos in [true, false] {
-            assert_eq!(Notifiers { macos, have: &nothing }.command(None, "T", "B", true).unwrap(), None);
-        }
+        assert_eq!(Notifiers { have: &nothing }.command(None, "T", "B", true).unwrap(), None);
     }
 
-    /// `ps -ww -A -o pid= -o ppid= -o command=` as macOS and FreeBSD print it.
-    const PS_TABLE: &str = "    1     0 /sbin/launchd
-  512     1 /usr/libexec/logd
- 4242  4100 /Users/me/.nix-profile/bin/itm attach task-a
- 4243  4242 herdr session attach task-a
- 4250  4242 herdr session list
- 4300  4242 /Applications/My Tools/herdr session attach task-b
-94512 94500 -zsh
-";
-
-    #[test]
-    fn ps_output_is_read_into_command_lines() {
-        let children = ps_children(PS_TABLE, 4242);
-        let argv = |words: &str| words.split(' ').map(str::to_string).collect::<Vec<_>>();
-        assert_eq!(
-            children,
-            [
-                (4243, argv("herdr session attach task-a")),
-                (4250, argv("herdr session list")),
-                // ps joins arguments with spaces: a path with one comes back split.
-                (4300, argv("/Applications/My Tools/herdr session attach task-b")),
-            ]
-        );
-        assert_eq!(ps_children(PS_TABLE, 7), []);
-        assert_eq!(ps_children("  PID  PPID COMMAND\n", 0), [], "a header is no process");
-        assert_eq!(
-            ps_command("/usr/bin/python3 /home/me/.local/bin/itm attach\n"),
-            Some(argv("/usr/bin/python3 /home/me/.local/bin/itm attach"))
-        );
-        assert_eq!(ps_command(""), None, "ps prints nothing for a process that is gone");
-    }
-
-    /// Both readers where they work: /proc, and ps when it takes BSD-style options.
     fn tables() -> Vec<(&'static str, Box<dyn Processes>)> {
-        let mut tables: Vec<(&str, Box<dyn Processes>)> = vec![];
-        if fs::metadata("/proc/self/cmdline").is_ok() {
-            tables.push(("proc", Box::new(Proc)));
-        }
-        if Ps::run(&["-A", "-o", "pid="]).is_some() {
-            tables.push(("ps", Box::new(Ps)));
-        }
-        assert!(!tables.is_empty(), "no way to read the process table");
-        tables
+        vec![("proc", Box::new(Proc))]
     }
 
     #[test]

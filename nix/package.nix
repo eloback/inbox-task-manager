@@ -5,9 +5,7 @@
   makeWrapper,
   git,
   libnotify,
-  coreutils-prefixed,
-  procps,
-  darwin,
+  coreutils,
   # A fallback on PATH only: the Herdr client must match the server, so a
   # `herdr` the user already runs wins. null leaves it out.
   herdr ? null,
@@ -39,27 +37,22 @@ rustPlatform.buildRustPackage {
 
   # checkPhase runs `cargo test`: the unit tests (screen snapshots
   # included) and tests/switching.rs, which runs the built itm with the
-  # test binary playing herdr and git. git: local work and URL rewriting;
-  # ps: the process table read the way macOS and the BSDs read it.
-  nativeCheckInputs = [
-    git
-    (if stdenv.hostPlatform.isDarwin then darwin.ps else procps)
-  ];
+  # test binary playing herdr and git. git: local work and URL rewriting.
+  nativeCheckInputs = [ git ];
 
   # wrapProgram keeps argv[0] (…/bin/itm), which the attach loop's
-  # process-name rule needs (DESIGN.md section 2). git for projects, gdate
-  # for snooze phrases itm does not read itself, notify-send on Linux;
-  # ITM_SELF makes a clone child run this wrapper, with this PATH.
+  # process-name rule needs (DESIGN.md section 2). git for projects, GNU
+  # date for snooze phrases itm does not read itself, notify-send for
+  # desktop notifications; ITM_SELF makes a clone child run this wrapper,
+  # with this PATH.
   postInstall = ''
     wrapProgram $out/bin/itm \
       --prefix PATH : ${
-        lib.makeBinPath (
-          [
-            git
-            coreutils-prefixed
-          ]
-          ++ lib.optional stdenv.hostPlatform.isLinux libnotify
-        )
+        lib.makeBinPath [
+          git
+          coreutils
+          libnotify
+        ]
       } \
       --set ITM_SELF $out/bin/itm \
       ${lib.optionalString bundleHerdr "--suffix PATH : ${lib.makeBinPath [ herdr ]}"}
@@ -68,7 +61,7 @@ rustPlatform.buildRustPackage {
   meta = {
     inherit (cargoToml.package) description;
     license = lib.licenses.mit;
-    platforms = lib.platforms.unix;
+    platforms = lib.platforms.linux;
     mainProgram = "itm";
   };
 }

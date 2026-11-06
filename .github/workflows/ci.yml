@@ -6,12 +6,8 @@ on:
 
 jobs:
   rust:
-    name: fmt, clippy and tests (${{ matrix.os }})
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
+    name: fmt, clippy and tests
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       # The toolchain the code is checked with (DESIGN.md section 6).

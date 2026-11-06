@@ -12,17 +12,15 @@
 //! a session that stops accepting connections (a deadlock, a SIGSTOP) must
 //! not hang `itm list`, an archive or the daemon.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, ErrorKind, Write};
 use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 use std::{fs, io, thread};
 
-use rustix::event::{PollFd, PollFlags, Timespec, poll};
 use rustix::io::Errno;
 use rustix::net::{AddressFamily, SocketAddrUnix, SocketType};
 use serde::Deserialize;
@@ -38,10 +36,6 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
 const ANSWER_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long a headless server may take to answer after it was started.
 const SERVER_START: Duration = Duration::from_secs(5);
-/// How long a session that refuses connections but was found running
-/// (macOS, the BSDs: [`refused_by_a_live_server`]) counts as running
-/// before it is checked again.
-const RECHECK_REFUSER: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Session {
@@ -170,21 +164,15 @@ pub struct Herdr {
     config: PathBuf,
     connect_timeout: Duration,
     answer_timeout: Duration,
-    refusers: LiveRefusers,
 }
 
 impl Herdr {
     pub fn new(config: PathBuf) -> Herdr {
-        Herdr {
-            config,
-            connect_timeout: CONNECT_TIMEOUT,
-            answer_timeout: ANSWER_TIMEOUT,
-            refusers: LiveRefusers::default(),
-        }
+        Herdr { config, connect_timeout: CONNECT_TIMEOUT, answer_timeout: ANSWER_TIMEOUT }
     }
 
     fn connect(&self, socket: &Path) -> io::Result<UnixStream> {
-        connect(socket, self.connect_timeout, FULL_IS_REFUSED.then_some(&self.refusers))
+        connect(socket, self.connect_timeout)
     }
 
     /// Every session Herdr knows (running or stopped), like `herdr session
@@ -409,106 +397,27 @@ impl Herdr {
     }
 }
 
-/// Whether a full backlog is refused like a socket nobody listens on
-/// (ECONNREFUSED): so on macOS and the BSDs; Linux says EAGAIN instead.
-const FULL_IS_REFUSED: bool = !cfg!(any(target_os = "linux", target_os = "android"));
-
 /// Connect to a session's socket within `timeout`. A blocking connect to a
 /// server that stopped accepting waits forever once its backlog is full,
-/// so the socket is non-blocking. A full backlog is refused at once
-/// (nothing is queued) and tried again until the deadline: Linux says
-/// EAGAIN, macOS and the BSDs ECONNREFUSED, as for a server that is gone,
-/// so there (`refusers`) a refusal from a server still running counts as a
-/// full backlog. Other systems may answer EINPROGRESS, which is waited for.
-fn connect(socket: &Path, timeout: Duration, refusers: Option<&LiveRefusers>) -> io::Result<UnixStream> {
+/// so the socket is non-blocking: Linux refuses a full backlog at once
+/// (EAGAIN; nothing is queued), which is tried again until the deadline.
+fn connect(socket: &Path, timeout: Duration) -> io::Result<UnixStream> {
     let deadline = Instant::now() + timeout;
     let address = SocketAddrUnix::new(socket)?;
-    let mut alive = None; // asked once: whether a refusing server still runs
     loop {
-        let fd = nonblocking_socket()?;
-        let left = deadline.saturating_duration_since(Instant::now());
+        let fd = rustix::net::socket_with(
+            AddressFamily::UNIX,
+            SocketType::STREAM,
+            rustix::net::SocketFlags::CLOEXEC | rustix::net::SocketFlags::NONBLOCK,
+            None,
+        )?;
         match rustix::net::connect(&fd, &address) {
             Ok(()) => return blocking(fd),
-            Err(Errno::INPROGRESS) => {
-                let mut fds = [PollFd::new(&fd, PollFlags::OUT)];
-                let left = Timespec::try_from(left).map_err(|_| io::Error::from(ErrorKind::TimedOut))?;
-                if poll(&mut fds, Some(&left))? == 0 {
-                    return Err(ErrorKind::TimedOut.into());
-                }
-                rustix::net::sockopt::socket_error(&fd)??;
-                return blocking(fd);
-            }
-            Err(Errno::AGAIN) => {}
-            Err(Errno::CONNREFUSED)
-                if refusers.is_some_and(|refusers| *alive.get_or_insert_with(|| refusers.alive(socket))) => {}
+            Err(Errno::AGAIN) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
+            Err(Errno::AGAIN) => return Err(ErrorKind::TimedOut.into()),
             Err(e) => return Err(e.into()),
         }
-        // The backlog is full.
-        if left.is_zero() {
-            return Err(ErrorKind::TimedOut.into());
-        }
-        thread::sleep(left.min(Duration::from_millis(10)));
     }
-}
-
-/// The sessions that refused a connection but were found running, and
-/// when: the check queues a connection on the session's client socket that
-/// a stuck server never takes, so it runs at most once a minute per
-/// session and its client socket's backlog (128 on macOS) lasts an hour or
-/// more of a hang, not minutes. A process (the daemon, the switcher) keeps one.
-#[derive(Default)]
-struct LiveRefusers(Mutex<HashMap<PathBuf, Instant>>);
-
-impl LiveRefusers {
-    fn alive(&self, socket: &Path) -> bool {
-        let mut found = self.0.lock().unwrap_or_else(PoisonError::into_inner);
-        if found.get(socket).is_some_and(|at| at.elapsed() < RECHECK_REFUSER) {
-            return true;
-        }
-        let alive = refused_by_a_live_server(socket);
-        match alive {
-            true => found.insert(socket.into(), Instant::now()),
-            false => found.remove(socket),
-        };
-        alive
-    }
-}
-
-/// Whether the server behind a session socket that refused a connection
-/// still runs, stuck with a full backlog, rather than gone. The session's
-/// other socket tells: a running server listens on `herdr-client.sock`
-/// too, and its backlog fills only with clients trying to attach. A
-/// session that stopped removes both sockets; one whose server crashed
-/// keeps both, and nothing listens on either. The connection this queues
-/// is closed at once; Herdr reads it as a client that left.
-fn refused_by_a_live_server(socket: &Path) -> bool {
-    let Ok(address) = SocketAddrUnix::new(socket.with_file_name("herdr-client.sock")) else {
-        return false;
-    };
-    let Ok(fd) = nonblocking_socket() else {
-        return false;
-    };
-    matches!(rustix::net::connect(&fd, &address), Ok(()) | Err(Errno::INPROGRESS | Errno::AGAIN))
-}
-
-#[cfg(not(target_vendor = "apple"))]
-fn nonblocking_socket() -> io::Result<OwnedFd> {
-    use rustix::net::SocketFlags;
-    Ok(rustix::net::socket_with(
-        AddressFamily::UNIX,
-        SocketType::STREAM,
-        SocketFlags::CLOEXEC | SocketFlags::NONBLOCK,
-        None,
-    )?)
-}
-
-/// macOS has no SOCK_CLOEXEC or SOCK_NONBLOCK: the flags are set right after.
-#[cfg(target_vendor = "apple")]
-fn nonblocking_socket() -> io::Result<OwnedFd> {
-    let fd = rustix::net::socket(AddressFamily::UNIX, SocketType::STREAM, None)?;
-    rustix::io::fcntl_setfd(&fd, rustix::io::FdFlags::CLOEXEC)?;
-    rustix::io::ioctl_fionbio(&fd, true)?;
-    Ok(fd)
 }
 
 /// The connected socket as a stream whose reads and writes block (with timeouts).
@@ -677,28 +586,26 @@ mod tests {
         }
     }
 
-    /// A session whose server never accepts: listening, with its backlog
-    /// full, and listening on its client socket too, as Herdr does.
+    /// A session socket that never accepts: listening, with its backlog full.
     /// Returns what must stay open for it to stay that way.
-    fn stuck_session(socket: &Path) -> (OwnedFd, Vec<OwnedFd>, std::os::unix::net::UnixListener) {
+    fn stuck_session(socket: &Path) -> (OwnedFd, Vec<OwnedFd>) {
         fs::create_dir_all(socket.parent().unwrap()).unwrap();
-        let client = std::os::unix::net::UnixListener::bind(socket.with_file_name("herdr-client.sock")).unwrap();
         let listener = rustix::net::socket(AddressFamily::UNIX, SocketType::STREAM, None).unwrap();
         let address = SocketAddrUnix::new(socket).unwrap();
         rustix::net::bind(&listener, &address).unwrap();
         rustix::net::listen(&listener, 0).unwrap();
         let mut queued = vec![];
         loop {
-            let fd = nonblocking_socket().unwrap();
+            let flags = rustix::net::SocketFlags::NONBLOCK;
+            let fd = rustix::net::socket_with(AddressFamily::UNIX, SocketType::STREAM, flags, None).unwrap();
             match rustix::net::connect(&fd, &address) {
-                Ok(()) | Err(Errno::INPROGRESS) => queued.push(fd),
-                Err(Errno::AGAIN) => break,                          // Linux
-                Err(Errno::CONNREFUSED) if FULL_IS_REFUSED => break, // macOS, the BSDs
+                Ok(()) => queued.push(fd),
+                Err(Errno::AGAIN) => break,
                 Err(e) => panic!("{e}"),
             }
             assert!(queued.len() < 1000, "the backlog never filled");
         }
-        (listener, queued, client)
+        (listener, queued)
     }
 
     /// The sockets a crashed server leaves: both still there, nothing listening.
@@ -721,48 +628,6 @@ mod tests {
         let err = herdr.snapshot(&socket).unwrap_err();
         assert_eq!(err, Error::Herdr { method: "session.snapshot", failure: HerdrFailure::NotRunning });
         assert!(started.elapsed() < Duration::from_millis(100), "took {:?}", started.elapsed());
-    }
-
-    /// On macOS and the BSDs (`refusers`) a refusal from a server whose
-    /// client socket listens is a full backlog, waited for until the
-    /// timeout, and the check is remembered for a minute: a stuck server
-    /// takes none of the connections it queues, so checking on every connect
-    /// would fill its client socket and make it look stopped after all.
-    /// Without (Linux) a refusal is final.
-    #[test]
-    fn a_stuck_server_is_checked_once_a_minute_not_on_every_connect() {
-        let tmp = tempfile::tempdir().unwrap();
-        let socket = tmp.path().join("task-x").join("herdr.sock");
-        crashed_session(&socket);
-        let refusers = LiveRefusers::default();
-        let short = Duration::from_millis(20);
-        let refused = |refusers| connect(&socket, short, refusers).unwrap_err().kind();
-        assert_eq!(refused(Some(&refusers)), ErrorKind::ConnectionRefused, "crashed");
-        fs::remove_file(socket.with_file_name("herdr-client.sock")).unwrap();
-        let client = std::os::unix::net::UnixListener::bind(socket.with_file_name("herdr-client.sock")).unwrap();
-        client.set_nonblocking(true).unwrap();
-        for _ in 0..5 {
-            assert_eq!(refused(Some(&refusers)), ErrorKind::TimedOut, "stuck: waited for");
-        }
-        assert!(client.accept().is_ok(), "checked once");
-        assert_eq!(client.accept().unwrap_err().kind(), ErrorKind::WouldBlock, "only once");
-        assert_eq!(refused(None), ErrorKind::ConnectionRefused, "Linux: nobody listens, so it is final");
-    }
-
-    /// What macOS and the BSDs decide on a refused connection (they refuse a
-    /// full backlog too), checked here on any system: a server that still
-    /// listens on its client socket runs, stuck; a crashed one does not.
-    #[test]
-    fn a_refused_session_runs_while_its_client_socket_listens() {
-        let tmp = tempfile::tempdir().unwrap();
-        let socket = tmp.path().join("task-x").join("herdr.sock");
-        crashed_session(&socket);
-        assert!(!refused_by_a_live_server(&socket), "crashed");
-        fs::remove_file(socket.with_file_name("herdr-client.sock")).unwrap();
-        let _client = std::os::unix::net::UnixListener::bind(socket.with_file_name("herdr-client.sock")).unwrap();
-        assert!(refused_by_a_live_server(&socket), "stuck");
-        fs::remove_dir_all(socket.parent().unwrap()).unwrap();
-        assert!(!refused_by_a_live_server(&socket), "stopped: no sockets at all");
     }
 
     /// DESIGN.md section 2: every Herdr query has a timeout, the connection included.

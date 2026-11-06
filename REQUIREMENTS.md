@@ -37,13 +37,13 @@ explicitly.
 
 ### R3 Notifications (agents only)
 - R3.1 One notification when an agent in any task becomes `blocked`; plain shells never notify.
-- R3.2 Delivery: a Herdr toast in the attached session when a client is attached, else a desktop notification: `$ITM_NOTIFY_COMMAND` when set (it gets the title and body as arguments), else `notify-send` (Linux, BSD) or `osascript` (macOS). Without any of them the daemon logs the notification instead.
+- R3.2 Delivery: a Herdr toast in the attached session when a client is attached, else a desktop notification: `$ITM_NOTIFY_COMMAND` when set (it gets the title and body as arguments), else `notify-send`. Without either the daemon logs the notification instead.
 - R3.3 The notification names the task and agent; the desktop notification's "Open" action switches the most recently attached `itm attach` client to the task (offered only by `notify-send`, and only when such a client exists).
 - R3.4 A wait is reported once (deduplicated per pane and state change).
 - R3.5 Snoozed tasks are included: a blocked agent notifies **and** wakes the task.
 
 ### R4 Snooze
-- R4.1 `itm snooze [task] [when]` (`30m`, `2h`, `1h30m`, `2d`, `45` minutes, `14:30` or `5pm` (the next time the clock shows it), `today 17:00`, `tomorrow 9:00`, `friday 2pm`, `next mon`, `2026-12-01 14:30`; other phrases such as `next week` when GNU `date` is installed, as `gdate` on macOS; at most 10 years); without a time it opens the snooze dialog. The first word is the task when it names one, else the current task is snoozed. The dialog offers presets in time order (past ones left out) and accepts a typed time.
+- R4.1 `itm snooze [task] [when]` (`30m`, `2h`, `1h30m`, `2d`, `45` minutes, `14:30` or `5pm` (the next time the clock shows it), `today 17:00`, `tomorrow 9:00`, `friday 2pm`, `next mon`, `2026-12-01 14:30`; other phrases such as `next week` when GNU `date` is installed; at most 10 years); without a time it opens the snooze dialog. The first word is the task when it names one, else the current task is snoozed. The dialog offers presets in time order (past ones left out) and accepts a typed time.
 - R4.2 Snoozed tasks leave the Inbox; their session keeps running.
 - R4.3 When the timer expires the task becomes active again, with a notification.
 - R4.4 A blocked agent in a snoozed task wakes it early, with a notification.
@@ -65,7 +65,7 @@ explicitly.
 - R6.5 `itm status [--format F] [--json]` prints counts for a window title or bar, by default `⚑ waiting ● active ◔ snoozed`; `?` for waiting when the daemon is not running.
 
 ### R7 Daemon
-- R7.1 `itm daemon` (a user service: systemd on Linux, launchd on macOS) polls agents in every running task session, sends notifications and wakes snoozed tasks.
+- R7.1 `itm daemon` (a systemd user service) polls agents in every running task session, sends notifications and wakes snoozed tasks.
 - R7.2 It works with no Herdr client attached.
 - R7.3 Its status cache records when each wait started. When the cache is older than 15 s, the switcher says the daemon is not running instead of showing nothing waiting.
 
@@ -98,7 +98,7 @@ explicitly.
 
 ### Non-functional
 - N1 Task and project metadata lives in `$XDG_STATE_HOME/inbox-task-manager/tasks.json`; clones (R8.6) and notes (R9.1) live under `$XDG_DATA_HOME`; settings (R10.4) under `$XDG_CONFIG_HOME`; Herdr remains the source of truth for layouts and agents. A `tasks.json` from before tasks had several projects is read as is (`project` becomes `projects`), and a stored project `kind` is dropped (it is read off the fields). Older itm binaries cannot read a file written by this version: upgrade itm everywhere at once and restart the daemon.
-- N2 Runs on Linux and macOS (the BSDs are untested), as one binary, `itm`. Installs with cargo (`cargo install --locked`), or with Nix (a flake with a package, an overlay and a home-manager module that runs the daemon as a user service). Herdr's key bindings stay in the user's Herdr config.
+- N2 Runs on Linux (NixOS included), as one binary, `itm`; macOS and the BSDs are not supported. Installs with cargo (`cargo install --locked`), or with Nix (a flake with a package, an overlay and a home-manager module that runs the daemon as a user service). Herdr's key bindings stay in the user's Herdr config.
 - N3 The switcher draws its first frame with the tasks within a few milliseconds (2.6 ms measured with 5 tasks, 3 of them running, `scripts/measure.sh`; the Python itm took about 175 ms); it reads agent state from the daemon's status cache instead of querying every session, and refreshes every 2 s in the background, keeping the highlighted task. `itm list` and `itm status` take under 2 ms (1.3 ms and 1.6 ms measured), and the daemon about 0.05% of a core and 5 MB.
 - N4 Never touches sessions without the task prefix, except attaching to them when asked.
 

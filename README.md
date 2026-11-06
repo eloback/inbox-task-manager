@@ -64,13 +64,13 @@ Binary: `itm`. Run `itm` for the task switcher.
 
 ## 📋 Requirements
 
-- Linux or macOS (the BSDs should work but are untested).
+- Linux (NixOS included). macOS and the BSDs are not supported.
 - [Herdr](https://herdr.dev) 0.9.3 or later.
 - `git`, for repository projects.
 - To build it: Rust 1.89 or later (`cargo`; CI checks that version), or Nix.
-- Optional: `notify-send` (Linux) for desktop notifications; macOS uses
-  `osascript`. GNU `date` (`gdate` from coreutils on macOS) for snooze phrases
-  beyond the ones itm reads itself (see [Snooze times](#snooze-times)).
+- Optional: `notify-send` for desktop notifications. GNU `date` (not
+  BusyBox's) for snooze phrases beyond the ones itm reads itself (see
+  [Snooze times](#snooze-times)).
 
 ## 📦 Install
 
@@ -95,14 +95,14 @@ imports = [ inputs.inbox-task-manager.homeModules.default ];
 programs.inbox-task-manager.enable = true;   # the CLI and its daemon
 ```
 
-The module installs itm and runs `itm daemon` as a user service (systemd on
-Linux, launchd on macOS); `programs.inbox-task-manager.daemon.enable = false`
+The module installs itm and runs `itm daemon` as a systemd user service;
+`programs.inbox-task-manager.daemon.enable = false`
 leaves the service out. The service gets your profile's `PATH` and
 home-manager's XDG folders, so it sees the same tasks and Herdr sessions as
-your shell. The package puts git, GNU `date` and (on Linux) `notify-send` on
-itm's `PATH`, and adds Herdr only as a fallback after yours: the Herdr client
-must match the running server's version. The flake builds for x86_64-linux,
-aarch64-linux and aarch64-darwin; elsewhere use its overlay.
+your shell. The package puts git, GNU `date` and `notify-send` on itm's
+`PATH`, and adds Herdr only as a fallback after yours: the Herdr client must
+match the running server's version. The flake builds for x86_64-linux and
+aarch64-linux.
 
 **Upgrading from the Python itm** (0.2.0): the Rust itm reads and writes
 the same files, so tasks, projects, notes and settings carry over.
@@ -117,10 +117,8 @@ switcher draws with your terminal's colors (`ITM_THEME` is gone).
 
 1. **Run the daemon.** It notifies about blocked agents and wakes snoozed
    tasks. The home-manager module does this for you. Otherwise use
-   [`contrib/systemd/inbox-task-manager.service`](contrib/systemd/inbox-task-manager.service)
-   (Linux) or
-   [`contrib/launchd/inbox-task-manager.plist`](contrib/launchd/inbox-task-manager.plist)
-   (macOS); both explain how to install them.
+   [`contrib/systemd/inbox-task-manager.service`](contrib/systemd/inbox-task-manager.service),
+   which explains how to install it.
 2. **Add the Herdr keys.** Copy
    [`contrib/herdr-keys.toml`](contrib/herdr-keys.toml) into your Herdr config
    (`~/.config/herdr/config.toml`). It also turns on Herdr toasts
@@ -274,17 +272,15 @@ Files:
   (`tasks/<session>/notes.md`) (`~/.local/share` by default).
 - Runtime files (switching markers, the daemon's status cache):
   `$XDG_RUNTIME_DIR/inbox-task-manager`, else `/run/user/<uid>/inbox-task-manager`,
-  else `/tmp/inbox-task-manager-<uid>` (macOS). The daemon and your shell
+  else `/tmp/inbox-task-manager-<uid>`. The daemon and your shell
   must agree on `XDG_CONFIG_HOME` (where Herdr keeps its sessions),
   `XDG_STATE_HOME`, `XDG_DATA_HOME` and `XDG_RUNTIME_DIR` when you set them.
 
 ## 💻 Platform notes
 
-- **Linux** reads the process table from `/proc`; the BSDs and macOS ask `ps`.
-- **macOS** shows notifications with `osascript`, without the Open action
-  that `notify-send` offers. The daemon runs as a launchd agent. Unix socket
-  paths are shorter there (104 bytes): with a long user name, keep task
-  titles short, or Herdr may hang attaching (DESIGN.md, Known gaps).
+- **Linux only**, NixOS included: itm reads the process table from `/proc`
+  and relies on how Linux handles Unix sockets and signals. macOS and the
+  BSDs are not supported (DESIGN.md section 4).
 - **Notifications elsewhere** (a phone, a chat): set `ITM_NOTIFY_COMMAND` to
   a program that takes the title and body as its last two arguments.
 
