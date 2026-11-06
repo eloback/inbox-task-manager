@@ -5,31 +5,30 @@ on:
   pull_request:
 
 jobs:
-  test:
-    name: tests (${{ matrix.os }}, Python ${{ matrix.python }})
+  rust:
+    name: fmt, clippy and tests (${{ matrix.os }})
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
-        python: ["3.11", "3.13"]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      # The toolchain the code is checked with (DESIGN.md section 6).
+      - uses: dtolnay/rust-toolchain@1.95.0
         with:
-          python-version: ${{ matrix.python }}
-      - run: pip install .
-      - run: python -m unittest discover -s tests -v
-      - run: itm --help
+          components: clippy, rustfmt
+      - run: cargo fmt --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked
+      - run: cargo run --locked --quiet -- --help
 
   nix:
-    name: nix flake check (${{ matrix.os }})
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
+    name: nix build and flake check (Linux)
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: cachix/install-nix-action@v31
+      # Building runs the tests; the flake's checks add clippy and rustfmt.
+      - run: nix build -L
       - run: nix flake check -L

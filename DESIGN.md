@@ -1080,22 +1080,42 @@ The switcher and its dialogs follow these principles.
 
 ## 7. Packaging
 
-- itm is a Python package (pyproject, setuptools) with two console scripts,
-  `inbox-task-manager` and `itm`; both names keep the attach loop's command
-  line recognizable (see the process-name rule in section 2). Only the TUI
-  needs a dependency (Textual).
-- `ITM_SELF`, when set, is the command child processes (clones) run, so they
-  run the same build; the Nix wrapper sets it. Without it they run
-  `python -m inbox_task_manager` with the current interpreter.
-- The Nix package (`nix/package.nix`, `buildPythonApplication`) puts git,
-  `gdate` and, on Linux, `notify-send` first on `PATH`. Herdr goes
-  last (`--suffix`): the client must match the server's version, so a
-  `herdr` the user already runs wins, and the bundled one serves services
-  started without the user's `PATH`. `herdr = null` leaves it out.
-- The flake follows nixos-unstable, where Herdr is packaged. It lists no
-  x86_64-darwin, which nixpkgs 26.11 dropped; there the overlay and the
-  module's default package (`callPackage` with the user's nixpkgs) still
-  work. A configuration that installs Herdr from another nixpkgs should make
-  the flake's `nixpkgs` input follow that one, so both use the same Herdr.
+- itm is one Rust crate (`Cargo.toml`, edition 2024) with one binary,
+  `itm`, whose name keeps the attach loop's command line recognizable (the
+  process-name rule in section 2). `cargo install --locked --path .` (or
+  `--git <repository>`) installs it into `~/.cargo/bin`. Every dependency
+  is pinned exactly in `Cargo.toml` and by checksum in `Cargo.lock`
+  (section 4, 2026-11-06).
+- `ITM_SELF`, when set, is the program child processes (clones) run, so
+  they run the same build with the same `PATH`; the Nix wrapper sets it to
+  itself. Without it they run the running binary.
+- The Nix package (`nix/package.nix`, `rustPlatform.buildRustPackage` with
+  `cargoLock.lockFile`, so there is no vendor hash to update) runs `cargo
+  test` in its check phase, with git and `ps` as check inputs, and wraps
+  `itm` (`wrapProgram`, which keeps argv[0], `…/bin/itm`, for the
+  process-name rule) with git, `gdate` (coreutils-prefixed) and, on Linux,
+  `notify-send` first on `PATH`. Herdr goes last (`--suffix`): the client
+  must match the server's version, so a `herdr` the user already runs
+  wins, and the bundled one serves services started without the user's
+  `PATH`. `herdr = null` leaves it out.
+- The flake has `packages` (the default is the package), `overlays.default`,
+  `homeModules.default` (`nix/home-module.nix`: the package and the daemon
+  as a systemd or launchd user service, running `lib.getExe`, which is
+  `bin/itm`), `checks` (the package, so its tests; clippy with warnings
+  denied, on the same sources and crates; rustfmt), a `devShells.default`
+  with cargo, rustc, clippy and rustfmt and what the end-to-end scripts
+  drive (git, tmux, socat, python3, herdr), and `formatter` (nixfmt).
+- The flake follows nixos-unstable, where Herdr is packaged (its lock of
+  2026-11-06 has Rust 1.99 and Herdr 0.9.5). It lists no x86_64-darwin,
+  which nixpkgs 26.11 dropped; there the overlay and the module's default
+  package (`callPackage` with the user's nixpkgs) still work. A
+  configuration that installs Herdr from another nixpkgs should make the
+  flake's `nixpkgs` input follow that one, so both use the same Herdr.
+- CI (`.github/workflows/ci.yml`): `cargo fmt --check`, `cargo clippy
+  --all-targets -- -D warnings` and `cargo test` with Rust 1.95.0 (the
+  toolchain the crate is developed and checked with, pinned by
+  `dtolnay/rust-toolchain@1.95.0`) on Linux and macOS, and `nix build` and
+  `nix flake check` on Linux.
 - New files need `git add` (`-N` is enough) before a flake build can see them.
-- The source fileset excludes `__pycache__`.
+- The source fileset is `Cargo.toml`, `Cargo.lock`, `rustfmt.toml`, `src/`
+  and the `.rs` files of `tests/`.

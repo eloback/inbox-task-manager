@@ -1,7 +1,8 @@
 {
   lib,
   stdenv,
-  python3Packages,
+  rustPlatform,
+  makeWrapper,
   git,
   libnotify,
   coreutils-prefixed,
@@ -13,74 +14,61 @@
 }:
 
 let
-  pyproject = lib.importTOML ../pyproject.toml;
+  cargoToml = lib.importTOML ../Cargo.toml;
   bundleHerdr = herdr != null && lib.meta.availableOn stdenv.hostPlatform herdr;
 in
-python3Packages.buildPythonApplication {
-  pname = pyproject.project.name;
-  inherit (pyproject.project) version;
-  pyproject = true;
+rustPlatform.buildRustPackage {
+  pname = cargoToml.package.name;
+  inherit (cargoToml.package) version;
 
   src = lib.fileset.toSource {
     root = ../.;
     fileset = lib.fileset.unions [
-      ../pyproject.toml
-      ../README.md
-      ../LICENSE
-      (lib.fileset.fileFilter (file: file.hasExt "py") ../inbox_task_manager)
-      (lib.fileset.fileFilter (file: file.hasExt "py") ../tests)
+      ../Cargo.toml
+      ../Cargo.lock
+      ../rustfmt.toml
+      ../src
+      (lib.fileset.fileFilter (file: file.hasExt "rs") ../tests)
     ];
   };
 
-  build-system = [ python3Packages.setuptools ];
-  dependencies = [ python3Packages.textual ];
+  # Every crate is pinned by its checksum in Cargo.lock: no vendor hash to update.
+  cargoLock.lockFile = ../Cargo.lock;
 
-  # ps: the tests read the process table the way macOS and the BSDs do too.
+  nativeBuildInputs = [ makeWrapper ];
+
+  # checkPhase runs `cargo test`: the unit tests (screen snapshots
+  # included) and tests/switching.rs, which runs the built itm with the
+  # test binary playing herdr and git. git: local work and URL rewriting;
+  # ps: the process table read the way macOS and the BSDs read it.
   nativeCheckInputs = [
     git
     (if stdenv.hostPlatform.isDarwin then darwin.ps else procps)
   ];
-  # buildPythonApplication runs this after installing; doCheck switches it on.
-  installCheckPhase = ''
-    runHook preInstallCheck
-    python3 -m unittest discover -s tests
-    runHook postInstallCheck
+
+  # wrapProgram keeps argv[0] (…/bin/itm), which the attach loop's
+  # process-name rule needs (DESIGN.md section 2). git for projects, gdate
+  # for snooze phrases itm does not read itself, notify-send on Linux;
+  # ITM_SELF makes a clone child run this wrapper, with this PATH.
+  postInstall = ''
+    wrapProgram $out/bin/itm \
+      --prefix PATH : ${
+        lib.makeBinPath (
+          [
+            git
+            coreutils-prefixed
+          ]
+          ++ lib.optional stdenv.hostPlatform.isLinux libnotify
+        )
+      } \
+      --set ITM_SELF $out/bin/itm \
+      ${lib.optionalString bundleHerdr "--suffix PATH : ${lib.makeBinPath [ herdr ]}"}
   '';
-  doCheck = true;
-
-  makeWrapperArgs = [
-    # notify-send on Linux; gdate for snooze phrases itm does not read itself.
-    "--prefix"
-    "PATH"
-    ":"
-    (lib.makeBinPath (
-      [
-        git
-        coreutils-prefixed
-      ]
-      ++ lib.optional stdenv.hostPlatform.isLinux libnotify
-    ))
-    "--set"
-    "ITM_SELF"
-    "${placeholder "out"}/bin/inbox-task-manager"
-  ]
-  ++ lib.optionals bundleHerdr [
-    "--suffix"
-    "PATH"
-    ":"
-    (lib.makeBinPath [ herdr ])
-  ];
-
-  pythonImportsCheck = [
-    "inbox_task_manager"
-    "inbox_task_manager.tui"
-  ];
 
   meta = {
-    inherit (pyproject.project) description;
+    inherit (cargoToml.package) description;
     license = lib.licenses.mit;
     platforms = lib.platforms.unix;
-    # The attach loop's command line must name itm (DESIGN.md, process name).
-    mainProgram = "inbox-task-manager";
+    mainProgram = "itm";
   };
 }

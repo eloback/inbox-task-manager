@@ -3,7 +3,7 @@
 <!--
   itm's daemon as a launchd agent (macOS without the home-manager module).
     1. Replace /Users/YOU with your home folder and check the itm path
-       (`command -v itm`).
+       (`command -v itm`; `cargo install` puts itm in ~/.cargo/bin).
     2. cp inbox-task-manager.plist ~/Library/LaunchAgents/
     3. launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/inbox-task-manager.plist
   launchd does not read your shell profile: herdr must be on the PATH below,
@@ -16,13 +16,13 @@
   <string>inbox-task-manager</string>
   <key>ProgramArguments</key>
   <array>
-    <string>/Users/YOU/.local/bin/itm</string>
+    <string>/Users/YOU/.cargo/bin/itm</string>
     <string>daemon</string>
   </array>
   <key>EnvironmentVariables</key>
   <dict>
     <key>PATH</key>
-    <string>/Users/YOU/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    <string>/Users/YOU/.cargo/bin:/Users/YOU/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
   </dict>
   <key>RunAtLoad</key>
   <true/>
