@@ -22,6 +22,53 @@ use crate::store::{flocked, write_atomic};
 
 /// The table the settings live in.
 const SECTION: &str = "herdr";
+/// The table the look lives in.
+const UI: &str = "ui";
+/// The theme's key in `[ui]`.
+const THEME: &str = "theme";
+
+/// The switcher's colors (`[ui] theme`, `ITM_THEME` overriding it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ThemeName {
+    /// Catppuccin Mocha: dark.
+    #[default]
+    Mocha,
+    /// Catppuccin Latte: light.
+    Latte,
+    /// The terminal's own colors.
+    Terminal,
+}
+
+impl ThemeName {
+    pub const ALL: [ThemeName; 3] = [ThemeName::Mocha, ThemeName::Latte, ThemeName::Terminal];
+
+    pub fn key(self) -> &'static str {
+        match self {
+            ThemeName::Mocha => "mocha",
+            ThemeName::Latte => "latte",
+            ThemeName::Terminal => "terminal",
+        }
+    }
+
+    /// What the Settings screen calls it.
+    pub fn label(self) -> &'static str {
+        match self {
+            ThemeName::Mocha => "Mocha (dark)",
+            ThemeName::Latte => "Latte (light)",
+            ThemeName::Terminal => "The terminal's colors",
+        }
+    }
+
+    pub fn named(key: &str) -> Option<ThemeName> {
+        ThemeName::ALL.into_iter().find(|t| t.key() == key)
+    }
+
+    /// The one after it, round: what Enter on the Settings screen picks.
+    pub fn next(self) -> ThemeName {
+        let at = ThemeName::ALL.iter().position(|&t| t == self).unwrap_or(0);
+        ThemeName::ALL[(at + 1) % ThemeName::ALL.len()]
+    }
+}
 
 /// One setting: a key in `[herdr]`, true or false.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -72,11 +119,12 @@ impl Setting {
 pub struct Settings {
     pub projects_from_workspaces: bool,
     pub remove_projects_without_workspace: bool,
+    pub theme: ThemeName,
 }
 
 impl Default for Settings {
     fn default() -> Settings {
-        Settings { projects_from_workspaces: true, remove_projects_without_workspace: true }
+        Settings { projects_from_workspaces: true, remove_projects_without_workspace: true, theme: ThemeName::Mocha }
     }
 }
 
@@ -109,9 +157,22 @@ pub fn parse(text: &str, shown: &str) -> Result<Settings> {
     let mut settings = Settings::default();
     for (section, item) in doc.iter() {
         let values = match item.as_table_like() {
-            Some(values) if section == SECTION => values,
+            Some(values) if section == SECTION || section == UI => values,
             _ => return Err(Error::Other(format!("{shown}: unknown setting {section}"))),
         };
+        if section == UI {
+            for (key, value) in values.iter() {
+                if key != THEME {
+                    return Err(Error::Other(format!("{shown}: unknown setting {section}.{key}")));
+                }
+                let names = ThemeName::ALL.map(|t| format!("\"{}\"", t.key())).join(", ");
+                settings.theme = value
+                    .as_str()
+                    .and_then(ThemeName::named)
+                    .ok_or_else(|| Error::Other(format!("{shown}: {section}.{key} must be one of {names}")))?;
+            }
+            continue;
+        }
         for (key, value) in values.iter() {
             let setting =
                 Setting::named(key).ok_or_else(|| Error::Other(format!("{shown}: unknown setting {section}.{key}")))?;
@@ -143,41 +204,49 @@ fn read_text(path: &Path, shown: &str) -> Result<String> {
     }
 }
 
-/// `text` with `setting` changed to `on`, the rest kept as it is: the
+/// `text` with `section.key` changed to `new`, the rest kept as it is: the
 /// comment after the value too (assigning a new value would drop it). A new
 /// key goes after the last one in its table; a missing table is added.
-fn changed(text: &str, setting: Setting, on: bool) -> Option<String> {
+fn changed(text: &str, section: &str, key: &str, new: Value) -> Option<String> {
     let mut doc: DocumentMut = text.parse().ok()?;
-    if !doc.contains_key(SECTION) {
-        // Any other table is an error, so the file holds comments at most: they
-        // stay before the new table, then one blank line, as the Python itm writes it.
+    if !doc.contains_key(section) {
+        // The file holds comments and the other known table at most: comments
+        // after the last table stay before the new one, then one blank line.
         let mut before = doc.trailing().as_str().unwrap_or_default().to_string();
         if !before.is_empty() && !before.ends_with('\n') {
             before.push('\n');
         }
-        if before.lines().last().is_some_and(|l| !l.trim().is_empty()) {
+        if before.lines().last().is_some_and(|l| !l.trim().is_empty()) || (before.is_empty() && !doc.is_empty()) {
             before.push('\n');
         }
         let mut table = Table::new();
         table.decor_mut().set_prefix(before);
         doc.set_trailing("");
-        doc.insert(SECTION, Item::Table(table));
+        doc.insert(section, Item::Table(table));
     }
-    let table = doc.get_mut(SECTION)?.as_table_like_mut()?;
-    match table.get_mut(setting.key()) {
+    let table = doc.get_mut(section)?.as_table_like_mut()?;
+    match table.get_mut(key) {
         Some(Item::Value(value)) => {
             let decor = value.decor().clone();
-            *value = Value::from(on);
+            *value = new;
             *value.decor_mut() = decor;
         }
         Some(_) => return None,
-        None => drop(table.insert(setting.key(), toml_edit::value(on))),
+        None => drop(table.insert(key, Item::Value(new))),
     }
     let mut new = doc.to_string();
     if !new.ends_with('\n') {
         new.push('\n');
     }
     Some(new)
+}
+
+/// The theme the settings at `paths` name; Mocha when they cannot be read
+/// (the screen that opens says what is wrong with them where it matters).
+pub fn theme_setting(paths: &crate::paths::Paths) -> ThemeName {
+    let path = paths.config_file();
+    let shown = paths.display(&path);
+    read_text(&path, &shown).and_then(|text| parse(&text, &shown)).map(|s| s.theme).unwrap_or_default()
 }
 
 impl Itm {
@@ -199,16 +268,25 @@ impl Itm {
     /// through the link; the result must read back with the new value, or
     /// nothing is written.
     pub fn change_setting(&self, setting: Setting, on: bool) -> Result<()> {
+        self.change(SECTION, setting.key(), Value::from(on), |s| s.get(setting) == on)
+    }
+
+    /// Change the switcher's theme in `config.toml`, as [`Itm::change_setting`] does.
+    pub fn change_theme(&self, theme: ThemeName) -> Result<()> {
+        self.change(UI, THEME, Value::from(theme.key()), |s| s.theme == theme)
+    }
+
+    fn change(&self, section: &str, key: &str, new: Value, took: impl Fn(&Settings) -> bool) -> Result<()> {
         let config = self.paths.config_file();
         let lock = self.paths.config.join(".config.lock");
         let _lock = flocked(&lock).context(|| format!("cannot lock {}", self.paths.display(&lock)))?;
         let path = if config.is_symlink() { resolved(&config) } else { config.clone() };
         let shown = self.paths.display(&path);
         let text = read_text(&path, &shown)?;
-        let hand = || Error::Other(format!("could not change {SECTION}.{} in {shown}; edit it by hand", setting.key()));
-        let new = changed(&text, setting, on).ok_or_else(hand)?;
+        let hand = || Error::Other(format!("could not change {section}.{key} in {shown}; edit it by hand"));
+        let new = changed(&text, section, key, new).ok_or_else(hand)?;
         match parse(&new, &self.paths.display(&config)) {
-            Ok(settings) if settings.get(setting) == on => {}
+            Ok(settings) if took(&settings) => {}
             _ => return Err(hand()),
         }
         write_atomic(&path, &new).context(|| format!("cannot write {shown}"))
@@ -294,6 +372,31 @@ mod tests {
         assert_eq!(parse("herdr.remove_projects_without_workspace = false\n", "c").unwrap(), off);
         assert_eq!(parse("herdr = { remove_projects_without_workspace = false }\n", "c").unwrap(), off);
         assert_eq!(parse("# nothing\n[herdr]\n", "c").unwrap(), Settings::default());
+    }
+
+    /// The switcher's theme: `[ui] theme`, Mocha without it; a name it
+    /// does not know is an error that lists the ones it does.
+    #[test]
+    fn the_theme_is_a_setting() {
+        assert_eq!(parse("[ui]\ntheme = \"latte\"\n", "c").unwrap().theme, ThemeName::Latte);
+        assert_eq!(parse("ui.theme = \"terminal\"\n", "c").unwrap().theme, ThemeName::Terminal);
+        assert_eq!(parse("", "c").unwrap().theme, ThemeName::Mocha);
+        let error = |text: &str| parse(text, "~/c.toml").unwrap_err().to_string();
+        assert_eq!(
+            error("[ui]\ntheme = \"solarized\"\n"),
+            "~/c.toml: ui.theme must be one of \"mocha\", \"latte\", \"terminal\""
+        );
+        assert_eq!(error("[ui]\ncolors = \"latte\"\n"), "~/c.toml: unknown setting ui.colors");
+
+        let (_tmp, itm) = itm();
+        write(&itm, "# mine\n[herdr]\nprojects_from_workspaces = false\n");
+        itm.change_theme(ThemeName::Latte).unwrap();
+        assert_eq!(read(&itm), "# mine\n[herdr]\nprojects_from_workspaces = false\n\n[ui]\ntheme = \"latte\"\n");
+        itm.change_theme(ThemeName::Terminal).unwrap();
+        assert!(read(&itm).ends_with("[ui]\ntheme = \"terminal\"\n"));
+        let settings = itm.settings().unwrap();
+        assert_eq!((settings.theme, settings.projects_from_workspaces), (ThemeName::Terminal, false));
+        assert_eq!(ThemeName::Terminal.next(), ThemeName::Mocha);
     }
 
     /// R10.4: a file that cannot be read is an error, and itm then does not follow workspaces.

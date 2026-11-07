@@ -1,24 +1,23 @@
 ---
 source: src/tui/draw.rs
-assertion_line: 1129
 expression: "sized(&mut app, 100, 26)"
 ---
   Inbox 3   Snoozed 1   Archived 1   All 5                                            ⚑ 1 needs you
 
- › Search tasks · @project filters · or type a new title
+  › Search tasks · @project filters · or type a new title
 
- NEEDS YOU                                                     │  Fix login
- ⚑ Fix l╭──────────────────────────────────────────────────────────────────────────────────╮
- ACTIVE ╭──────────────────────────────────────────────────────────────────────────────────╮
- ● Write│ Projects                                                                         │
- ○ Old i│                                                                                  │
-        │ › ~/code/                                                                        │
+  NEEDS YOU  1                                                 │  Fix login
+ ▌⚑ Fix ╭──────────────────────────────────────────────────────────────────────────────────╮
+        ╭──────────────────────────────────────────────────────────────────────────────────╮
+  ACTIVE│ Projects                                                                         │
+  ● Writ│                                                                                  │
+  ○ Old │  › ~/code/                                                                       │
         │                                                                                  │
-        │ Use ~/code/                                                                      │
-        │   ~/code/api/  ◆ api saved                                                       │
-        │   ~/code/new/                                                                    │
-        │   ~/code/web/  ◆ web saved                                                       │
-        │                                                                                  │
+        │ ▌Use ~/code/                                                                     │
+        │    ~/code/api/  ◆ api saved                                                      │
+        │    ~/code/new/                                                                   │
+        │    ~/code/web/  ◆ web saved                                                      │
+        │                                                                                  │rites
         │ Enter adds the folder (or picks it when saved); tab goes into it.                │
         │                                                                                  │
         │ enter add · remove a ✓ one  tab complete a folder  ↑↓ move  esc back             │

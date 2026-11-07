@@ -1,20 +1,19 @@
 ---
 source: src/tui/draw.rs
-assertion_line: 946
 expression: screen(&mut app)
 ---
   Inbox 3   Snoozed 1   Archived 1   All 5                                                      ⚑ 1 needs you
 
- › Search tasks · @project filters · or type a new title
+  › Search tasks · @project filters · or type a new title
 
- NEEDS YOU                                                           │  Write docs
- ⚑ Fix login                                claude waiting · 4m      │
- ACTIVE                ╭──────────────────────────────────────────────────────────────╮ng
- ● Write docs          │ Snooze “Write docs”                                          │
- ○ Old idea            │                                                              │
-                       │ › Type 2h, 14:30, fri 9:00… or pick below                    │t · ctrl+o writes
-                       │                                                              │
-                       │  1 hour                                               09:00  │
+  NEEDS YOU  1                                                       │  Write docs
+  ⚑ Fix login                                claude waiting · 4m     │
+                       ╭──────────────────────────────────────────────────────────────╮
+  ACTIVE  2            │ Snooze “Write docs”                                          │ng
+ ▌● Write docs         │                                                              │
+  ○ Old idea           │  › Type 2h, 14:30, fri 9:00… or pick below                   │
+                       │                                                              │ · ctrl+o writes
+                       │ ▌1 hour                                               09:00  │
                        │  Until an agent needs me                           no timer  │
                        │                                                              │
                        │                                                              │

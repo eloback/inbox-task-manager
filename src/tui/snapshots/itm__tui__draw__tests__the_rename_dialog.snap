@@ -5,12 +5,12 @@ expression: screen(&mut app)
 
  Projects  repositories and folders tasks start in
 
- ◆ api      dir  ~/code/api                                    1 task · 1 open  used now
- ◆ web      dir  ~/code/web                                    0 tasks          used now
- ◆ backend  git  git@github.com:acme/backend.git               0 tasks          used now
- ◆ gone     dir  ~/code/gone                                   0 tasks          used 1m ago · folder missing
- ◆ Client X n╭──────────────────────────────────────────────────────────────────────────────────╮
-             │ Rename project “api”                                                             │
+    NAME     KIND WHERE                                         TASKS            USED
+ ▌◆ api      dir  ~/code/api                                    1 task · 1 open  used now
+  ◆ web      dir  ~/code/web                                    0 tasks          used now
+  ◆ backend  git  git@github.com:acme/backend.git               0 tasks          used now
+  ◆ gone     ╭──────────────────────────────────────────────────────────────────────────────────╮lder missing
+  ◆ Client X │ Rename project “api”                                                             │
              │                                                                                  │
              │ New name  2                                                                      │
              │                                                                                  │

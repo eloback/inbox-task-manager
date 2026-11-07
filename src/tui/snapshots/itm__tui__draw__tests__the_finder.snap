@@ -1,25 +1,24 @@
 ---
 source: src/tui/draw.rs
-assertion_line: 1111
 expression: "sized(&mut app, 100, 26)"
 ---
   Inbox 3   Snoozed 1   Archived 1   All 5                                            ⚑ 1 needs you
 
- › Search tasks · @project filters · or type a new title
+  › Search tasks · @project filters · or type a new title
 
- NEEDS YOU                                                     │  Fix login
- ⚑ Fix l╭──────────────────────────────────────────────────────────────────────────────────╮
- ACTIVE │ New task                                                                         │
- ● Write╭──────────────────────────────────────────────────────────────────────────────────╮
- ○ Old i│ Projects                                                                         │
+  NEEDS YOU  1                                                 │  Fix login
+ ▌⚑ Fix ╭──────────────────────────────────────────────────────────────────────────────────╮
+        │ New task                                                                         │
+  ACTIVE╭──────────────────────────────────────────────────────────────────────────────────╮
+  ● Writ│ Projects                                                                         │
+  ○ Old │                                                                                  │
+        │  › a                                                                             │
         │                                                                                  │
-        │ › a                                                                              │
-        │                                                                                  │
-        │   ◆ api         dir  ~/code/api                                                  │
-        │   ◆ backend     git  git@github.com:acme/backend.git                             │
-        │ + Add git repository…                                                            │
-        │ + Add local folder…  or type ~/ or /                                             │
-        │ + New project “a”…  no folder                                                    │
+        │ ▌  ◆ api         dir  ~/code/api                                                 │
+        │    ◆ backend     git  git@github.com:acme/backend.git                            │
+        │  + Add git repository…                                                           │
+        │  + Add local folder…  or type ~/ or /                                            │rites
+        │  + New project “a”…  no folder                                                   │
         │                                                                                  │
         │ enter add · remove a ✓ one  tab complete a folder  ↑↓ move  esc back             │
         ╰──────────────────────────────────────────────────────────────────────────────────╯

@@ -1,25 +1,24 @@
 ---
 source: src/tui/draw.rs
-assertion_line: 900
 expression: screen(&mut app)
 ---
   Inbox 3   Snoozed 1   Archived 1   All 5                                                      ⚑ 1 needs you
 
- › Search tasks · @project filters · or type a new title
+  › Search tasks · @project filters · or type a new title
 
- NEEDS YOU                                                           │  Fix login
- ⚑ Fix login                                claude waiting · 4m      │
- ACTIVE      ╭──────────────────────────────────────────────────────────────────────────────────╮
- ● Write docs│ Remove project “api”?                                                            │
- ○ Old idea  │                                                                                  │
-             │ Clone: /r/data/projects/github.com/acme/api                                      │
+  NEEDS YOU  1                                                       │  Fix login
+ ▌⚑ Fix login                                claude waiting · 4m     │
+             ╭──────────────────────────────────────────────────────────────────────────────────╮
+  ACTIVE  2  │ Remove project “api”?                                                            │
+  ● Write doc│                                                                                  │
+  ○ Old idea │ Clone: /r/data/projects/github.com/acme/api                                      │
              │                                                                                  │
-             │  Keep the clone  (default)                                                       │
-             │  Delete the clone                                                                │ writes
-             │                                                                                  │
+             │ ▌Keep the clone  (default)                                                       │
+             │  Delete the clone                                                                │
+             │                                                                                  │writes
              │ enter remove  esc cancel, nothing changes                                        │
              ╰──────────────────────────────────────────────────────────────────────────────────╯
-                                                                     │
+                                                                     │  used 1h ago
                                                                      │
                                                                      │
                                                                      │  enter open  ctrl+o notes

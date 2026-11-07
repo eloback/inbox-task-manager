@@ -24,6 +24,7 @@ mod form;
 mod help;
 mod projects;
 mod screen;
+mod theme;
 
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::Arc;
@@ -228,6 +229,7 @@ impl Work for Itm {
             }
             Job::Clone { url, name } => clones::clone_project(self, url, name.as_deref(), &run.clones, &|l| run.say(l)),
             Job::Setting { setting, on } => done(self.change_setting(*setting, *on)),
+            Job::Theme { theme } => done(self.change_theme(*theme)),
         }
     }
 
@@ -260,6 +262,7 @@ impl Work for NoWork {
 pub fn run(itm: &Arc<Itm>, view: View) -> Result<Option<String>> {
     // A measurement switch (scripts/measure.sh): quit right after the first frame with tasks.
     let exit_after_draw = std::env::var_os("ITM_EXIT_AFTER_DRAW").is_some_and(|v| v == "1");
+    theme::set(theme::chosen(crate::config::theme_setting(&itm.paths)));
     let app = App::new(view, itm.paths.clone(), itm.tz.clone(), Moment::now());
     let work: Arc<dyn Work> = Arc::clone(itm) as Arc<dyn Work>;
     let chosen = in_terminal(|terminal| event_loop(terminal, app, work, &TerminalEvents, exit_after_draw))?;
@@ -271,6 +274,7 @@ pub fn run(itm: &Arc<Itm>, view: View) -> Result<Option<String>> {
 
 /// `screen` alone, with `work` doing what it asks for; the action it closed with.
 fn alone(screen: Screen, paths: &Paths, tz: &TimeZone, work: Arc<dyn Work>) -> Result<Option<Action>> {
+    theme::set(theme::chosen(crate::config::theme_setting(paths)));
     let app = App::alone(screen, paths.clone(), tz.clone(), Moment::now());
     in_terminal(|terminal| event_loop(terminal, app, work, &TerminalEvents, false))
 }

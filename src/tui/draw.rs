@@ -6,26 +6,20 @@
 use jiff::tz::TimeZone;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Margin, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Clear, List, ListItem, Paragraph, Wrap};
+use ratatui::widgets::{Block, BorderType, Borders, Clear, HighlightSpacing, List, ListItem, Paragraph, Wrap};
 
 use super::app::{App, Query, Row, Snapshot, View};
 use super::screen::{RemoveDialog, Screen, SettingsScreen, SnoozeDialog};
-use crate::config::Setting;
+use super::theme::{self, theme};
+use crate::config::{Setting, ThemeName};
 use crate::paths::Paths;
 use crate::projects::{CloneChoice, CloneState};
 use crate::snooze::Until;
 use crate::status::AgentState;
 use crate::store::{Project, ProjectKind, State, Task};
 use crate::times::{age, day_and_clock, rel};
-
-pub const ACCENT: Color = Color::Cyan;
-pub const PROJECT: Color = Color::Magenta;
-pub const ERROR: Color = Color::Red;
-pub const WARNING: Color = Color::Yellow;
-pub const SUCCESS: Color = Color::Green;
-pub const MUTED: Color = Color::DarkGray;
 
 /// Dialogs are this wide, or as wide as the popup when it is narrower.
 pub const DIALOG: u16 = 64;
@@ -56,31 +50,68 @@ impl Tone {
     pub fn span(self, text: impl Into<String>) -> Span<'static> {
         match self {
             Tone::Muted => muted(text),
-            Tone::Error => colored(text, ERROR),
-            Tone::Warning => colored(text, WARNING),
+            Tone::Error => colored(text, theme().flag),
+            Tone::Warning => colored(text, theme().snooze),
         }
     }
 }
 
+/// Context: statuses, paths, what a dialog says it does (the sub tone).
 pub fn muted(text: impl Into<String>) -> Span<'static> {
-    Span::styled(text.into(), Style::new().fg(MUTED))
+    Span::styled(text.into(), theme().sub)
 }
 
-pub fn colored(text: impl Into<String>, color: Color) -> Span<'static> {
-    Span::styled(text.into(), Style::new().fg(color))
+/// Hints, counts and section labels on the screen or a panel (the faint tone).
+pub fn faint(text: impl Into<String>) -> Span<'static> {
+    Span::styled(text.into(), theme().faint)
+}
+
+/// A section's label: faint, bold, in capitals where it is written so (V6).
+pub fn label(text: impl Into<String>) -> Span<'static> {
+    Span::styled(text.into(), theme().faint.bold())
+}
+
+/// What is read: the text tone, even where the ground under it says otherwise.
+pub fn text(text: impl Into<String>) -> Span<'static> {
+    Span::styled(text.into(), theme().text)
+}
+
+pub fn colored(text: impl Into<String>, style: Style) -> Span<'static> {
+    Span::styled(text.into(), style)
 }
 
 pub fn bold(text: impl Into<String>) -> Span<'static> {
-    Span::styled(text.into(), Style::new().bold())
+    Span::styled(text.into(), theme().text.bold())
 }
 
 pub fn key_hints(keys: &[(&str, &str)]) -> Line<'static> {
     let mut spans = vec![];
     for (key, what) in keys {
-        spans.push(Span::styled(key.to_string(), Style::new().fg(ACCENT).bold()));
+        spans.push(Span::styled(key.to_string(), theme().key.bold()));
         spans.push(muted(format!(" {what}  ")));
     }
     Line::from(spans)
+}
+
+/// The highlighted row of a list (visual principle V3): the selection's
+/// ground, bold, its spans keeping their colors, and a bar in front.
+pub fn highlight() -> Style {
+    let sel = theme().sel;
+    // The ground only: a foreground here would paint over every span's own.
+    Style { fg: None, ..sel }.bold()
+}
+
+pub fn highlight_bar() -> Span<'static> {
+    Span::styled("▌", theme().accent)
+}
+
+/// Paints `area` with the screen's ground, and the theme the settings
+/// name (or `ITM_THEME`) from this frame on.
+pub fn ground(frame: &mut Frame, area: Rect, setting: Option<ThemeName>) {
+    if let Some(setting) = setting {
+        theme::set(theme::chosen(setting));
+    }
+    frame.render_widget(Block::new().style(theme().bg), area);
 }
 
 /// Key hints on as many lines as `width` needs, never cutting one (UX principle 5).
@@ -105,6 +136,8 @@ pub fn cut(text: &str, max: usize) -> String {
 }
 
 pub fn draw(frame: &mut Frame, app: &mut App, now: i64) {
+    let setting = app.snapshot.as_ref().and_then(|s| s.settings.as_ref().ok()).map(|s| s.theme);
+    ground(frame, frame.area(), setting);
     if app.alone {
         for screen in &app.screens {
             draw_screen(frame, screen, frame.area(), &app.tz, now, &app.paths);
@@ -130,7 +163,10 @@ pub fn draw(frame: &mut Frame, app: &mut App, now: i64) {
     draw_list(frame, app, list, now);
     draw_preview(frame, app, side, now);
     if let Some(m) = &app.message {
-        frame.render_widget(Paragraph::new(colored(m.text.clone(), if m.error { ERROR } else { SUCCESS })), message);
+        frame.render_widget(
+            Paragraph::new(colored(m.text.clone(), if m.error { theme().flag } else { theme().ok })),
+            message,
+        );
     }
     frame.render_widget(Paragraph::new(hints), keys);
     for screen in &app.screens {
@@ -141,13 +177,13 @@ pub fn draw(frame: &mut Frame, app: &mut App, now: i64) {
 /// Views are always shown with their counts (R6.1), and the inbox says
 /// when waits are unknown instead of showing none (R7.3).
 fn draw_views(frame: &mut Frame, app: &App, area: Rect) {
+    let t = theme();
     let mut spans = vec![];
     for view in View::ALL {
-        let label = format!(" {} {} ", view.label(), app.count(view));
-        spans.push(if view == app.view {
-            Span::styled(label, Style::new().fg(ACCENT).bold().reversed())
-        } else {
-            muted(label)
+        let (label, count) = (format!(" {} ", view.label()), format!("{} ", app.count(view)));
+        spans.extend(match view == app.view {
+            true => [Span::styled(label, t.field.bold()), Span::styled(count, t.field.patch(t.accent).bold())],
+            false => [muted(label), faint(count)],
         });
         spans.push(Span::raw(" "));
     }
@@ -155,16 +191,16 @@ fn draw_views(frame: &mut Frame, app: &App, area: Rect) {
     let Some(snap) = &app.snapshot else { return };
     let state = if !snap.listed {
         let daemon = if snap.status.fresh { "" } else { " · daemon not running" };
-        colored(format!("Herdr not answering · sessions unknown{daemon}"), WARNING)
+        colored(format!("Herdr not answering · sessions unknown{daemon}"), t.snooze)
     } else if !snap.status.fresh {
-        colored("daemon not running · waits unknown", WARNING)
+        colored("daemon not running · waits unknown", t.snooze)
     } else {
         let tasks = snap.data.tasks.iter();
         let waiting = tasks.filter(|(name, t)| t.state != State::Archived && snap.status.waiting(name) > 0).count();
         if waiting == 0 {
             return;
         }
-        Span::styled(format!("⚑ {waiting} needs you"), Style::new().fg(ERROR).bold())
+        Span::styled(format!("⚑ {waiting} needs you"), t.flag.bold())
     };
     frame.render_widget(Paragraph::new(state).right_aligned(), area);
 }
@@ -177,9 +213,11 @@ fn draw_search(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         Span::raw(typed.to_string())
     };
-    frame.render_widget(Paragraph::new(Line::from(vec![colored("› ", ACCENT), text])), area);
+    // A filled field, so it is clear where typing goes (visual principle V4).
+    let line = Line::from(vec![colored(" › ", theme().accent.bold()), text]);
+    frame.render_widget(Paragraph::new(line).style(theme().field), area);
     if app.screens.is_empty() {
-        frame.set_cursor_position((area.x + 2 + app.search.visual_cursor() as u16, area.y));
+        frame.set_cursor_position((area.x + 3 + app.search.visual_cursor() as u16, area.y));
     }
 }
 
@@ -192,30 +230,38 @@ fn draw_list(frame: &mut Frame, app: &mut App, area: Rect, now: i64) {
         })
         .collect();
     let widest = statuses.iter().flatten().map(Status::width).max().unwrap_or(0);
-    let columns = Columns::fitting(area.width as usize - 1, widest); // one column from the preview
-    let items: Vec<ListItem> = (app.rows.iter().zip(statuses))
-        .map(|(row, status)| match (row, status) {
+    // One column for the bar in front, one from the preview.
+    let columns = Columns::fitting((area.width as usize).saturating_sub(2), widest);
+    let t = theme();
+    let items: Vec<ListItem> = (app.rows.iter().enumerate().zip(statuses))
+        .map(|((i, row), status)| match (row, status) {
             (Row::Task(name), Some(status)) => ListItem::new(task_line(snap, &snap.data.tasks[name], status, columns)),
             (Row::Header(header), _) => {
-                let color = if *header == "NEEDS YOU" { ERROR } else { MUTED };
-                ListItem::new(Span::styled(*header, Style::new().fg(color).bold()))
+                // A blank row before every section but the first, and how many it holds (V6).
+                let count = app.rows[i + 1..].iter().take_while(|r| matches!(r, Row::Task(_))).count();
+                let style = if *header == "NEEDS YOU" { t.flag } else { t.text };
+                let line = Line::from(vec![Span::styled(*header, style.bold()), faint(format!("  {count}"))]);
+                ListItem::new(if i == 0 { vec![line] } else { vec![Line::default(), line] })
             }
-            (Row::UnknownProject(name), _) => ListItem::new(colored(format!("No project named “{name}”"), WARNING)),
+            (Row::UnknownProject(name), _) => ListItem::new(colored(format!("No project named “{name}”"), t.snooze)),
             (Row::Create, _) => {
                 let mut line = vec![
-                    colored("+ ", ACCENT),
+                    colored("+ ", t.accent),
                     Span::raw(format!("Create task “{}”", Query::parse(app.search.value()).text)),
                 ];
                 // R6.2: in the filter's project (or the current task's first).
                 if let Some(project) = app.default_projects().first().and_then(|id| snap.data.projects.get(id)) {
-                    line.extend([Span::raw(" in "), colored(format!("◆ {}", project.name), PROJECT)]);
+                    line.extend([Span::raw(" in "), colored(format!("◆ {}", project.name), t.project)]);
                 }
                 ListItem::new(Line::from(line))
             }
             (Row::Task(_), None) => unreachable!("every task row has a status"),
         })
         .collect();
-    let list = List::new(items).highlight_style(Style::new().add_modifier(Modifier::BOLD | Modifier::REVERSED));
+    let list = List::new(items)
+        .highlight_style(highlight())
+        .highlight_symbol(highlight_bar())
+        .highlight_spacing(HighlightSpacing::Always);
     frame.render_stateful_widget(list, area, &mut app.list);
 }
 
@@ -257,17 +303,18 @@ impl Columns {
 }
 
 fn status(snap: &Snapshot, name: &str, task: &Task, now: i64) -> Status {
+    let t = theme();
     let session = snap.sessions.get(name);
     let longest_wait = snap.status.blocked(name).min_by_key(|a| a.since.unwrap_or(now));
     let (icon, detail) = match (task.state, longest_wait) {
         (State::Snoozed, _) => match task.snoozed_until {
-            Some(until) => (colored("◔", WARNING), colored(format!("wakes {}", rel(until, now)), WARNING)),
-            None => (colored("◔", WARNING), colored("until an agent asks", WARNING)),
+            Some(until) => (colored("◔", t.snooze), colored(format!("wakes {}", rel(until, now)), t.snooze)),
+            None => (colored("◔", t.snooze), colored("until an agent asks", t.snooze)),
         },
         (State::Archived, _) => (muted("▣"), muted(format!("archived {}", rel(task.archived_at.unwrap_or(now), now)))),
         (State::Active, Some(wait)) => {
             let waited = age(wait.since.unwrap_or(now), now);
-            (colored("⚑", ERROR), colored(format!("{} waiting · {waited}", wait.agent), ERROR))
+            (colored("⚑", t.flag), colored(format!("{} waiting · {waited}", wait.agent), t.flag))
         }
         _ if !snap.listed => (muted("?"), muted("session unknown")),
         _ if session.is_none() => (muted("○"), muted("not started")),
@@ -275,13 +322,13 @@ fn status(snap: &Snapshot, name: &str, task: &Task, now: i64) -> Status {
             (muted("○"), muted(format!("stopped · {}", rel(task.last_used_at, now))))
         }
         _ if snap.status.agents(name).iter().any(|a| a.status == AgentState::Working) => {
-            (colored("●", SUCCESS), colored("working", SUCCESS))
+            (colored("●", t.ok), colored("working", t.ok))
         }
-        _ => (colored("●", SUCCESS), muted("idle")),
+        _ => (colored("●", t.ok), muted("idle")),
     };
     let mut detail = vec![detail];
     if snap.current.as_deref() == Some(name) {
-        detail.push(colored(" · here", ACCENT));
+        detail.push(colored(" · here", t.accent));
     }
     Status { icon, detail }
 }
@@ -303,7 +350,7 @@ fn task_line(snap: &Snapshot, task: &Task, status: Status, columns: Columns) -> 
             None => String::new(),
         };
         let pad = columns.project.saturating_sub(badge.chars().count()).max(1);
-        spans.push(colored(badge + &" ".repeat(pad), PROJECT));
+        spans.push(colored(badge + &" ".repeat(pad), theme().project));
     }
     spans.extend(status.detail);
     Line::from(spans)
@@ -316,7 +363,7 @@ fn project_names(snap: &Snapshot, task: &Task) -> Vec<String> {
 /// The highlighted task's context: projects, description, state, agents
 /// (UX principle 12), and the key that opens it, named for its state.
 fn draw_preview(frame: &mut Frame, app: &App, area: Rect, now: i64) {
-    let block = Block::new().borders(Borders::LEFT).border_style(Style::new().fg(MUTED));
+    let block = Block::new().borders(Borders::LEFT).border_style(theme().rule);
     let inner = block.inner(area).inner(Margin { horizontal: 2, vertical: 0 });
     frame.render_widget(block, area);
     let (lines, enter) = preview(app, now);
@@ -348,19 +395,22 @@ fn preview(app: &App, now: i64) -> (Vec<Line<'static>>, Option<&'static str>) {
         }
         _ => return (vec![], None),
     };
-    let mut lines = vec![Line::from(Span::styled(task.title.clone(), Style::new().bold()))];
+    let t = theme();
+    let mut lines = vec![Line::from(bold(task.title.clone()))];
     // The daemon's record of open workspaces holds only while the session runs (R10.3).
     let running = snap.sessions.get(name).is_some_and(|s| s.running);
     for (id, project) in task.projects.iter().filter_map(|id| Some((id, snap.data.projects.get(id)?))) {
-        let mut head =
-            vec![colored(format!("◆ {}", project.name), PROJECT), muted(format!("  {}", project.kind().name()))];
+        let mut head = vec![
+            colored(format!("◆ {}", project.name), t.project.bold()),
+            faint(format!("  {}", project.kind().name())),
+        ];
         if running && task.workspace_projects.contains(id) {
-            head.push(colored("  workspace open", SUCCESS));
+            head.push(colored("  workspace open", t.ok));
         }
         lines.push(Line::from(head));
         lines.push(Line::from(muted(format!("  {}", app.paths.place(project)))));
         if snap.missing.contains(id) {
-            lines.push(Line::from(colored("  Its folder is missing, so it gets no workspace.", ERROR)));
+            lines.push(Line::from(colored("  Its folder is missing, so it gets no workspace.", t.flag)));
         } else if project.kind() == ProjectKind::Name {
             lines.push(Line::from(muted("  give it one: prefix+shift+a in its workspace, or itm project set")));
         }
@@ -368,9 +418,9 @@ fn preview(app: &App, now: i64) -> (Vec<Line<'static>>, Option<&'static str>) {
     if let Some(description) = &task.description {
         lines.push(Line::default());
         let all: Vec<&str> = description.lines().collect();
-        lines.extend(all.iter().take(5).map(|l| Line::from(muted(l.to_string()))));
+        lines.extend(all.iter().take(5).map(|l| Line::from(text(l.to_string()))));
         if all.len() > 5 {
-            lines.push(Line::from(muted("…")));
+            lines.push(Line::from(faint("…")));
         }
     }
     lines.push(Line::default());
@@ -380,7 +430,7 @@ fn preview(app: &App, now: i64) -> (Vec<Line<'static>>, Option<&'static str>) {
                 Some(until) => format!("◔ snoozed until {} ({})", day_and_clock(until, now, &app.tz), rel(until, now)),
                 None => "◔ snoozed until an agent needs you".into(),
             };
-            lines.extend([Line::from(colored(text, WARNING)), Line::default()]);
+            lines.extend([Line::from(colored(text, t.snooze)), Line::default()]);
         }
         State::Archived => {
             let when = rel(task.archived_at.unwrap_or(now), now);
@@ -389,15 +439,18 @@ fn preview(app: &App, now: i64) -> (Vec<Line<'static>>, Option<&'static str>) {
         State::Active => {}
     }
     let agents = snap.status.agents(name);
+    if !agents.is_empty() {
+        lines.push(Line::from(label("AGENTS")));
+    }
     for agent in agents {
         let label = format!("{:<7}", agent.agent);
         lines.push(Line::from(match agent.status {
             AgentState::Blocked => {
                 let waited = age(agent.since.unwrap_or(now), now);
-                vec![colored("⚑ ", ERROR), Span::raw(label), colored(format!(" waiting {waited}"), ERROR)]
+                vec![colored("⚑ ", t.flag), bold(label), colored(format!(" waiting {waited}"), t.flag)]
             }
-            AgentState::Working => vec![colored("● ", SUCCESS), Span::raw(label), muted(" working")],
-            other => vec![muted("○ "), Span::raw(label), muted(format!(" {}", other.name()))],
+            AgentState::Working => vec![colored("● ", t.ok), bold(label), colored(" working", t.ok)],
+            other => vec![muted("○ "), bold(label), muted(format!(" {}", other.name()))],
         }));
         if !agent.title.is_empty() {
             lines.push(Line::from(muted(format!("  {}", agent.title))));
@@ -406,16 +459,16 @@ fn preview(app: &App, now: i64) -> (Vec<Line<'static>>, Option<&'static str>) {
     if agents.is_empty() {
         let session = snap.sessions.get(name);
         lines.push(Line::from(match session {
-            _ if !snap.listed => colored("Session unknown: Herdr is not answering", WARNING),
+            _ if !snap.listed => colored("Session unknown: Herdr is not answering", t.snooze),
             None => muted(not_started(app, snap, task)),
             Some(s) if !s.running => muted("Session stopped · opens where you left it"),
             Some(_) if snap.status.fresh => muted("No agents running"),
-            Some(_) => colored("Agents unknown: the daemon is not running", WARNING),
+            Some(_) => colored("Agents unknown: the daemon is not running", t.snooze),
         }));
     }
     lines.push(Line::default());
     lines.extend(notes_preview(snap, name, task, now));
-    lines.extend([Line::default(), Line::from(muted(format!("used {}", rel(task.last_used_at, now))))]);
+    lines.extend([Line::default(), Line::from(faint(format!("used {}", rel(task.last_used_at, now))))]);
     let enter = match task.state {
         State::Active => "open",
         State::Snoozed => "wake & open",
@@ -428,19 +481,27 @@ fn preview(app: &App, now: i64) -> (Vec<Line<'static>>, Option<&'static str>) {
 /// what itm started them with (the preview shows those already).
 fn notes_preview(snap: &Snapshot, name: &str, task: &Task, now: i64) -> Vec<Line<'static>> {
     let Some(tail) = snap.notes.get(name) else {
-        return vec![Line::from(muted("Notes · none yet · ctrl+o writes some"))];
+        return vec![Line::from(vec![label("NOTES"), faint("  none yet · ctrl+o writes some")])];
     };
     let known: Vec<&str> = task.description.as_deref().unwrap_or("").lines().map(str::trim).collect();
     let started = |line: &str| line.starts_with("# ") || (line.starts_with("*Created ") && line.ends_with('*'));
     let written: Vec<&String> = (tail.lines.iter()).filter(|l| !started(l) && !known.contains(&l.trim())).collect();
     if written.is_empty() {
-        return vec![Line::from(muted("Notes · nothing written yet · ctrl+o"))];
+        return vec![Line::from(vec![label("NOTES"), faint("  nothing written yet · ctrl+o")])];
     }
-    let mut lines = vec![Line::from(muted(format!("Notes · edited {}", rel(tail.modified, now))))];
-    lines.extend(
-        written[written.len().saturating_sub(3)..].iter().map(|l| Line::from(muted(format!("  {}", cut(l, 80))))),
-    );
+    let mut lines = vec![Line::from(vec![label("NOTES"), faint(format!("  edited {}", rel(tail.modified, now)))])];
+    lines.extend(written[written.len().saturating_sub(3)..].iter().map(|l| note_line(l)));
     lines
+}
+
+/// A line of the notes as text, not markdown (visual principle V7): a
+/// heading without its #s, in bold, the rest as it was written.
+fn note_line(line: &str) -> Line<'static> {
+    let heading = line.trim_start_matches('#');
+    match heading.len() < line.len() && heading.starts_with(' ') {
+        true => Line::from(Span::styled(cut(heading.trim(), 80), theme().sub.bold())),
+        false => Line::from(text(cut(line, 80))),
+    }
 }
 
 /// Where a session that never ran will start (R1.2): in its first project
@@ -460,13 +521,20 @@ fn not_started(app: &App, snap: &Snapshot, task: &Task) -> String {
 /// wide (Herdr's popup border is the only outer border, so a dialog alone
 /// fills the popup when it is smaller); returns the area inside its border.
 pub fn dialog_box(frame: &mut Frame, area: Rect, width: u16, height: u16) -> Rect {
+    framed(frame, area, width, height, theme().accent)
+}
+
+/// A dialog box with its border in `border`: the action's color (V5).
+/// What it covers is dimmed first, and it has a ground of its own.
+pub fn framed(frame: &mut Frame, area: Rect, width: u16, height: u16, border: Style) -> Rect {
+    theme::dim(frame.buffer_mut(), area);
     let [_, row, _] =
         Layout::vertical([Constraint::Fill(1), Constraint::Length(height.min(area.height)), Constraint::Fill(1)])
             .areas(area);
     let [_, rect, _] =
         Layout::horizontal([Constraint::Fill(1), Constraint::Length(area.width.min(width)), Constraint::Fill(1)])
             .areas(row);
-    let block = Block::bordered().border_type(BorderType::Rounded).border_style(Style::new().fg(ACCENT));
+    let block = Block::bordered().border_type(BorderType::Rounded).border_style(border).style(theme().panel);
     frame.render_widget(Clear, rect);
     let inside = block.inner(rect).inner(Margin { horizontal: 1, vertical: 0 });
     frame.render_widget(block, rect);
@@ -493,9 +561,14 @@ fn draw_screen(frame: &mut Frame, screen: &Screen, area: Rect, tz: &TimeZone, no
 
 /// Lines in a dialog box as tall as they wrap to.
 pub fn wrapped_dialog(frame: &mut Frame, area: Rect, width: u16, lines: Vec<Line<'static>>) -> Rect {
+    wrapped_framed(frame, area, width, lines, theme().accent)
+}
+
+/// [`wrapped_dialog`] with its border in `border`.
+pub fn wrapped_framed(frame: &mut Frame, area: Rect, width: u16, lines: Vec<Line<'static>>, border: Style) -> Rect {
     let inner = (area.width.min(width).saturating_sub(4)).max(1) as usize; // less border and margin
     let rows: usize = lines.iter().map(|line| wrapped_rows(line, inner)).sum();
-    let inside = dialog_box(frame, area, width, rows as u16 + 2);
+    let inside = framed(frame, area, width, rows as u16 + 2, border);
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inside);
     inside
 }
@@ -545,15 +618,15 @@ pub fn name_badge(name: &str, width: usize, matched: &[usize]) -> Vec<Span<'stat
     let room = width.saturating_sub(4).max(1);
     let cut = chars.len() > width.saturating_sub(3);
     let shown: Vec<char> = if cut { chars[..room.min(chars.len())].to_vec() } else { chars };
-    let mut spans = vec![colored("◆ ", PROJECT)];
-    let style = Style::new().fg(PROJECT);
+    let mut spans = vec![colored("◆ ", theme().project)];
+    let style = theme().project;
     for (i, c) in shown.iter().enumerate() {
         let style =
             if matched.contains(&i) { style.add_modifier(Modifier::BOLD | Modifier::UNDERLINED) } else { style };
         spans.push(Span::styled(c.to_string(), style));
     }
     if cut {
-        spans.push(colored("…", PROJECT));
+        spans.push(colored("…", theme().project));
     }
     let used: usize = spans.iter().map(Span::width).sum();
     spans.push(Span::raw(" ".repeat(width.saturating_sub(used).max(1))));
@@ -564,7 +637,8 @@ pub fn name_badge(name: &str, width: usize, matched: &[usize]) -> Vec<Span<'stat
 pub fn project_line(project: &Project, matched: &[usize], missing: bool, paths: &Paths) -> Vec<Span<'static>> {
     let mut spans = name_badge(&project.name, 14, matched);
     let gone = if missing { " (folder missing)" } else { "" };
-    spans.push(muted(format!("{:<4} {}{gone}", project.kind().name(), paths.place(project))));
+    spans.push(faint(format!("{:<4} ", project.kind().name())));
+    spans.push(muted(format!("{}{gone}", paths.place(project))));
     spans
 }
 
@@ -600,23 +674,39 @@ pub fn field_line<'a>(
     focus: FieldFocus,
     room: usize,
 ) -> (Line<'a>, u16) {
+    let t = theme();
     let style = match focus {
-        FieldFocus::Unfocused => Style::new().fg(MUTED),
-        FieldFocus::Focused | FieldFocus::Selected => Style::new().fg(ACCENT).bold(),
+        FieldFocus::Unfocused => t.sub,
+        FieldFocus::Focused | FieldFocus::Selected => t.accent.bold(),
     };
     let mut spans = vec![Span::styled(format!("{label:<width$}"), style)];
-    let scroll = input.visual_scroll(room.saturating_sub(1).max(1)); // a column for the cursor at the end
-    match input.value() {
-        "" => spans.push(muted(placeholder.to_string())),
+    // The field is filled to its end (visual principle V4); selected text on the selection's ground.
+    let mut value_spans = match input.value() {
+        "" => vec![Span::styled(placeholder.to_string(), t.field.patch(t.sub))],
         value => {
-            let selected = if focus == FieldFocus::Selected { Style::new().reversed() } else { Style::new() };
-            spans.push(Span::styled(skip_columns(value, scroll), selected));
+            let selected = if focus == FieldFocus::Selected { t.sel.patch(t.accent).bold() } else { t.field };
+            let scroll = input.visual_scroll(room.saturating_sub(1).max(1));
+            let mut spans = vec![Span::styled(skip_columns(value, scroll), selected)];
             if let Some(rest) = ghost.and_then(|g| g.strip_prefix(value)) {
-                spans.push(muted(rest.to_string()));
+                spans.push(Span::styled(rest.to_string(), t.field.patch(t.sub)));
             }
+            spans
         }
-    }
+    };
+    let used: usize = value_spans.iter().map(Span::width).sum();
+    value_spans.push(Span::styled(" ".repeat(room.saturating_sub(used)), t.field));
+    spans.extend(value_spans);
+    let scroll = input.visual_scroll(room.saturating_sub(1).max(1)); // a column for the cursor at the end
     (Line::from(spans), (width + input.visual_cursor() - scroll) as u16)
+}
+
+/// `spans` on a field's ground, filled out to `room` columns (V4).
+pub fn filled(spans: Vec<Span<'static>>, room: usize) -> Vec<Span<'static>> {
+    let field = theme().field;
+    let used: usize = spans.iter().map(Span::width).sum();
+    let mut spans: Vec<Span> = spans.into_iter().map(|s| Span::styled(s.content, field.patch(s.style))).collect();
+    spans.push(Span::styled(" ".repeat(room.saturating_sub(used)), field));
+    spans
 }
 
 /// `text` without its first `columns` display columns.
@@ -634,9 +724,9 @@ fn skip_columns(text: &str, columns: usize) -> String {
 /// task, so the question says so (R10.5, UX principle 10).
 fn draw_confirm_folder(frame: &mut Frame, project: &str, folder: &str, area: Rect) {
     let lines = vec![
-        Line::from(Span::styled(format!("Give {folder} to {project}?"), Style::new().bold())),
+        Line::from(bold(format!("Give {folder} to {project}?"))),
         Line::default(),
-        Line::from(muted(format!(
+        Line::from(text(format!(
             "{project} has no folder. With this one, workspaces in it count as {project} in every task, and new tasks with {project} start there."
         ))),
         Line::default(),
@@ -648,37 +738,42 @@ fn draw_confirm_folder(frame: &mut Frame, project: &str, folder: &str, area: Rec
 /// The settings, each with what it does; a file with a mistake is shown
 /// instead of toggles that would not save (R10.4).
 fn draw_settings(frame: &mut Frame, screen: &SettingsScreen, area: Rect) {
-    let mut lines = vec![
-        Line::from(Span::styled("Settings", Style::new().bold())),
-        Line::default(),
-        Line::from(Span::styled("Herdr integration", Style::new().bold())),
-    ];
+    let t = theme();
+    let mut lines = vec![Line::from(bold("Settings")), Line::default(), Line::from(label("Herdr integration"))];
     // A file with a mistake: the defaults are shown, and nothing can be toggled.
     let shown = screen.settings.clone().unwrap_or_default();
+    let style = |i: usize| match screen.settings {
+        Ok(_) if i == screen.selected => highlight(),
+        Ok(_) => t.text,
+        Err(_) => t.sub,
+    };
+    let width = area.width.min(WIDE).saturating_sub(4) as usize; // inside the border and margin
     for (i, setting) in Setting::ALL.into_iter().enumerate() {
         let mark = match shown.get(setting) {
-            true if screen.settings.is_ok() => colored("● ", SUCCESS),
+            true if screen.settings.is_ok() => colored("● ", t.ok),
             true => muted("● "),
             false => muted("○ "),
         };
-        let style = match screen.settings {
-            Ok(_) if i == screen.selected => Style::new().add_modifier(Modifier::REVERSED),
-            Ok(_) => Style::new(),
-            Err(_) => Style::new().fg(MUTED),
-        };
-        lines.push(Line::from(vec![mark, Span::styled(setting.label(), style)]));
-        let width = area.width.min(WIDE).saturating_sub(4) as usize; // inside the border and margin
+        lines.push(Line::from(vec![mark, Span::styled(setting.label(), style(i))]));
         lines.extend(indented(setting.help(), width, 2).into_iter().map(|line| Line::from(muted(line))));
     }
+    // The look: one row, so the screen fits a popup as small as it did without it.
+    let i = Setting::ALL.len();
+    lines.push(Line::from(vec![
+        colored("◐ ", t.accent),
+        Span::styled("Colors", style(i)),
+        Span::styled(format!("  {}", shown.theme.label()), style(i).patch(t.accent)),
+        faint("  ITM_THEME overrides it"),
+    ]));
     lines.push(Line::default());
     lines.push(Line::from(match (&screen.settings, &screen.failed) {
-        (Err(e), _) => colored(e.clone(), ERROR),
-        (_, Some(e)) => colored(format!("Not saved: {e}"), ERROR),
+        (Err(e), _) => colored(e.clone(), t.flag),
+        (_, Some(e)) => colored(format!("Not saved: {e}"), t.flag),
         _ if screen.saving => muted("Saving…"),
         _ => muted(format!("Saved in {}; the daemon reads it on every pass.", screen.file)),
     }));
     lines.push(Line::default());
-    lines.push(key_hints(&[("enter / space", "toggle"), ("esc", "close")]));
+    lines.push(key_hints(&[("enter / space", "change"), ("esc", "close")]));
     wrapped_dialog(frame, area, WIDE, lines);
 }
 
@@ -687,45 +782,36 @@ fn draw_discard(frame: &mut Frame, area: Rect) {
     let lines = vec![
         Line::from(bold("Discard what you typed?")),
         Line::default(),
-        Line::from(vec![
-            Span::styled("y", Style::new().fg(ERROR).bold()),
-            muted(" discard   "),
-            Span::styled("n", Style::new().fg(ACCENT).bold()),
-            muted(" keep editing"),
-        ]),
+        answers(("discard", theme().flag), "keep editing"),
     ];
-    wrapped_dialog(frame, area, DIALOG, lines);
+    wrapped_framed(frame, area, DIALOG, lines, theme().flag);
 }
 
 /// Deleting cannot be undone, and the question says what goes (UX principle 10).
 fn draw_delete(frame: &mut Frame, title: &str, area: Rect) {
     let lines = vec![
-        Line::from(Span::styled(format!("Delete “{title}”?"), Style::new().bold())),
+        Line::from(bold(format!("Delete “{title}”?"))),
         Line::default(),
-        Line::from(muted(
+        Line::from(text(
             "Stops its session and removes its layout, agents and notes. Its project stays. This cannot be undone.",
         )),
         Line::default(),
-        Line::from(vec![
-            Span::styled("y", Style::new().fg(ERROR).bold()),
-            muted(" delete   "),
-            Span::styled("n", Style::new().fg(ACCENT).bold()),
-            muted(" keep"),
-        ]),
+        answers(("delete", theme().flag), "keep"),
     ];
-    wrapped_dialog(frame, area, DIALOG, lines);
+    wrapped_framed(frame, area, DIALOG, lines, theme().flag);
 }
 
 /// What removing a project does to its clone (R8.7): only a clean clone of
 /// itm's own is offered for deleting, and keeping it comes first.
 fn draw_remove(frame: &mut Frame, dialog: &RemoveDialog, area: Rect) {
     let folder = dialog.folder.clone().unwrap_or_default();
-    let mut lines = vec![Line::from(Span::styled(format!("Remove project “{}”?", dialog.name), Style::new().bold()))];
+    let t = theme();
+    let mut lines = vec![Line::from(bold(format!("Remove project “{}”?", dialog.name)))];
     lines.push(Line::default());
     if !dialog.users.is_empty() {
         lines.push(Line::from(colored(
             format!("Used by {} task(s), archived ones included:", dialog.users.len()),
-            ERROR,
+            t.flag,
         )));
         lines.extend(dialog.users.iter().map(|title| Line::from(format!("  · {title}"))));
         lines.push(Line::default());
@@ -741,7 +827,7 @@ fn draw_remove(frame: &mut Frame, dialog: &RemoveDialog, area: Rect) {
             (_, Some(CloneState::Missing)) => lines.push(Line::from(muted("Its clone is already gone."))),
             (_, Some(CloneState::Deletable { local_work: Some(work) })) => {
                 lines.push(Line::from(vec![muted("Clone: "), Span::raw(folder)]));
-                lines.push(Line::from(colored(format!("It has {work}, so the clone is kept."), WARNING)));
+                lines.push(Line::from(colored(format!("It has {work}, so the clone is kept."), t.snooze)));
                 let force = format!("To delete it anyway: itm project remove {} --delete-clone", dialog.name);
                 lines.push(Line::from(muted(force)));
             }
@@ -757,14 +843,15 @@ fn draw_remove(frame: &mut Frame, dialog: &RemoveDialog, area: Rect) {
         let with_work = matches!(dialog.clone, Some(CloneState::Deletable { local_work: Some(_) }));
         for (i, choice) in dialog.choices.iter().enumerate() {
             let (text, color) = match choice {
-                CloneChoice::Keep if clean => ("Keep the clone  (default)", Color::Reset),
-                CloneChoice::Keep if with_work => ("Forget the project, keep the clone", Color::Reset),
-                CloneChoice::Keep => ("Forget the project", Color::Reset),
-                CloneChoice::IfClean | CloneChoice::Delete => ("Delete the clone", ERROR),
+                CloneChoice::Keep if clean => ("Keep the clone  (default)", t.text),
+                CloneChoice::Keep if with_work => ("Forget the project, keep the clone", t.text),
+                CloneChoice::Keep => ("Forget the project", t.text),
+                CloneChoice::IfClean | CloneChoice::Delete => ("Delete the clone", t.flag),
             };
-            let style = Style::new().fg(color);
-            let style = if i == dialog.selected { style.add_modifier(Modifier::REVERSED) } else { style };
-            lines.push(Line::from(Span::styled(format!(" {text} "), style)));
+            lines.push(Line::from(match i == dialog.selected {
+                true => vec![highlight_bar(), Span::styled(format!("{text} "), highlight().patch(color))],
+                false => vec![Span::styled(format!(" {text} "), color)],
+            }));
         }
     }
     lines.push(Line::default());
@@ -773,26 +860,31 @@ fn draw_remove(frame: &mut Frame, dialog: &RemoveDialog, area: Rect) {
         false => &[("enter", "remove"), ("esc", "cancel, nothing changes")],
     };
     lines.push(key_hints(keys));
-    wrapped_dialog(frame, area, WIDE, lines);
+    wrapped_framed(frame, area, WIDE, lines, t.flag);
 }
 
 /// Destructive actions confirm and say what will be lost (UX principle 10).
 fn draw_archive(frame: &mut Frame, title: &str, area: Rect) {
     let lines = vec![
-        Line::from(Span::styled(format!("Archive “{title}”?"), Style::new().bold())),
+        Line::from(bold(format!("Archive “{title}”?"))),
         Line::default(),
-        Line::from(muted(
+        Line::from(text(
             "Stops its session and the programs running in it. Reopening restores the layout and resumes agents that support it.",
         )),
         Line::default(),
-        Line::from(vec![
-            Span::styled("y", Style::new().fg(WARNING).bold()),
-            muted(" archive   "),
-            Span::styled("n", Style::new().fg(ACCENT).bold()),
-            muted(" keep"),
-        ]),
+        answers(("archive", theme().snooze), "keep"),
     ];
-    wrapped_dialog(frame, area, DIALOG, lines);
+    wrapped_framed(frame, area, DIALOG, lines, theme().snooze);
+}
+
+/// y and n as keys, y in the action's color.
+fn answers((yes, color): (&str, Style), no: &str) -> Line<'static> {
+    Line::from(vec![
+        Span::styled("y", color.bold()),
+        muted(format!(" {yes}   ")),
+        Span::styled("n", theme().key.bold()),
+        muted(format!(" {no}")),
+    ])
 }
 
 /// Presets before free text, sorted by time; free text keeps working (UX principle 9).
@@ -809,29 +901,35 @@ fn draw_snooze(frame: &mut Frame, dialog: &SnoozeDialog, area: Rect, tz: &TimeZo
         Constraint::Length(1),
     ])
     .areas(inside);
-    frame.render_widget(Paragraph::new(Span::styled(format!("Snooze “{}”", dialog.title), Style::new().bold())), title);
-    let text = match dialog.typed.value() {
+    let t = theme();
+    frame.render_widget(Paragraph::new(bold(format!("Snooze “{}”", dialog.title))), title);
+    let typed_text = match dialog.typed.value() {
         "" => muted("Type 2h, 14:30, fri 9:00… or pick below"),
         value => Span::raw(value.to_string()),
     };
-    frame.render_widget(Paragraph::new(Line::from(vec![colored("› ", ACCENT), text])), typed);
-    frame.set_cursor_position((typed.x + 2 + dialog.typed.visual_cursor() as u16, typed.y));
+    let line = Line::from(vec![colored(" › ", t.accent.bold()), typed_text]);
+    frame.render_widget(Paragraph::new(line).style(t.field), typed);
+    frame.set_cursor_position((typed.x + 3 + dialog.typed.visual_cursor() as u16, typed.y));
     let rows = dialog.presets.iter().enumerate().map(|(i, (label, until))| {
         let (when, color) = match until {
-            Until::Time(ts) => (day_and_clock(*ts, now, tz), Color::Reset),
-            Until::Agent => ("no timer".to_string(), WARNING),
+            Until::Time(ts) => (day_and_clock(*ts, now, tz), t.sub),
+            Until::Agent => ("no timer".to_string(), t.snooze),
         };
         let width = presets.width as usize;
-        let line = format!(" {label:<26}{when:>w$} ", w = width.saturating_sub(28));
-        let style = Style::new().fg(color);
-        Line::from(Span::styled(
-            line,
-            if i == dialog.selected { style.add_modifier(Modifier::REVERSED) } else { style },
-        ))
+        let when = format!("{when:>w$} ", w = width.saturating_sub(28));
+        match i == dialog.selected {
+            true => Line::from(vec![
+                highlight_bar(),
+                Span::styled(format!("{label:<26}"), highlight()),
+                Span::styled(when, highlight().patch(if color == t.sub { t.text } else { color })),
+            ])
+            .style(highlight()),
+            false => Line::from(vec![text(format!(" {label:<26}")), colored(when, color)]),
+        }
     });
     frame.render_widget(Paragraph::new(rows.collect::<Vec<_>>()), presets);
     if let Some(e) = &dialog.error {
-        frame.render_widget(Paragraph::new(colored(e.clone(), ERROR)), error);
+        frame.render_widget(Paragraph::new(colored(e.clone(), t.flag)), error);
     } else if dialog.reading {
         frame.render_widget(Paragraph::new(muted("Reading the time…")), error);
     }
@@ -863,6 +961,33 @@ mod tests {
     #[test]
     fn the_inbox() {
         insta::assert_snapshot!(screen(&mut app(snapshot())));
+    }
+
+    /// Visual principles V1 and V3: no screen selects by reversing, or uses
+    /// a named color, which base16 themes remap (color8 drew text at 1.8:1);
+    /// the whole popup is painted with the screen's ground.
+    #[test]
+    fn screens_never_reverse_or_use_named_colors() {
+        use ratatui::style::Color;
+        let mut app = app(with_projects());
+        let mut screens = vec![];
+        for keys in [vec![], vec![ctrl('n')], vec![ctrl('s')], vec![ctrl('p')], vec![ctrl('z')], vec![ctrl('d')]] {
+            app.screens.clear();
+            for k in keys {
+                app.on_key(k);
+            }
+            let mut terminal = Terminal::new(TestBackend::new(110, 30)).unwrap();
+            terminal.draw(|frame| draw(frame, &mut app, NOW)).unwrap();
+            screens.push(terminal.backend().buffer().clone());
+        }
+        for (i, buffer) in screens.iter().enumerate() {
+            for cell in &buffer.content {
+                assert!(!cell.modifier.contains(Modifier::REVERSED), "screen {i}: {cell:?}");
+                for color in [cell.fg, cell.bg] {
+                    assert!(matches!(color, Color::Rgb(..)), "screen {i}: {color:?} in {cell:?}");
+                }
+            }
+        }
     }
 
     #[test]
@@ -995,14 +1120,16 @@ mod tests {
         let tail = NotesTail { modified: NOW - 7200, lines: lines.map(String::from).to_vec() };
         snap.notes.insert("task-fix-login".into(), tail);
         let shown = screen(&mut app(snap.clone()));
-        assert!(shown.contains("Notes · edited 2h ago"), "{shown}");
-        for line in ["## 2026-11-05 11:00 · Note", "tried the cookie flag", "Safari drops it"] {
-            assert!(shown.contains(&format!("  {line}")), "{line}: {shown}");
+        assert!(shown.contains("NOTES  edited 2h ago"), "{shown}");
+        // V7: a heading without its #s.
+        for line in ["2026-11-05 11:00 · Note", "tried the cookie flag", "Safari drops it"] {
+            assert!(shown.contains(&format!("│  {line}")), "{line}: {shown}");
         }
+        assert!(!shown.contains("## "), "{shown}");
         assert!(!shown.contains("*Created") && !shown.contains("# Fix login"), "{shown}");
         let started = NotesTail { modified: NOW, lines: lines[..3].iter().map(|l| l.to_string()).collect() };
         snap.notes.insert("task-fix-login".into(), started);
-        assert!(screen(&mut app(snap)).contains("Notes · nothing written yet"), "the description is no note");
+        assert!(screen(&mut app(snap)).contains("NOTES  nothing written yet"), "the description is no note");
     }
 
     #[test]
@@ -1167,7 +1294,7 @@ mod tests {
         let input = tui_input::Input::new("git@github.com:organization/a-long-repository-name.git".into());
         let (line, cursor) = field_line("Source", 8, &input, "", None, FieldFocus::Focused, 20);
         let shown: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
-        assert_eq!(shown, "Source  repository-name.git", "its end, where the cursor is");
+        assert_eq!(shown, "Source  repository-name.git ", "its end, where the cursor is, filled to the field's end");
         assert_eq!(cursor, 8 + 19);
         let (line, cursor) =
             field_line("Name", 8, &tui_input::Input::new("api".into()), "", None, FieldFocus::Focused, 20);
@@ -1181,8 +1308,22 @@ mod tests {
         let input = tui_input::Input::new("~/code/api".into());
         let (line, _) = field_line("Source", 8, &input, "", Some("~/code/api/"), FieldFocus::Selected, 40);
         let shown: Vec<&str> = line.spans.iter().map(|s| s.content.as_ref()).collect();
-        assert_eq!(shown, ["Source  ", "~/code/api", "/"]);
-        assert!(line.spans[1].style.add_modifier.contains(Modifier::REVERSED), "drawn selected");
+        assert_eq!(shown[..3], ["Source  ", "~/code/api", "/"]);
+        assert_eq!(line.spans[1].style.bg, theme().sel.bg, "drawn selected, on the selection's ground");
+        assert!(!line.spans[1].style.add_modifier.contains(Modifier::REVERSED), "never reversed (V3)");
+        assert_eq!(line.spans[3].style.bg, theme().field.bg, "the field filled to its end");
+    }
+
+    /// V3: the highlighted row keeps its spans' colors (a waiting task stays red).
+    #[test]
+    fn the_highlighted_row_keeps_its_colors() {
+        let mut app = app(snapshot());
+        let mut terminal = Terminal::new(TestBackend::new(110, 22)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app, NOW)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let row = (0..22).find(|&y| buffer[(1, y)].symbol() == "▌").expect("a highlighted row");
+        let flag = &buffer[(2, row)];
+        assert_eq!((flag.symbol(), flag.fg, flag.bg), ("⚑", theme().flag.fg.unwrap(), theme().sel.bg.unwrap()));
     }
 
     /// R1.6: many projects give way to the field's hint, counted as "+n".

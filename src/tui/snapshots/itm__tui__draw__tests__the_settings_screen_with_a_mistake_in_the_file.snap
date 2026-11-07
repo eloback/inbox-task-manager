@@ -1,27 +1,26 @@
 ---
 source: src/tui/draw.rs
-assertion_line: 882
 expression: screen(&mut app)
 ---
   Inbox 3   Snoozed 1   Archived 1   All 5                                                      ⚑ 1 needs you
 
- › Search tasks · @project filters · or type a new title
-             ╭──────────────────────────────────────────────────────────────────────────────────╮
- NEEDS YOU   │ Settings                                                                         │
- ⚑ Fix login │                                                                                  │
- ACTIVE      │ Herdr integration                                                                │
- ● Write docs│ ● Projects follow workspaces                                                     │
- ○ Old idea  │   A running task's projects are the saved projects its workspaces are in (the    │
-             │   folder Herdr names a workspace after). Off: projects change only when you edit │
-             │   them.                                                                          │
+  › Search ta╭──────────────────────────────────────────────────────────────────────────────────╮
+             │ Settings                                                                         │
+  NEEDS YOU  │                                                                                  │
+ ▌⚑ Fix login│ Herdr integration                                                                │
+             │ ● Projects follow workspaces                                                     │
+  ACTIVE  2  │   A running task's projects are the saved projects its workspaces are in (the    │
+  ● Write doc│   folder Herdr names a workspace after). Off: projects change only when you edit │
+  ○ Old idea │   them.                                                                          │
              │ ● Remove a project when its workspace closes                                     │
-             │   With the above: a project found in a workspace leaves the task once its        │ writes
+             │   With the above: a project found in a workspace leaves the task once its        │
              │   workspace closed; projects you added yourself stay. Off: projects are only     │
-             │   added.                                                                         │
+             │   added.                                                                         │writes
+             │ ◐ Colors  Mocha (dark)  ITM_THEME overrides it                                   │
              │                                                                                  │
              │ ~/.config/inbox-task-manager/config.toml: unknown setting herdr.nope             │
              │                                                                                  │
-             │ enter / space toggle  esc close                                                  │
+             │ enter / space change  esc close                                                  │
              ╰──────────────────────────────────────────────────────────────────────────────────╯
 
  enter open  tab view  ^n new  ^e edit  ^z snooze  ^p projects  ? all keys

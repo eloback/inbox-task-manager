@@ -1,17 +1,16 @@
 ---
 source: src/tui/draw.rs
-assertion_line: 1221
 expression: "sized(&mut app, 110, 16)"
 ---
 
  Projects  repositories and folders tasks start in
 
- ◆ api      dir  ~/code/api                                    1 task · 1 open  used now
- ◆ web      dir  ~/code/web                                    0 tasks          used now
- ◆ backend  git  git@github.com:acme/backend.git               0 tasks          used now
- ◆ gone     dir  ~/code/gone                                   0 tasks          used 1m ago · folder missing
- ◆ Client X name no folder                                     0 tasks          used 1m ago
-
+    NAME     KIND WHERE                                         TASKS            USED
+  ◆ api      dir  ~/code/api                                    1 task · 1 open  used now
+  ◆ web      dir  ~/code/web                                    0 tasks          used now
+  ◆ backend  git  git@github.com:acme/backend.git               0 tasks          used now
+  ◆ gone     dir  ~/code/gone                                   0 tasks          used 1m ago · folder missing
+ ▌◆ Client X name no folder                                     0 tasks          used 1m ago
 
  Client X has no folder: press prefix+shift+a in its workspace, or run itm project set 'Client X' --dir
  <folder>

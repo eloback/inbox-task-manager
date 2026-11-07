@@ -1,22 +1,21 @@
 ---
 source: src/tui/draw.rs
-assertion_line: 1143
 expression: screen(&mut app)
 ---
   Inbox 3   Snoozed 1   Archived 1   All 5                                                      ⚑ 1 needs you
 
- › Search tasks · @project filters · or type a new title
+  › Search tasks · @project filters · or type a new title
 
- NEEDS YOU                                                           │  Fix login
- ⚑ Fix login ╭──────────────────────────────────────────────────────────────────────────────────╮
- ACTIVE      │ Add project                                                                      │
- ● Write docs│  Git repository   Local folder   Name only                                       │
- ○ Old idea  │                                                                                  │
-             │ Source  https://github.com/acme/tool.git                                         │
+  NEEDS YOU  1                                                       │  Fix login
+ ▌⚑ Fix login╭──────────────────────────────────────────────────────────────────────────────────╮
+             │ Add project                                                                      │
+  ACTIVE  2  │  Git repository   Local folder   Name only                                       │
+  ● Write doc│                                                                                  │
+  ○ Old idea │ Source  https://github.com/acme/tool.git                                         │
              │ Name    tool                                                                     │
              │                                                                                  │
-             │ Clones to /r/data/inbox-task-manager/projects/github.com/acme/tool               │ writes
-             │ Esc stops the clone and removes what it copied.                                  │
+             │ Clones to /r/data/inbox-task-manager/projects/github.com/acme/tool               │
+             │ Esc stops the clone and removes what it copied.                                  │writes
              │                                                                                  │
              │ enter add  tab complete  ←→ kind (empty source)  esc back                        │
              ╰──────────────────────────────────────────────────────────────────────────────────╯

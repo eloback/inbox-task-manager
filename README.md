@@ -10,7 +10,7 @@
 [![Nix flake](https://img.shields.io/badge/nix-flake-5277C3?logo=nixos&logoColor=white)](flake.nix)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
-<img src="docs/screenshots/inbox.png" alt="The itm switcher: two tasks whose agents wait for you, three active tasks, and the preview of the highlighted one" width="900">
+<img src="docs/screenshots/inbox.png" alt="The itm switcher: two tasks whose agents wait for you, three active tasks, and the preview of the highlighted one with its agents and notes" width="900">
 
 </div>
 
@@ -55,10 +55,12 @@ Binary: `itm`. Run `itm` for the task switcher.
     <td align="center"><b>Snoozed</b>: back on a timer, or when an agent asks</td>
   </tr>
   <tr>
-    <td colspan="2"><img src="docs/screenshots/projects.png" alt="The Projects screen: four folder projects with their tasks"></td>
+    <td width="50%"><img src="docs/screenshots/projects.png" alt="The Projects screen: four folder projects with their tasks"></td>
+    <td width="50%"><img src="docs/screenshots/inbox-latte.png" alt="The inbox in the light Latte theme"></td>
   </tr>
   <tr>
-    <td colspan="2" align="center"><b>Projects</b>: repositories and folders your tasks start in</td>
+    <td align="center"><b>Projects</b>: repositories and folders your tasks start in</td>
+    <td align="center"><b>Latte</b>: a light theme, or your terminal's colors</td>
   </tr>
 </table>
 
@@ -111,7 +113,8 @@ uninstall inbox-task-manager`), install this one, and restart the daemon
 (an `itm attach` loop of the Python itm still counts as an itm client
 until you close it). The command is
 `itm` only: scripts that ran `inbox-task-manager` need `itm`. The
-switcher draws with your terminal's colors (`ITM_THEME` is gone).
+switcher's colors are `[ui] theme` (below); `ITM_THEME` takes `mocha`,
+`latte` or `terminal`.
 
 ## 🛠️ Setup
 
@@ -245,6 +248,9 @@ from the switcher's Settings screen (Ctrl+S), which keeps your comments:
 [herdr]
 projects_from_workspaces = true            # a running task's projects follow its workspaces
 remove_projects_without_workspace = true   # ...and a project found there leaves when its workspace closes
+
+[ui]
+theme = "mocha"   # Catppuccin Mocha (dark); "latte" is light, "terminal" uses your terminal's colors
 ```
 
 The daemon reads it on every pass, so changes apply without a restart.
@@ -262,6 +268,7 @@ move; Enter chooses; Esc goes back without changing the project.
 | `ITM_TASK_DIR`       | where a task without a project starts (default `$HOME`)                   |
 | `ITM_NOTIFY_COMMAND` | desktop notification command; gets the title and body as arguments       |
 | `ITM_POPUP`          | set in Herdr popups: errors stay on screen for 2.5 s                      |
+| `ITM_THEME`          | `mocha`, `latte` or `terminal`: overrides `[ui] theme` for this run       |
 | `VISUAL`, `EDITOR`   | the editor for notes (else nvim, vim, vi or nano)                         |
 
 Files:

@@ -1,22 +1,21 @@
 ---
 source: src/tui/draw.rs
-assertion_line: 861
 expression: screen(&mut app)
 ---
   Inbox 3   Snoozed 1   Archived 1   All 5                                                      ⚑ 1 needs you
 
- › Search tasks · @project filters · or type a new title
+  › Search tasks · @project filters · or type a new title
 
- NEEDS YOU                                                           │  Fix login
- ⚑ Fix login                                claude waiting · 4m      │
- ACTIVE      ╭──────────────────────────────────────────────────────────────────────────────────╮
- ● Write docs│ Add project                                                                      │
- ○ Old idea  │  Git repository   Local folder   Name only                                       │
-             │                                                                                  │
+  NEEDS YOU  1                                                       │  Fix login
+ ▌⚑ Fix login                                claude waiting · 4m     │
+             ╭──────────────────────────────────────────────────────────────────────────────────╮
+  ACTIVE  2  │ Add project                                                                      │
+  ● Write doc│  Git repository   Local folder   Name only                                       │
+  ○ Old idea │                                                                                  │
              │ Source  ~/code/new-thing                                                         │
              │ Name    My Thing                                                                 │
-             │                                                                                  │ writes
-             │ project already exists: My Thing (no folder); choose another name                │
+             │                                                                                  │
+             │ project already exists: My Thing (no folder); choose another name                │writes
              │                                                                                  │
              │ enter add  tab complete  ←→ kind (empty source)  esc back                        │
              ╰──────────────────────────────────────────────────────────────────────────────────╯

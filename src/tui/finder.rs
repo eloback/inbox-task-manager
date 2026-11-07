@@ -13,9 +13,8 @@ use std::path::PathBuf;
 use ratatui::Frame;
 use ratatui::crossterm::event::{Event, KeyCode, KeyEvent};
 use ratatui::layout::Rect;
-use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::widgets::{HighlightSpacing, List, ListItem, ListState, Paragraph, Wrap};
 use tui_input::Input;
 use tui_input::backend::crossterm::EventHandler;
 
@@ -23,9 +22,11 @@ use super::add::AddDialog;
 use super::app::Action;
 use super::completion::Folders;
 use super::draw::{
-    ACCENT, PROJECT, SUCCESS, WIDE, bold, colored, dialog_box, muted, project_line, wrapped_key_hints, wrapped_rows,
+    WIDE, bold, colored, dialog_box, faint, highlight, highlight_bar, muted, project_line, wrapped_key_hints,
+    wrapped_rows,
 };
 use super::screen::{Field, Need, Outcome, Screen, moves, step};
+use super::theme::theme;
 use crate::folders::{Listing, folder_parent, looks_like_path};
 use crate::fuzzy::fuzzy_match;
 use crate::paths::Paths;
@@ -325,19 +326,24 @@ impl Finder {
         let keys = wrapped_key_hints(&keys, width);
         let said = status.as_ref().map_or(0, |s| 1 + wrapped_rows(&Line::from(s.as_str()), width as usize) as u16);
         let inside = dialog_box(frame, area, WIDE, 4 + shown + said + 1 + keys.len() as u16 + 2);
-        let mut head = vec![Line::from(bold("Projects")), Line::default()];
+        let head = vec![Line::from(bold("Projects")), Line::default()];
         let typed = match self.query.value() {
             "" => muted("Search projects, or type ~/folder, /folder or a git URL"),
             value => Span::raw(value.to_string()),
         };
-        head.push(Line::from(vec![colored("› ", ACCENT), typed]));
         frame.render_widget(Paragraph::new(head), inside);
-        frame.set_cursor_position((inside.x + 2 + self.query.visual_cursor() as u16, inside.y + 2));
+        let field = Rect { y: inside.y + 2, height: 1, ..inside }.intersection(inside);
+        let line = Line::from(vec![colored(" › ", theme().accent.bold()), typed]);
+        frame.render_widget(Paragraph::new(line).style(theme().field), field);
+        frame.set_cursor_position((inside.x + 3 + self.query.visual_cursor() as u16, inside.y + 2));
         let list = Rect { y: inside.y + 4, height: shown, ..inside }.intersection(inside);
         let items: Vec<ListItem> = rows.iter().map(|pick| ListItem::new(Line::from(self.row(pick)))).collect();
         let mut state = ListState::default().with_selected((!rows.is_empty()).then_some(self.selected));
-        let highlight = Style::new().add_modifier(Modifier::BOLD | Modifier::REVERSED);
-        frame.render_stateful_widget(List::new(items).highlight_style(highlight), list, &mut state);
+        let list_widget = List::new(items)
+            .highlight_style(highlight())
+            .highlight_symbol(highlight_bar())
+            .highlight_spacing(HighlightSpacing::Always);
+        frame.render_stateful_widget(list_widget, list, &mut state);
         let mut tail = vec![];
         if let Some(status) = status {
             tail.extend([Line::default(), Line::from(muted(status))]);
@@ -353,26 +359,31 @@ impl Finder {
             Pick::Project { id, matched, saved } => {
                 let Some(project) = self.saved.projects.get(id) else { return vec![] };
                 let chosen = self.chosen.contains(id);
-                let mut spans = vec![if chosen { colored("✓ ", SUCCESS) } else { Span::raw("  ") }];
+                let mut spans = vec![if chosen { colored("✓ ", theme().ok) } else { Span::raw("  ") }];
                 spans.extend(project_line(project, matched, self.saved.missing.contains(id), &self.paths));
                 if *saved {
-                    spans.push(muted("  saved"));
+                    spans.push(faint("  saved"));
                 }
                 spans
             }
             Pick::RemoveAll => vec![muted("  Remove all projects")],
-            Pick::Clone(url) => vec![colored("+ Clone", ACCENT), Span::raw(format!(" {url}"))],
-            Pick::AddGit => vec![colored("+ Add git repository…", ACCENT)],
-            Pick::AddFolder => vec![colored("+ Add local folder…", ACCENT), muted("  or type ~/ or /")],
+            Pick::Clone(url) => vec![colored("+ Clone", theme().accent), Span::raw(format!(" {url}"))],
+            Pick::AddGit => vec![colored("+ Add git repository…", theme().accent)],
+            Pick::AddFolder => vec![colored("+ Add local folder…", theme().accent), faint("  or type ~/ or /")],
             Pick::NewName(name) => {
-                vec![colored("+ New project", ACCENT), Span::raw(format!(" “{name}”…  ")), muted("no folder")]
+                vec![colored("+ New project", theme().accent), Span::raw(format!(" “{name}”…  ")), faint("no folder")]
             }
             Pick::Folder { path, named, project } => {
-                let mut spans =
-                    vec![if *named { colored("Use ", ACCENT) } else { Span::raw("  ") }, Span::raw(path.clone())];
+                let mut spans = vec![
+                    if *named { colored("Use ", theme().accent) } else { Span::raw("  ") },
+                    Span::raw(path.clone()),
+                ];
                 if let Some(project) = project.as_ref().and_then(|id| Some((id, self.saved.projects.get(id)?))) {
                     let state = if self.chosen.contains(project.0) { "✓ chosen" } else { "saved" };
-                    spans.extend([colored(format!("  ◆ {}", project.1.name), PROJECT), muted(format!(" {state}"))]);
+                    spans.extend([
+                        colored(format!("  ◆ {}", project.1.name), theme().project),
+                        muted(format!(" {state}")),
+                    ]);
                 }
                 spans
             }

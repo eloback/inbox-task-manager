@@ -16,17 +16,17 @@ use tui_input::Input;
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
 
 use super::app::{Action, Job, Reply, Snapshot};
 use super::draw::{
-    ACCENT, FieldFocus, MUTED, Tone, WIDE, bold, colored, dialog_box, field_line, muted, name_badge, project_line,
+    FieldFocus, Tone, WIDE, bold, colored, dialog_box, faint, field_line, filled, muted, name_badge, project_line,
     wrapped_key_hints, wrapped_rows,
 };
 use super::finder::{Finder, Saved};
 use super::screen::{Context, Outcome, Screen, selects, type_into};
+use super::theme::theme;
 use crate::error::Error;
 use crate::herdr::Session;
 use crate::paths::Paths;
@@ -551,7 +551,7 @@ impl TaskForm {
         for (label, text, tone) in effects {
             tail.push(Line::from(match label {
                 "" => vec![tone.span(text)],
-                label => vec![muted(format!("{label} ")), Span::raw(text)],
+                label => vec![faint(format!("{label} ")), muted(text)],
             }));
         }
         if let Some(e) = &self.error {
@@ -567,7 +567,7 @@ impl TaskForm {
         let mut lines =
             vec![Line::from(bold(if self.editing.is_some() { "Edit task" } else { "New task" })), Line::default()];
         let label = |text: &str, part: Part| {
-            let style = if self.focus == part { Style::new().fg(ACCENT).bold() } else { Style::new().fg(MUTED) };
+            let style = if self.focus == part { theme().accent.bold() } else { theme().sub };
             Span::styled(format!("{text:<LABEL$}"), style)
         };
         let focused = |part| FieldFocus::of(self.focus == part, self.selected);
@@ -577,12 +577,12 @@ impl TaskForm {
         let description_row = lines.len();
         lines.extend([Line::from(label("Description", Part::Description)), Line::default(), Line::default()]);
         let mut projects = vec![label("Projects", Part::Projects)];
-        projects.extend(self.project_field(room, paths));
+        projects.extend(filled(self.project_field(room, paths), room));
         lines.push(Line::from(projects));
         let mut other_cursor = 0;
         if self.editing.is_none() {
             let mut snooze = vec![label("Snooze", Part::Snooze)];
-            snooze.extend(self.snooze_choice(now, tz));
+            snooze.extend(filled(self.snooze_choice(now, tz), room));
             lines.push(Line::from(snooze));
             if self.other_chosen() {
                 let placeholder = "2h, 14:30, tomorrow 9:00, fri 9:00";
@@ -604,14 +604,18 @@ impl TaskForm {
             height: 3,
         }
         .intersection(inside);
+        // The field filled over its three rows, whatever its text covers (V4).
+        frame.render_widget(ratatui::widgets::Block::new().style(theme().field), rows);
         if self.focus == Part::Description || !self.description.is_empty() {
             let mut description = self.description.clone();
-            let cursor = if self.focus == Part::Description { Style::new().reversed() } else { Style::new() };
+            // The cursor is a block of the text's own colors, swapped: the one reversal left.
+            let cursor = if self.focus == Part::Description { theme().text.reversed() } else { theme().field };
+            description.set_style(theme().field);
             description.set_cursor_style(cursor);
-            description.set_placeholder_style(Style::new().fg(MUTED));
+            description.set_placeholder_style(theme().field.patch(theme().sub));
             frame.render_widget(&description, rows);
         } else {
-            frame.render_widget(Paragraph::new(muted("Optional. Enter adds a line.")), rows);
+            frame.render_widget(Paragraph::new(muted("Optional. Enter adds a line.")).style(theme().field), rows);
         }
         let typing = match self.focus {
             Part::Title => Some((2, title_cursor)),
@@ -665,7 +669,7 @@ impl TaskForm {
             }
         };
         if !hint.is_empty() {
-            spans.push(colored(hint, ACCENT));
+            spans.push(muted(hint));
         }
         spans
     }
@@ -675,7 +679,7 @@ impl TaskForm {
         let focused = self.focus == Part::Snooze;
         let mut spans = vec![];
         if focused {
-            spans.push(colored("‹ ", ACCENT));
+            spans.push(colored("‹ ", theme().accent));
         }
         match self.snooze {
             0 => spans.push(Span::raw("Don't snooze")),
@@ -686,10 +690,10 @@ impl TaskForm {
                     spans.push(muted(format!("  {}", crate::times::day_and_clock(ts, now, tz))));
                 }
             }
-            _ => spans.push(colored("Other time…", ACCENT)),
+            _ => spans.push(colored("Other time…", theme().accent)),
         }
         if focused {
-            spans.push(colored(" ›", ACCENT));
+            spans.push(colored(" ›", theme().accent));
             spans.push(muted("  ←→ change, or type a time"));
         }
         spans

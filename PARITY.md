@@ -240,8 +240,9 @@ Last updated: milestone 5 (parity audit and cutover).
   and after each save.
 - One command, `itm`; the Python package also installed it as
   `inbox-task-manager`. Both names still count for the process-name rule.
-- No `ITM_THEME`: the switcher draws with the terminal's named colors
-  (Textual themes have no counterpart).
+- `ITM_THEME` names one of itm's three themes (mocha, the default, latte,
+  terminal), also set as `[ui] theme` in `config.toml` or on the Settings
+  screen; Textual's theme names have no counterpart.
 - A snooze time only GNU `date` reads, typed in the snooze dialog or the
   form, is read by a worker; keys typed in those milliseconds are dropped.
   The Python switcher ran `date` on its event loop, which queued them.

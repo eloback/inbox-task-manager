@@ -1,25 +1,24 @@
 ---
 source: src/tui/draw.rs
-assertion_line: 795
 expression: screen(&mut app(snapshot()))
 ---
   Inbox 3   Snoozed 1   Archived 1   All 5                                                      ⚑ 1 needs you
 
- › Search tasks · @project filters · or type a new title
+  › Search tasks · @project filters · or type a new title
 
- NEEDS YOU                                                           │  Fix login
- ⚑ Fix login                                claude waiting · 4m      │
- ACTIVE                                                              │  Users get logged out
- ● Write docs                               working                  │  after 5 min
- ○ Old idea                                 not started              │
+  NEEDS YOU  1                                                       │  Fix login
+ ▌⚑ Fix login                                claude waiting · 4m     │
+                                                                     │  Users get logged out
+  ACTIVE  2                                                          │  after 5 min
+  ● Write docs                               working                 │
+  ○ Old idea                                 not started             │  AGENTS
                                                                      │  ⚑ claude  waiting 4m
                                                                      │    Refactor auth
                                                                      │
-                                                                     │  Notes · none yet · ctrl+o writes
+                                                                     │  NOTES  none yet · ctrl+o writes
                                                                      │  some
                                                                      │
                                                                      │  used 1h ago
-                                                                     │
                                                                      │
                                                                      │
                                                                      │  enter open  ctrl+o notes

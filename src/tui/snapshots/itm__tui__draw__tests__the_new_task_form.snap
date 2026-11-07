@@ -1,24 +1,23 @@
 ---
 source: src/tui/draw.rs
-assertion_line: 1064
 expression: "sized(&mut app, 100, 30)"
 ---
   Inbox 3   Snoozed 1   Archived 1   All 5                                            ⚑ 1 needs you
 
- › Search tasks · @project filters · or type a new title
+  › Search tasks · @project filters · or type a new title
 
- NEEDS YOU                                                     │  Fix login
- ⚑ Fix login                   ◆ api       claude waiting · 4m │  ◆ api  dir
- ACTIVE ╭──────────────────────────────────────────────────────────────────────────────────╮
- ● Write│ New task                                                                         │
- ○ Old i│                                                                                  │
-        │ Title        Plan launch                                                         │
+  NEEDS YOU  1                                                 │  Fix login
+ ▌⚑ Fix login                  ◆ api       claude waiting · 4m │  ◆ api  dir
+        ╭──────────────────────────────────────────────────────────────────────────────────╮
+  ACTIVE│ New task                                                                         │
+  ● Writ│                                                                                  │
+  ○ Old │ Title        Plan launch                                                         │
         │ Description  Optional. Enter adds a line.                                        │
         │                                                                                  │
         │                                                                                  │
         │ Projects     ◆ api  ◆ gone  +1  enter or type to add · ⌫ removes the last        │
         │ Snooze       Don't snooze                                                        │
-        │                                                                                  │
+        │                                                                                  │rites
         │ Starts in ~/code/api                                                             │
         │ Missing, so no workspace: gone                                                   │
         │ No folder, so no workspace: Client X                                             │

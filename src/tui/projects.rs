@@ -9,17 +9,18 @@ use std::collections::BTreeSet;
 use ratatui::Frame;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Constraint, Layout, Margin, Rect};
-use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Clear, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::widgets::{Block, Clear, HighlightSpacing, List, ListItem, ListState, Paragraph, Wrap};
 use tui_input::Input;
 
 use super::add::AddDialog;
 use super::app::{Action, Job, Reply, Snapshot, renamed};
 use super::draw::{
-    FieldFocus, Tone, WIDE, bold, field_line, key_hints, muted, name_badge, wrapped_dialog, wrapped_key_hints,
+    FieldFocus, Tone, WIDE, bold, faint, field_line, highlight, highlight_bar, key_hints, label, muted, name_badge,
+    text, wrapped_dialog, wrapped_key_hints,
 };
 use super::screen::{Context, Field, Outcome, RemoveDialog, Screen, moves, selects, step, type_into};
+use super::theme::theme;
 use crate::error::{Error, shell_quote};
 use crate::paths::Paths;
 use crate::projects::{RemovalNote, name_problem, projects_by_recent};
@@ -183,12 +184,15 @@ impl ProjectsScreen {
     /// name-only project a folder, what the last action said, the keys.
     pub fn draw(&self, frame: &mut Frame, area: Rect, paths: &Paths, now: i64) {
         frame.render_widget(Clear, area);
+        frame.render_widget(Block::new().style(theme().bg), area);
         let area = area.inner(Margin { horizontal: 1, vertical: 1 });
         let hints = [("enter", "show its tasks"), ("^n", "add"), ("^r", "rename"), ("^d", "remove"), ("esc", "back")];
         let keys = wrapped_key_hints(&hints, area.width);
-        let [title, _, list, hint, message, footer] = Layout::vertical([
+        let ids = self.ids();
+        let [title, _, header, list, hint, message, footer] = Layout::vertical([
             Constraint::Length(1),
             Constraint::Length(1),
+            Constraint::Length(u16::from(!ids.is_empty())),
             Constraint::Fill(1),
             Constraint::Length(if self.hint().is_some() { 2 } else { 0 }),
             Constraint::Length(u16::from(self.message.is_some()) * 2),
@@ -199,18 +203,22 @@ impl ProjectsScreen {
             Paragraph::new(Line::from(vec![bold("Projects"), muted("  repositories and folders tasks start in")])),
             title,
         );
-        let ids = self.ids();
+        // One column for the bar in front of the highlighted row.
+        let widths = self.widths(&ids, now, (list.width as usize).saturating_sub(1));
         let items: Vec<ListItem> = match ids.is_empty() {
             true => vec![ListItem::new(muted("No projects yet. Ctrl+N adds a repository, a folder or a name."))],
             false => {
-                let widths = self.widths(&ids, now, list.width as usize);
+                frame.render_widget(Paragraph::new(Line::from(label(widths.header()))), header);
                 ids.iter().map(|id| ListItem::new(Line::from(self.row(id, paths, now, widths)))).collect()
             }
         };
         let at = self.selected.as_ref().and_then(|id| ids.iter().position(|i| i == id));
         let mut state = ListState::default().with_selected(at);
-        let highlight = Style::new().add_modifier(Modifier::BOLD | Modifier::REVERSED);
-        frame.render_stateful_widget(List::new(items).highlight_style(highlight), list, &mut state);
+        let list_widget = List::new(items)
+            .highlight_style(highlight())
+            .highlight_symbol(highlight_bar())
+            .highlight_spacing(HighlightSpacing::Always);
+        frame.render_stateful_widget(list_widget, list, &mut state);
         if let Some(text) = self.hint() {
             frame.render_widget(Paragraph::new(muted(text)).wrap(Wrap { trim: false }), hint);
         }
@@ -266,7 +274,7 @@ impl ProjectsScreen {
     fn row(&self, id: &str, paths: &Paths, now: i64, widths: Widths) -> Vec<Span<'static>> {
         let project = &self.data.projects[id];
         let mut spans = name_badge(&project.name, widths.badge, &[]);
-        spans.push(muted(format!("{:<4} ", project.kind().name())));
+        spans.push(faint(format!("{:<4} ", project.kind().name())));
         let room = widths.place;
         if room > 0 {
             let place = paths.place(project);
@@ -275,7 +283,7 @@ impl ProjectsScreen {
                 true => format!("…{}", chars[chars.len() + 2 - room..].iter().collect::<String>()),
                 false => place,
             };
-            spans.push(Span::raw(format!("{place:<room$} ")));
+            spans.push(text(format!("{place:<room$} ")));
         }
         let count = widths.count;
         spans.push(muted(format!("{:<count$} {}", self.count(id), self.used(id, now))));
@@ -290,6 +298,15 @@ struct Widths {
     count: usize,
     /// Where a project is; none when 0.
     place: usize,
+}
+
+impl Widths {
+    /// The columns' names, over the rows (past the bar in front of them).
+    fn header(self) -> String {
+        let (badge, count) = (self.badge, self.count);
+        let place = if self.place > 0 { format!("{:<w$} ", "WHERE", w = self.place) } else { String::new() };
+        format!(" {:<badge$}{:<5}{place}{:<count$} USED", "  NAME", "KIND", "TASKS")
+    }
 }
 
 impl RenameDialog {

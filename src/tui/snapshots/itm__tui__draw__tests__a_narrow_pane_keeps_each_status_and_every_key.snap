@@ -1,23 +1,22 @@
 ---
 source: src/tui/draw.rs
-assertion_line: 978
 expression: screen
 ---
 "  Inbox 3   Snoozed 1   Archived 1   All 5        ⚑ 1 needs you "
 "                                                                "
-" › Search tasks · @project filters · or type a new title        "
+"  › Search tasks · @project filters · or type a new title       "
 "                                                                "
-" NEEDS YOU                              │  Fix login            "
-" ⚑ Fix login        claude waiting · 4m │                       "
-" ACTIVE                                 │  Users get logged     "
-" ● Write docs       working · here      │  out                  "
-" ○ Old idea         not started         │  after 5 min          "
-"                                        │                       "
+"  NEEDS YOU  1                          │  Fix login            "
+" ▌⚑ Fix login       claude waiting · 4m │                       "
+"                                        │  Users get logged     "
+"  ACTIVE  2                             │  out                  "
+"  ● Write docs      working · here      │  after 5 min          "
+"  ○ Old idea        not started         │                       "
+"                                        │  AGENTS               "
 "                                        │  ⚑ claude  waiting    "
 "                                        │  4m                   "
 "                                        │    Refactor auth      "
 "                                        │                       "
-"                                        │  Notes · none yet ·   "
 "                                        │  enter open           "
 "                                        │  ctrl+o notes         "
 "                                                                "

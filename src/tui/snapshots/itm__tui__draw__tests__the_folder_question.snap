@@ -1,25 +1,24 @@
 ---
 source: src/tui/draw.rs
-assertion_line: 858
 expression: screen(&mut app)
 ---
   Inbox 3   Snoozed 1   Archived 1   All 5                                                      ⚑ 1 needs you
 
- › Search tasks · @project filters · or type a new title
+  › Search tasks · @project filters · or type a new title
 
- NEEDS YOU                                                           │  Fix login
- ⚑ Fix login                                claude waiting · 4m      │
- ACTIVE                                                              │  Users get logged out
- ● Write docs          ╭──────────────────────────────────────────────────────────────╮
- ○ Old idea            │ Give ~/code/client-x to Client X?                            │
-                       │                                                              │ng 4m
-                       │ Client X has no folder. With this one, workspaces in it      │
+  NEEDS YOU  1                                                       │  Fix login
+ ▌⚑ Fix login                                claude waiting · 4m     │
+                                                                     │  Users get logged out
+  ACTIVE  2            ╭──────────────────────────────────────────────────────────────╮
+  ● Write docs         │ Give ~/code/client-x to Client X?                            │
+  ○ Old idea           │                                                              │
+                       │ Client X has no folder. With this one, workspaces in it      │ng 4m
                        │ count as Client X in every task, and new tasks with Client X │
-                       │ start there.                                                 │t · ctrl+o writes
-                       │                                                              │
+                       │ start there.                                                 │
+                       │                                                              │ · ctrl+o writes
                        │ y give it  n keep it without a folder  esc cancel            │
                        ╰──────────────────────────────────────────────────────────────╯
-                                                                     │
+                                                                     │  used 1h ago
                                                                      │
                                                                      │
                                                                      │  enter open  ctrl+o notes

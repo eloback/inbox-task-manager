@@ -7,12 +7,12 @@ use std::cell::Cell;
 use ratatui::Frame;
 use ratatui::crossterm::event::{KeyCode, KeyEvent};
 use ratatui::layout::Rect;
-use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
 
-use super::draw::{ACCENT, WIDE, bold, dialog_box, key_hints, wrapped_rows};
+use super::draw::{WIDE, dialog_box, key_hints, label, text, wrapped_rows};
 use super::screen::{Outcome, moves};
+use super::theme::theme;
 
 /// Sections of (keys, what they do).
 pub const HELP: [(&str, &[(&str, &str)]); 5] = [
@@ -119,10 +119,10 @@ impl Help {
             if i > 0 {
                 lines.push(Line::default());
             }
-            lines.push(Line::from(bold(*section)));
+            lines.push(Line::from(label(*section)));
             for (key, what) in keys.iter() {
-                let key = Span::styled(format!("  {key:<20}"), Style::new().fg(ACCENT).bold());
-                lines.push(Line::from(vec![key, Span::raw(format!(" {what}"))]));
+                let key = Span::styled(format!("  {key:<20}"), theme().key.bold());
+                lines.push(Line::from(vec![key, text(format!(" {what}"))]));
             }
         }
         let width = area.width.min(WIDE).saturating_sub(4) as usize; // inside the border and margin

@@ -256,6 +256,10 @@ pub enum Job {
         setting: Setting,
         on: bool,
     },
+    /// Change the switcher's theme in `config.toml`.
+    Theme {
+        theme: crate::config::ThemeName,
+    },
 }
 
 impl Job {

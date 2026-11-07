@@ -11,17 +11,15 @@ use std::time::{Duration, Instant};
 use ratatui::Frame;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::Rect;
-use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
 use tui_input::Input;
 
 use super::app::{Action, Job, Reply};
 use super::completion::Folders;
-use super::draw::{
-    ACCENT, FieldFocus, Tone, WIDE, bold, dialog_box, field_line, muted, wrapped_key_hints, wrapped_rows,
-};
+use super::draw::{FieldFocus, Tone, WIDE, bold, dialog_box, field_line, muted, wrapped_key_hints, wrapped_rows};
 use super::screen::{Context, Field, Need, Outcome, selects, type_into};
+use super::theme::theme;
 use crate::error::Error;
 use crate::paths::Paths;
 use crate::projects::Check;
@@ -339,7 +337,7 @@ impl AddDialog {
                 ProjectKind::Name => " Name only ",
             };
             tabs.push(match kind == self.kind {
-                true => Span::styled(label, Style::new().fg(ACCENT).bold().reversed()),
+                true => Span::styled(label, theme().field.patch(theme().accent).bold()),
                 false => muted(label),
             });
             tabs.push(Span::raw(" "));

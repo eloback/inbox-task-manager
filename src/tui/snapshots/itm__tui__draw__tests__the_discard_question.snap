@@ -1,22 +1,21 @@
 ---
 source: src/tui/draw.rs
-assertion_line: 1208
 expression: "sized(&mut app, 100, 26)"
 ---
   Inbox 3   Snoozed 1   Archived 1   All 5                                            ⚑ 1 needs you
 
- › Search tasks · @project filters · or type a new title
+  › Search tasks · @project filters · or type a new title
 
- NEEDS YOU                                                     │  Fix login
- ⚑ Fix l╭──────────────────────────────────────────────────────────────────────────────────╮
- ACTIVE │ New task                                                                         │
- ● Write│                                                                                  │
- ○ Old i│ Title        x                                                                   │
-        │ Description  Optional. Enter adds a line.                                        │
+  NEEDS YOU  1                                                 │  Fix login
+ ▌⚑ Fix ╭──────────────────────────────────────────────────────────────────────────────────╮
+        │ New task                                                                         │
+  ACTIVE│                                                                                  │
+  ● Writ│ Title        x                                                                   │
+  ○ Old │ Description  Optional. Enter adds a line.                                        │
         │                                                                                  │
         │         ╭──────────────────────────────────────────────────────────────╮         │
         │ Projects│ Discard what you typed?                                      │         │
-        │ Snooze  │                                                              │         │
+        │ Snooze  │                                                              │         │rites
         │         │ y discard   n keep editing                                   │         │
         │ Starts i╰──────────────────────────────────────────────────────────────╯         │
         │ Session   task-x                                                                 │

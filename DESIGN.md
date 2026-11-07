@@ -530,6 +530,33 @@ The switcher and its dialogs follow these principles.
     field is enough: Enter creates with defaults, the other fields are a Tab
     away. No chain of prompts.
 
+Visual principles (`tui/theme.rs`, `tui/draw.rs`; the decision of 2026-11-06,
+"a theme of its own"):
+
+- **V1. Three text tones, one floor.** *text* for what is read (titles,
+  descriptions, notes, values), *sub* for context (statuses, paths, key
+  labels), *faint* only for hints, counts and section labels on the screen
+  or a panel. Each is at least 4.5:1 on every ground it is drawn on; a test
+  checks every role of Mocha and Latte.
+- **V2. Color means state.** Red needs you (and errors, deleting), yellow is
+  snoozed (and warnings, archiving), green is working or open, mauve is a
+  project, peach is a key, lavender is focus. An icon or a word always goes
+  with the color.
+- **V3. Select with a bar, never by reversing.** The highlighted row gets
+  the selection's ground, bold, and a lavender `▌` in front; its spans keep
+  their colors. The only reversal left is the description's cursor.
+- **V4. Fields look like fields.** Every input is filled with the field
+  ground to its end; focus is a lavender label.
+- **V5. Dialogs dim the screen.** What a dialog covers is set to the dim
+  tone first; the dialog has a ground of its own and a border in its
+  action's color (lavender, yellow for archive, red for delete and remove).
+- **V6. Space separates sections.** A blank row before every inbox section
+  but the first; headers in bold with a faint count; labels (AGENTS,
+  NOTES, column names, the help's and the Settings screen's sections) in
+  faint bold.
+- **V7. Text people wrote shows as text.** A notes heading shows without
+  its `#`s.
+
 ## 4. Decisions
 
 ### 2026-11-04: Textual for the switcher, not fzf
@@ -844,9 +871,9 @@ The switcher and its dialogs follow these principles.
     always. The footer shows seven keys (`?` among them); the help lists
     the rest (Ctrl+U, Ctrl+A, Ctrl+D, Ctrl+O, Ctrl+S, Alt+1…9, Esc).
   - Text is drawn as ratatui spans, never parsed as markup, so a title or
-    project name with `[` styles nothing. Colors are the terminal's named
-    ANSI colors (`tui/draw.rs`), so the switcher follows the terminal's
-    (and Herdr's) theme; the Textual switcher's `ITM_THEME` is gone.
+    project name with `[` styles nothing. Colors come from the theme
+    (`tui/theme.rs`; see the decision "a theme of its own" below, which
+    replaced the terminal's named ANSI colors).
   - Time, keys and work are injected (`Events`, `Work`, the backend), so
     tests run the loop itself on ratatui's `TestBackend` with a scripted
     clock, folder listings read in real threads, and clones as real child
@@ -1009,8 +1036,8 @@ The switcher and its dialogs follow these principles.
   (section 6), and the smoke run passes against Herdr 0.9.3 and 0.9.5.
 - **Deliberate differences** from the Python itm are listed in
   `PARITY.md` ("Known differences"); the ones a user sees: one command,
-  `itm` (no `inbox-task-manager`); no `ITM_THEME` (the terminal's
-  colors); the Settings screen edits dotted keys and inline tables;
+  `itm` (no `inbox-task-manager`); `ITM_THEME` names mocha, latte or
+  terminal, not a Textual theme; the Settings screen edits dotted keys and inline tables;
   errors from the system read as Rust words them; the form's snooze is a
   field, not a drop-down; no mouse.
 - **Not done.** The oldest Rust it claims (1.89) is checked only by CI.
@@ -1032,6 +1059,32 @@ The switcher and its dialogs follow these principles.
   (the home-manager module's `PATH` includes `/run/current-system/sw/bin`).
   Supporting another system again means bringing those pieces back: they
   are in the history before this commit.
+
+### 2026-11-06: a theme of its own, not the terminal's named colors
+- **Why.** The cutover drew with the terminal's named ANSI colors so the
+  switcher would follow the terminal's theme. Base16 themes remap colors
+  8–15: in a Catppuccin kitty, `DarkGray` (color8) is `#45475a` on
+  `#1e1e2e`, 1.8:1, and most of the switcher's text was drawn in it (the
+  description, notes, statuses, every key label). `REVERSED` turned a
+  colored row into a block of its color. The first TUI proposal had chosen
+  Catppuccin Mocha with `ITM_THEME`; the port had dropped both.
+- **Decided.** Three themes (`[ui] theme` in `config.toml`, the Settings
+  screen's Colors row, `ITM_THEME` overriding both): `mocha` (the default)
+  and `latte`, Catppuccin's, with the colors that fell short moved until
+  each role meets its floor (V1), and `terminal`, the terminal's colors
+  without colors 8–15 (the faint tone is `DIM`, the selection bold). The
+  whole popup is painted with the theme's screen ground. Without
+  `COLORTERM=truecolor` (or `24bit`), colors are drawn as their nearest
+  xterm color of 16–255, which themes leave alone. The visual principles
+  V1–V7 (section 3) are what every screen follows.
+- **Tests.** Every role of both palettes against its floor on every ground;
+  the terminal theme uses no color 8–15; drawn screens (the inbox, the
+  form, settings, projects, snooze, delete) have no reversed cell and no
+  color but RGB; the highlighted row keeps a waiting task red.
+- **Screenshots.** `scripts/screenshots.sh` takes the README's from the
+  real itm in a sandbox (Herdr sessions with fake agents, the daemon, the
+  switcher in tmux), through `scripts/ansi-to-html.py` and a headless
+  Chromium.
 
 ## 5. Known gaps
 

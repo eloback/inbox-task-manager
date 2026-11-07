@@ -158,7 +158,7 @@ impl Screen {
             Screen::AddProject(_) => {
                 matches!(job, Job::AddProject { .. } | Job::Clone { .. } | Job::CheckProject { .. })
             }
-            Screen::Settings(_) => matches!(job, Job::Setting { .. }),
+            Screen::Settings(_) => matches!(job, Job::Setting { .. } | Job::Theme { .. }),
             Screen::Snooze(_) | Screen::Form(_) => matches!(job, Job::SnoozeTime { .. }),
             Screen::Projects(_) => {
                 matches!(job, Job::RenameProject { .. } | Job::RemovalPlan { .. } | Job::RemoveProject { .. })
@@ -172,7 +172,8 @@ impl Screen {
         match self {
             Screen::AddProject(dialog) => dialog.done(job, result),
             Screen::Settings(screen) => match job {
-                Job::Setting { setting, on } => screen.done(*setting, *on, result),
+                Job::Setting { setting, on } => screen.done(|s| s.set(*setting, *on), result),
+                Job::Theme { theme } => screen.done(|s| s.theme = *theme, result),
                 _ => Outcome::Stay,
             },
             Screen::Projects(screen) => screen.done(job, result, cx),
@@ -234,7 +235,7 @@ pub struct SettingsScreen {
     pub settings: Result<Settings, String>,
     /// Where they are saved, as shown.
     pub file: String,
-    /// An index into [`Setting::ALL`].
+    /// An index into [`Setting::ALL`], or past its end the theme.
     pub selected: usize,
     /// A save runs: one at a time, since a toggle reads the value the last one left.
     pub saving: bool,
@@ -255,15 +256,18 @@ impl SettingsScreen {
     }
 
     fn on_key(&mut self, key: KeyEvent) -> Outcome {
-        let last = Setting::ALL.len() - 1;
+        let last = Setting::ALL.len(); // the theme
         match key.code {
             KeyCode::Esc => return Outcome::Close,
             _ if moves(key) != 0 => self.selected = step(self.selected, moves(key), last),
             KeyCode::Enter | KeyCode::Char(' ') if !self.saving => {
                 if let Ok(settings) = &self.settings {
-                    let setting = Setting::ALL[self.selected];
                     (self.saving, self.failed) = (true, None);
-                    return Outcome::Act(Action::Run(Job::Setting { setting, on: !settings.get(setting) }));
+                    let job = match Setting::ALL.get(self.selected) {
+                        Some(&setting) => Job::Setting { setting, on: !settings.get(setting) },
+                        None => Job::Theme { theme: settings.theme.next() },
+                    };
+                    return Outcome::Act(Action::Run(job));
                 }
             }
             _ => {}
@@ -271,10 +275,10 @@ impl SettingsScreen {
         Outcome::Stay
     }
 
-    fn done(&mut self, setting: Setting, on: bool, result: Result<Reply, Error>) -> Outcome {
+    fn done(&mut self, change: impl FnOnce(&mut Settings), result: Result<Reply, Error>) -> Outcome {
         self.saving = false;
         match (result, &mut self.settings) {
-            (Ok(_), Ok(settings)) => settings.set(setting, on),
+            (Ok(_), Ok(settings)) => change(settings),
             (Ok(_), Err(_)) => {}
             (Err(e), _) => self.failed = Some(e.to_string()),
         }
