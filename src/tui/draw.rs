@@ -109,7 +109,7 @@ pub fn highlight_bar() -> Span<'static> {
 /// name (or `ITM_THEME`) from this frame on.
 pub fn ground(frame: &mut Frame, area: Rect, setting: Option<ThemeName>) {
     if let Some(setting) = setting {
-        theme::set(theme::chosen(setting));
+        theme::set(setting);
     }
     frame.render_widget(Block::new().style(theme().bg), area);
 }

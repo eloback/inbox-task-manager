@@ -609,10 +609,13 @@ mod tests {
     }
 
     /// The sockets a crashed server leaves: both still there, nothing listening.
+    /// Bound but never listened on: a listener closed here could still be open
+    /// in a child another test is forking, and take connections meanwhile.
     fn crashed_session(socket: &Path) {
         fs::create_dir_all(socket.parent().unwrap()).unwrap();
         for path in [socket.to_path_buf(), socket.with_file_name("herdr-client.sock")] {
-            drop(std::os::unix::net::UnixListener::bind(path).unwrap());
+            let fd = rustix::net::socket(AddressFamily::UNIX, SocketType::STREAM, None).unwrap();
+            rustix::net::bind(&fd, &SocketAddrUnix::new(&path).unwrap()).unwrap();
         }
     }
 

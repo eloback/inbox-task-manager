@@ -8,7 +8,6 @@
 //! drew most of the text at 1.8:1.
 
 use std::cell::Cell;
-use std::sync::OnceLock;
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -165,32 +164,39 @@ impl Theme {
 }
 
 thread_local! {
-    /// The theme drawing uses; Mocha in truecolor until [`set`] (so tests draw alike everywhere).
-    static CURRENT: Cell<(ThemeName, bool)> = const { Cell::new((ThemeName::Mocha, true)) };
+    /// The theme drawing uses. Until [`start`] reads the environment, Mocha
+    /// in truecolor whatever the terminal, so tests draw alike everywhere.
+    static CURRENT: Cell<Current> = const { Cell::new(Current { name: ThemeName::Mocha, truecolor: true, env: None }) };
+}
+
+#[derive(Clone, Copy)]
+struct Current {
+    name: ThemeName,
+    /// Whether the terminal says it draws 24-bit color (Herdr's panes do).
+    truecolor: bool,
+    /// The theme `ITM_THEME` names, which outranks the setting.
+    env: Option<ThemeName>,
 }
 
 /// The theme drawing uses now.
 pub fn theme() -> Theme {
-    let (name, truecolor) = CURRENT.get();
-    Theme::new(name, truecolor)
+    let current = CURRENT.get();
+    Theme::new(current.name, current.truecolor)
 }
 
-/// Draw with `name` from now on, in truecolor where the terminal says it has it.
-pub fn set(name: ThemeName) {
-    CURRENT.set((name, truecolor()));
+/// Before the first frame: what the terminal (`COLORTERM`) and `ITM_THEME`
+/// say, and the theme `setting` names unless `ITM_THEME` names another.
+pub fn start(setting: ThemeName) {
+    let var = |name| std::env::var(name).unwrap_or_default();
+    let truecolor = matches!(var("COLORTERM").as_str(), "truecolor" | "24bit");
+    let env = ThemeName::named(&var("ITM_THEME"));
+    CURRENT.set(Current { name: env.unwrap_or(setting), truecolor, env });
 }
 
-/// The theme to draw with: `ITM_THEME` when it names one, else the setting.
-pub fn chosen(setting: ThemeName) -> ThemeName {
-    static ENV: OnceLock<Option<ThemeName>> = OnceLock::new();
-    let env = ENV.get_or_init(|| std::env::var("ITM_THEME").ok().and_then(|v| ThemeName::named(&v)));
-    env.unwrap_or(setting)
-}
-
-/// Whether the terminal says it draws 24-bit color (Herdr's panes do).
-fn truecolor() -> bool {
-    static TRUECOLOR: OnceLock<bool> = OnceLock::new();
-    *TRUECOLOR.get_or_init(|| std::env::var("COLORTERM").is_ok_and(|v| v == "truecolor" || v == "24bit"))
+/// Draw with the theme `setting` names from now on, unless `ITM_THEME` names another.
+pub fn set(setting: ThemeName) {
+    let current = CURRENT.get();
+    CURRENT.set(Current { name: current.env.unwrap_or(setting), ..current });
 }
 
 /// The xterm color (16–255) nearest to `r g b`: the 6×6×6 cube's or the grays'.
@@ -299,5 +305,16 @@ mod tests {
         assert_eq!(nearest(255, 255, 255), 231);
         assert_eq!(nearest(0x80, 0x80, 0x80), 244);
         assert_eq!(nearest(0xff, 0x00, 0x00), 196);
+    }
+
+    /// Drawing never reads the environment, so a test's screen is the same
+    /// in any terminal, and `ITM_THEME` outlasts a setting changed meanwhile.
+    #[test]
+    fn only_start_reads_the_terminal_and_itm_theme() {
+        set(ThemeName::Latte);
+        assert_eq!(theme(), Theme::new(ThemeName::Latte, true));
+        CURRENT.set(Current { name: ThemeName::Terminal, truecolor: false, env: Some(ThemeName::Terminal) });
+        set(ThemeName::Mocha);
+        assert_eq!(theme(), Theme::new(ThemeName::Terminal, false));
     }
 }
