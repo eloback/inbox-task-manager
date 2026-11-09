@@ -286,13 +286,12 @@ impl SettingsScreen {
     }
 }
 
-/// Typing into a one-line field as the Python itm's Textual Input did
-/// (select on focus): while `selected`, which focusing a field with text
-/// in it sets ([`selects`]), a character replaces the text and Backspace
-/// or Delete clears it, so a field that opens filled in (a rename, an
-/// edit's title) takes a new value without being cleared first. Any other
-/// key unselects it, Left and Home going to its start. Returns whether the
-/// value changed.
+/// Typing into a one-line field, selected on focus: while `selected`,
+/// which focusing a field with text in it sets ([`selects`]), a character
+/// replaces the text and Backspace or Delete clears it, so a field that
+/// opens filled in (a rename, an edit's title) takes a new value without
+/// being cleared first. Any other key unselects it, Left and Home going to
+/// its start. Returns whether the value changed.
 pub fn type_into(input: &mut Input, selected: &mut bool, key: KeyEvent) -> bool {
     let plain = !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
     if std::mem::take(selected) {
@@ -468,9 +467,9 @@ mod tests {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
 
-    /// The Python itm's Textual Input: a field focused with text in it has
-    /// that text selected; a character replaces it, Backspace and Delete
-    /// clear it, Left and Home go to its start, any other key keeps it.
+    /// A field focused with text in it has that text selected; a character
+    /// replaces it, Backspace and Delete clear it, Left and Home go to its
+    /// start, any other key keeps it.
     #[test]
     fn typing_into_a_selected_field_replaces_its_text() {
         let field = || {

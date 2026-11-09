@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# End-to-end smoke run of the Rust itm against a real headless Herdr, with
+# End-to-end smoke run of itm against a real headless Herdr, with
 # tmux as the terminal (DESIGN.md section 6). Build first, then run it in a
 # sandbox (a clean environment with private XDG folders), never against
 # your real sessions:
@@ -7,9 +7,7 @@
 #   cargo build --release
 #   scripts/sandbox.sh e2e scripts/smoke.sh; rm -rf /tmp/itm-e2e
 #
-# ITM (default target/release/itm) and ITM_PYTHON (the Python itm that
-# reads the state at the end; skipped when missing; see cross-check.sh for
-# how to build it) choose the binaries.
+# ITM (default target/release/itm) chooses the binary.
 #
 # It starts Herdr servers, fake agents (a pane running `sleep` that reports
 # itself blocked over the socket API; no real agent), the daemon and an
@@ -19,7 +17,6 @@ set -u
 root=${ITM_SANDBOX:?run this through scripts/sandbox.sh}
 repo=$(cd "$(dirname "$0")/.." && pwd)
 itm=${ITM:-$repo/target/release/itm}
-python_itm=${ITM_PYTHON:-}
 runtime=$XDG_RUNTIME_DIR/inbox-task-manager
 sessions=$XDG_CONFIG_HOME/herdr/sessions
 tmux_sock=$root/tmux.sock
@@ -146,7 +143,7 @@ fake_agent task-later "$later_pane"
 check "a blocked agent wakes a snoozed task" wait_for 6 contains "$root/notifications.log" "Woke · Needs input · Later"
 sleep 2.5
 check "each wait is reported once" test "$(grep -c "Needs input" "$root/notifications.log")" = 2
-check "notified.json has Python's keys" contains "$XDG_STATE_HOME/inbox-task-manager/notified.json" "task-fix-login|$agent_pane|"
+check "notified.json has the wait's key" contains "$XDG_STATE_HOME/inbox-task-manager/notified.json" "task-fix-login|$agent_pane|"
 
 echo "== attach loop and switching in tmux"
 tmux -S "$tmux_sock" -f /dev/null new-session -d -s e2e -x 120 -y 40 "$itm attach task-write-docs; sleep 600"
@@ -174,7 +171,7 @@ type_in_pane "$itm attach old-idea"
 check "itm attach inside Herdr switches by title" wait_for 5 marker_is task-old-idea
 check "a new task's session starts in \$HOME" wait_for 5 sh -c "printf '%s\n' '{\"id\":\"p\",\"method\":\"pane.list\",\"params\":{}}' | socat -t 5 - UNIX-CONNECT:$sessions/task-old-idea/herdr.sock | grep -q '\"cwd\":\"$HOME\"'"
 
-# last_used_at counts seconds (the format the Python itm shares), and these steps take less:
+# last_used_at counts seconds, and these steps take less:
 # let the clock move so that `itm last` below has one most recent task, not a tie.
 sleep 1.1
 type_in_pane "$itm attach two-repos"
@@ -348,7 +345,7 @@ keys Escape
 wait_for 5 gone '? all keys'
 printf '# mine\n[herdr]\nprojects_from_workspaces = true  # keep\n' >"$config"
 
-echo "== the switcher's screens: help, @filters, Projects, the add dialog, the New task form (milestone 4)"
+echo "== the switcher's screens: help, @filters, Projects, the add dialog, the New task form"
 "$itm" new "Filter me" -p web --no-switch >/dev/null
 "$itm" project add name "Scratch" >/dev/null
 type_in_pane "PATH=$root/bin:\$PATH $itm ui"
@@ -504,13 +501,6 @@ check "prefix+tab: the previous task" wait_for 10 marker_is_not "$here"
 ready
 keys C-b i
 check "prefix+i: the task waiting longest" wait_for 10 marker_is task-fix-login
-
-echo "== the Python itm reads this state"
-if [ -x "$python_itm" ]; then
-  check "python itm list agrees" test "$("$python_itm" list | cut -f1,2 | sort)" = "$("$itm" list | cut -f1,2 | sort)"
-else
-  echo "SKIP python itm list agrees ($python_itm missing)"
-fi
 
 echo "== detach"
 attach_child=$(pgrep -f "^herdr session attach" -P "$(ls "$runtime/clients" | grep -E '^[0-9]+$' | head -1)")

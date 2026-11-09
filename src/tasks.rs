@@ -117,7 +117,7 @@ impl Task {
     }
 }
 
-/// A change to a task by hand (R5.4): `itm edit`, and later the form.
+/// A change to a task by hand (R5.4): `itm edit`, or the edit form.
 #[derive(Debug, Clone, Default)]
 pub struct Edit {
     pub title: Option<String>,
@@ -290,7 +290,7 @@ pub fn resolve_task(data: &Data, query: &str) -> Result<String> {
 
 /// `Café crème: résumé #42!` → `cafe-creme-resume-42`, at most 40 characters.
 pub fn slugify(title: &str) -> String {
-    // Like Python's unicodedata: decompose, then drop what combines (accents).
+    // Decompose (NFKD), then drop what combines (accents).
     let ascii: String = title.nfkd().filter(|c| canonical_combining_class(*c) == 0).collect::<String>().to_lowercase();
     let mut slug = String::new();
     for c in ascii.chars() {

@@ -791,7 +791,7 @@ impl App {
     }
 }
 
-/// What a rename says (R8.2), as the Python itm's Projects screen says it.
+/// What a rename says (R8.2).
 pub fn renamed(old: &str, new: &str, note: Option<String>) -> String {
     format!("Renamed {old} to {new}.{}", note.map(|n| format!(" {n}.")).unwrap_or_default())
 }
@@ -1241,10 +1241,9 @@ pub mod tests {
         assert_eq!((filter_token("api"), filter_token("Client X")), ("@api".to_string(), "@\"Client X\"".to_string()));
     }
 
-    /// R6.2, after test_create_row_uses_the_filtered_project and
-    /// test_unknown_project_filter: a filter shows the tasks that have the
-    /// project among any of theirs, a task created from it gets the project,
-    /// and one that names no project says so and creates without one.
+    /// R6.2: a filter shows the tasks that have the project among any of
+    /// theirs, a task created from it gets the project, and one that names
+    /// no project says so and creates without one.
     #[test]
     fn r6_2_project_filters_and_the_create_row() {
         let mut snap = with_projects();
@@ -1279,9 +1278,9 @@ pub mod tests {
         assert!(matches!(&app.screens[..], [Screen::Form(form)] if form.projects == ["p-api"]));
     }
 
-    /// UX principle 5, after test_vim_keys_and_help: `?` opens the help only
-    /// while the search is empty (then it is typed), F1 always; the help
-    /// closes with `?`, F1 or Esc; list keys do nothing behind a screen.
+    /// UX principle 5: `?` opens the help only while the search is empty
+    /// (then it is typed), F1 always; the help closes with `?`, F1 or Esc;
+    /// list keys do nothing behind a screen.
     #[test]
     fn help_opens_with_a_question_mark_on_an_empty_search_or_f1() {
         let mut app = app(snapshot());

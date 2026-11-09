@@ -55,7 +55,7 @@
       devShells = forAllSystems (pkgs: {
         default = pkgs.mkShell {
           # The Rust toolchain, and what the end-to-end scripts drive
-          # (scripts/smoke.sh, cross-check.sh, measure.sh: tmux, socat, python3).
+          # (scripts/smoke.sh, measure.sh: tmux, socat, python3).
           packages = [
             pkgs.cargo
             pkgs.rustc

@@ -1,6 +1,5 @@
 //! itm: an inbox for Herdr task sessions. REQUIREMENTS.md says what it does,
-//! DESIGN.md the rules and decisions behind it, PARITY.md how far this Rust
-//! version is from the Python one it replaces.
+//! DESIGN.md the rules and decisions behind it.
 
 mod cli;
 mod config;

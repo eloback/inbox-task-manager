@@ -131,7 +131,7 @@ Herdr upgrade.
     description and project ids, state, times, workspace bookkeeping), saved
     projects keyed by id, tombstones;
   - `$XDG_CONFIG_HOME/inbox-task-manager/config.toml`: settings (user
-    content; itm changes one line at a time);
+    content; itm changes one setting at a time and keeps the rest);
   - `$XDG_DATA_HOME/inbox-task-manager/projects/<host>/<path>`: clones of
     git projects (`ITM_PROJECTS_DIR` overrides the root);
   - `$XDG_DATA_HOME/inbox-task-manager/tasks/<session>/notes.md`: task
@@ -182,19 +182,16 @@ Herdr upgrade.
   (section 1). Deleting then has Herdr delete the session (`herdr session
   delete`, which refuses a running one and has no socket method) from a
   detached `/bin/sh` in a session of its own (`itm setsid`), which tries
-  again every 0.5 s until the server is gone (at most 15 s). (The Python
-  itm ran `herdr session stop` and `delete` once from a detached `/bin/sh`.)
+  again every 0.5 s until the server is gone (at most 15 s).
 - A popup that moved its own client away exits right away. Otherwise it stays
   open in the old session (see the popup facts above) and is still there when
   you come back.
 - Clients started with plain `herdr` cannot be switched. Say so in the error.
 - The process name is part of the protocol: `is_itm_process`
-  (`switching.rs`) accepts a marker only if an argument of the process's
-  command line contains `inbox-task-manager` or `inbox_task_manager`, or is
-  a file named `itm`: the binary (`[[bin]] name = "itm"`; the Nix wrapper
-  keeps argv[0], `…/bin/itm`), and the Python itm's console scripts
-  (`python …/bin/itm attach`), so an attach loop of the Python itm still
-  running during an upgrade is no stale marker. Renaming the binary breaks
+  (`switching.rs`) accepts a marker only if the process's program (argv[0])
+  contains `inbox-task-manager` (the package, as in a Nix store path) or is
+  a file named `itm`: the binary (`[[bin]] name = "itm"`;
+  the Nix wrapper keeps argv[0], `…/bin/itm`). Renaming the binary breaks
   this: every marker would look stale and be deleted.
 
 ### Data safety
@@ -251,8 +248,7 @@ Herdr upgrade.
   id. `itm list --json` rows carry the name as `project` and the id as
   `project_id`.
 - A task has a list of project ids (`projects`); the first is where its
-  session starts. A `tasks.json` with the older single `project` is
-  converted when read (`store.rs` `upgrade`), so every reader sees `projects`.
+  session starts.
 - A task's session gets its project workspaces on the first start only;
   Herdr restores them afterwards. The attach loop asks Herdr whether the
   session exists (`first_start`); when it does not and the task has projects
@@ -292,18 +288,13 @@ Herdr upgrade.
   `Project::kind` reads `Git` (a URL; its `path` is always itm's clone),
   `Dir` (a folder) or `Name` (neither). A repository project without its
   clone does not exist, so duplicate repositories are still found by clone
-  path, and nothing in the daemon calls `repo_key`. `upgrade` drops a
-  stored `kind`; itm binaries older than this format read `kind` and fail
-  on a file this version wrote, so itm is upgraded everywhere at once (the
-  daemon restarted), as for the `project` → `projects` change.
+  path, and nothing in the daemon calls `repo_key`.
 - A project's folder is an `Option` (`Project::folder`), so no code can use
   one without asking whether there is one; `Paths::place` says where a
   project is (URL, else folder, else "no folder"), and `project_roots`,
   `task_folders`, `project_change_messages` and `deletable_clone` skip
   projects without one. The TUI keeps `Snapshot.missing`, the ids whose
-  folder is set and absent; a name-only project is never "missing" (in the
-  Python itm, a map from id to "folder exists" read with a default of true
-  once made the preview index a name-only project's `path`).
+  folder is set and absent; a name-only project is never "missing".
 - A folder belongs to at most one project, nesting allowed
   (`check_project_free` on add and on `set`). `set_project_folder` (`itm
   project set`) is for projects without a repository only: a repository's
@@ -476,9 +467,8 @@ Herdr upgrade.
   (its decor is copied onto the new value), a new key goes after the last
   one of its table, and a missing `[herdr]` table goes after the file's
   comments and one blank line. It follows quoted keys, dotted keys and
-  inline tables (the Python itm changed one `key = value` line and refused
-  those). It checks that the result reads back with the new value before
-  writing, and refuses with "edit it by hand" otherwise (a file with a
+  inline tables. It checks that the result reads back with the new value
+  before writing, and refuses with "edit it by hand" otherwise (a file with a
   mistake in it, a key that is a table), leaving the file unchanged. A TOML
   syntax error is said on one line ("… is not valid TOML: <what> (at line
   L, column C)").
@@ -559,26 +549,12 @@ Visual principles (`tui/theme.rs`, `tui/draw.rs`; the decision of 2026-11-06,
 
 ## 4. Decisions
 
-### 2026-11-04: Textual for the switcher, not fzf
+### 2026-11-04: a switcher of its own, not fzf
 - **Why.** fzf cannot draw section headers, dialogs or inline confirmations,
   truncates labels, and restarts (flickers) on every view change.
-- **Choice.** Textual: same language as itm, packaged in nixpkgs (8.2.6),
-  headless tests with `App.run_test()`.
-- **Measured in a prototype** (Herdr 0.9.3, warm cache, sample data):
-  - Python start plus Textual import: 141 ms (Python alone: 12 ms).
-  - 209–240 ms from the popup command starting to Textual's first refresh
-    (5 runs, then one with the projects screens added). This excludes Herdr
-    spawning the popup and used sample data; the real data source,
-    `herdr session list --json`, takes about 2 ms.
-  - All keys listed in section 1 arrive.
-  - The closure grows by about 27 MiB.
-- **Superseded** by the Rust switcher (2026-11-06, ratatui): its rules for
-  the TUI are there, and say where they come from. Textual's own rules
-  (lazy imports, `check_action`, `App.run_test()`, `$variables` in markup,
-  `check_consume_key`, `select_on_focus`, awaiting `dismiss()`,
-  `App.suspend()`) and the Python layout (core, CLI and daemon in
-  `inbox_task_manager/__init__.py`, the screens in `tui.py`, the OS layer
-  in `system.py`) went with the Python itm.
+- **Choice.** A full-screen TUI of itm's own in a Herdr popup (ratatui; its
+  rules are in the decision of 2026-11-06, "itm in Rust"). All keys listed
+  in section 1 arrive.
 - **Popup sizes** (`contrib/herdr-keys.toml`): switcher 80% × 80%, task form 70% × 26
   rows, snooze 60% × 18, notes 80% × 80%, workspace as project 70% × 18 (the
   add dialog), jump and last 60% × 4 (only an error is ever shown).
@@ -594,8 +570,8 @@ Visual principles (`tui/theme.rs`, `tui/draw.rs`; the decision of 2026-11-06,
   suspending the app). `itm notes --append` lets an agent in the task add
   to it without an editor. A popup rather than `type = "pane"`: every itm
   key is a popup, and how Herdr restores a temporary pane is unverified.
-- **Project finder.** The form's project `Select` became a field that opens
-  a fuzzy finder: typing narrows the saved projects; a typed path switches
+- **Project finder.** The form's project field opens a fuzzy finder:
+  typing narrows the saved projects; a typed path switches
   to folder completion and adds the folder; a typed URL clones or picks the
   saved repository. Adding goes through the existing add dialog, prefilled,
   so names and duplicates are checked in one place.
@@ -607,13 +583,12 @@ Visual principles (`tui/theme.rs`, `tui/draw.rs`; the decision of 2026-11-06,
   kept for its history. The snooze phrases itm reads itself stay.
 - **Why.** itm first assumed Linux and Nix: `/proc`, `notify-send`, GNU
   `date -d`, `bash`, and a Nix wrapper that put every tool on `PATH`.
-- **`system.rs`** (in the Python itm, `system.py`) holds what differs
-  between operating systems: the process table (`Processes`: `/proc`, else
-  `ps`), notification commands and finding a `date` that reads `-d`; the
-  runtime folder is `paths.rs`. `ps` gets one `-o` per column: FreeBSD
-  reads everything after the first `=` of an `-o` list as the header. Which
-  one runs is chosen at run time, not compile time, so every path is built
-  and tested on Linux too (section 4, 2026-11-06).
+- **`system.rs`** holds what differs between operating systems: the process
+  table (`Processes`: `/proc`, else `ps`), notification commands and finding a
+  `date` that reads `-d`; the runtime folder is `paths.rs`. `ps` gets one `-o`
+  per column: FreeBSD reads everything after the first `=` of an `-o` list as
+  the header. Which one runs is chosen at run time, not compile time, so every
+  path is built and tested on Linux too (section 4, 2026-11-06).
 - **Snooze phrases.** `snooze.rs` (`day_and_clock`) reads clock times (`14:30`, `5pm`),
   `today`, `tomorrow`, weekdays, `next <weekday>` and ISO dates the way GNU
   `date -d` does (a weekday is today when it matches; a day without a clock
@@ -650,8 +625,9 @@ Visual principles (`tui/theme.rs`, `tui/draw.rs`; the decision of 2026-11-06,
   named after a project stays with it (itm names the ones it opens), so a
   `cd` in its first pane does not move it. A workspace in a linked worktree
   or another checkout of a saved project's repository is in that project.
-  Projects have sources and the sync removes only what it found. Settings went into a TOML file with a
-  screen in the switcher, which writes it line by line. `prefix+shift+a`
+  Projects have sources and the sync removes only what it found. Settings
+  went into a TOML file with a screen in the switcher, which changes one
+  setting and keeps the rest of the file, comments too. `prefix+shift+a`
   turns the workspace you are in into a project of the current task in one
   step.
 - **Reviewed** (design, core and TUI reviews before merging). Changed after
@@ -677,7 +653,7 @@ Visual principles (`tui/theme.rs`, `tui/draw.rs`; the decision of 2026-11-06,
   where its workspace opens. Projects that are only a name come first and
   get a folder later.
 - **Choices.** A project is a name with an optional folder and, for a
-  repository, the URL of its clone; the stored `kind` went (read off the
+  repository, the URL of its clone; its kind is not stored (read off the
   fields). One folder per project: several folders were considered and left
   out, since a folder belongs to one project and worktrees and other
   checkouts are matched at runtime (by main work tree and by `origin`). No
@@ -690,8 +666,8 @@ Visual principles (`tui/theme.rs`, `tui/draw.rs`; the decision of 2026-11-06,
   repository project without its clone (orphaned clones, no way to clone
   again, `repo_key` in the daemon); `set` only for projects without a
   repository; the hotkey's folder offer needs a yes and refuses the home
-  folder and folders of other projects; the TUI's folder map became a
-  "missing" set (a name-only project crashed the preview); "+ New project"
+  folder and folders of other projects; the TUI keeps a "missing" set, not
+  a map of every project's folder; "+ New project"
   never saves on one Enter. A code review after building changed: a blank
   `add name` is refused (it saved "project"); no question for a folder that
   cannot be given or with `--name`; a project removed during the question;
@@ -701,21 +677,19 @@ Visual principles (`tui/theme.rs`, `tui/draw.rs`; the decision of 2026-11-06,
 - **Not done:** a Projects-screen action for `set` (the screen says how);
   `set --git` (a name cannot become a repository); several folders.
 
-### 2026-11-06: itm in Rust, next to the Python itm until it reaches parity
-- **Why.** A Go-versus-Rust standoff (two MVPs of the core, three reviews)
-  chose Rust: the switcher draws its first frame in about 2 ms instead of
-  175 ms, `itm list` and `itm status` take 1 ms instead of 50 ms, the daemon
-  uses 0.03% of a core and 4 MB instead of 0.8% and 24 MB, and the domain is
-  typed (task states, snooze until a time or an agent, optional folders), so
-  the optional-folder and project rules above become compile errors instead
-  of review notes.
-- **How.** An incremental rewrite. The Rust crate lives at the repository
-  root next to the Python package; the Python itm stays the behavior
-  reference (its tests are the most precise spec) until a cutover. Both read
-  and write the same files byte for byte, so either can run on the other's
-  state; `scripts/cross-check.sh` checks it. `PARITY.md` lists every
-  requirement and every rule of section 2 with its status in Rust, where it
-  lives and the test that pins it. (The cutover, below, ended this.)
+### 2026-11-06: itm in Rust
+- **Why.** A Go-versus-Rust standoff (an MVP of the core in each, from one
+  brief; three reviewers scoring maintainability 40%, focus 30% and
+  potential 30%) gave Rust 7.95 and Go 7.25, and every reviewer ranked Rust
+  first. Their reasons: a typed domain (task states, `Until {Time, Agent}`,
+  `Option` for folders, which turns the optional-folder and project rules
+  above into compile errors instead of review notes), designed test seams
+  (the `Itm` context, the `Processes` trait, the daemon split into
+  `observe` and a pure `poll_once`, the switcher as a pure state machine
+  with snapshot tests), and speed where users feel it: the switcher draws
+  its first frame in about 2 ms, `itm list` and `itm status` take about
+  1 ms, and the daemon uses 0.05% of a core and 5 MB (REQUIREMENTS.md N3,
+  `scripts/measure.sh`).
 - **Herdr over its socket API.** Every query and change goes to the
   session's socket (one JSON line each way per connection, documented with a
   JSON Schema by `herdr api schema`), 10–20 times faster than the CLI and
@@ -736,7 +710,7 @@ Visual principles (`tui/theme.rs`, `tui/draw.rs`; the decision of 2026-11-06,
 - **Stopping a session** is a `server.stop` request, not a detached
   `/bin/sh herdr session stop`: Herdr answers before it shuts down, so the
   caller may run inside the session it stops (archiving the current task).
-- **Errors** are an enum (`error.rs`) whose messages are the Python itm's.
+- **Errors** are an enum (`error.rs`) whose messages are sentences for the user.
   Its variants are the errors callers tell apart (which Herdr failure, a
   missing `herdr` or `git`, a missing task or project, a folder already
   saved versus a name taken, R8.4 and R8.5, and `Exit`: an exit status
@@ -745,13 +719,13 @@ Visual principles (`tui/theme.rs`, `tui/draw.rs`; the decision of 2026-11-06,
 - **Dependencies**, each pinned exactly (`=x.y.z`, released at least two
   weeks before it was added):
   - clap: arguments and help, with subcommands, aliases and repeated
-    options, like argparse;
+    options;
   - serde, serde_json: typed, tolerant reading of `tasks.json`, the status
     cache, `notified.json` and Herdr's answers (unknown fields kept through
-    `flatten`), and Python's exact JSON layout on write;
-  - jiff: local times for snooze phrases and presets; DST gaps and folds
-    resolve like Python's `mktime`;
-  - regex-lite: the snooze grammar, Python's two regexes verbatim;
+    `flatten`), written with sorted keys;
+  - jiff: local times for snooze phrases and presets; a DST gap moves a
+    time forward, a fold takes the earlier one;
+  - regex-lite: the snooze grammar;
   - ratatui (crossterm backend, default features off) and tui-input: the
     switcher's drawing and its line editing. ratatui has no forms or focus,
     so those are built in itm;
@@ -765,9 +739,9 @@ Visual principles (`tui/theme.rs`, `tui/draw.rs`; the decision of 2026-11-06,
   - signal-hook: the attach loop's SIGHUP, SIGTERM and SIGINT, received on
     a thread (already in the graph through crossterm);
   - tempfile: atomic writes and test folders;
-  - unicode-normalization: `slugify` like Python's `unicodedata` (NFKD, then
-    drop combining marks);
-  - shlex: `$ITM_NOTIFY_COMMAND` and `$EDITOR` split like `shlex.split`;
+  - unicode-normalization: `slugify` (NFKD, then drop combining marks);
+  - shlex: `$ITM_NOTIFY_COMMAND` and `$EDITOR` split into words as a shell
+    would;
   - toml_edit (`parse` and `display` only): `config.toml` (R10.4), read and
     changed as a document, so a toggle keeps the user's comments and
     layout; one front end for both, where serde with `toml` would read and
@@ -775,14 +749,12 @@ Visual principles (`tui/theme.rs`, `tui/draw.rs`; the decision of 2026-11-06,
     `Cargo.lock` to releases at least two weeks old (winnow 1.0.4,
     toml_writer 1.1.3, toml_datetime 1.1.2), not the newest;
   - insta (tests only): screen snapshots on ratatui's `TestBackend`.
-- **Rules for the TUI** (the switcher and every screen; they replace the
-  Textual switcher's rules of 2026-11-04, and keep what those were for):
+- **Rules for the TUI** (the switcher and every screen):
   - The app (`tui/app.rs`) holds state and turns keys into actions with no
     I/O and no clock; the event loop (`tui/mod.rs`) says what time it is,
     draws, and runs anything that can block (Herdr, the store lock, git, a
     hand-off, which waits up to 2 s, a folder listing) in a thread of its
-    own, never on the loop. There is nothing to import lazily: the TUI is
-    part of the one binary and costs nothing until it runs.
+    own, never on the loop.
   - A periodic refresh (every 2 s) keeps the highlighted task by its id,
     and writes the store only when there is a session to adopt or a
     tombstone to expire (`Work::load`).
@@ -830,41 +802,37 @@ Visual principles (`tui/theme.rs`, `tui/draw.rs`; the decision of 2026-11-06,
   - The loop ends (Esc, a switch, a screen alone closing, the terminal no
     longer read or drawn, SIGHUP, SIGTERM or SIGINT) only once the jobs that
     change state are done (`Job::must_finish`): a delete, an archive or a
-    project removal stopped halfway leaves a session running unseen or a
-    clone half deleted (Textual joined its workers too). So while a clone or
-    such a job runs, itm catches those signals (`ExitSignals`; a closing
-    popup sends SIGHUP) and they end the loop like Esc, also one that comes
-    while the loop waits to switch: no switch follows a kill. Meanwhile it
-    reads no keys and says "Finishing first…"; a failure of a job it waits for
-    keeps the switcher open to show it (UX principle 11). A clone is not
-    waited for (it stops on the way out and keeps nothing, R8.8), nor is a
-    folder listing.
-  - Keys are read on the loop's thread, only while it waits, never by a
-    thread of their own: crossterm reads input while it polls, so a reader
-    left running after the switcher closed would take keys meant for the
-    `herdr session attach` that follows a switch, and it cannot be stopped
-    at once (joining one cost 50 ms on every exit). Keys are handled one at
-    a time, in order, so a key that opens the finder (typed on the form's
-    project field) is followed by the next key in the finder, and no key
-    reaches a picker before it is up (which the Textual switcher had to
-    guard against). A paste (bracketed paste) is
-    fed as keys, its whitespace (newlines too) one space each, so a pasted
-    URL opens the finder like typing does and never presses Enter; the
-    form's description, the one field with several lines, takes it as it is.
-  - A one-line field focused with text in it has that text selected, as
-    Textual's `Input` had (`select_on_focus`): a character replaces it,
-    Backspace or Delete clears it, Left or Home goes to its start, and any
-    other key unselects it (`screen::type_into`, drawn reversed, its ghost
-    text still shown). So a field that opens filled in (the rename dialog,
-    the edit form's title, `itm new -i "<title>"`, the add dialog
-    `add-workspace` fills in) takes a new value without being cleared first.
-    Only moving the focus selects: focus that stays where it is (a name
+    project removal stopped halfway leaves a session running unseen or a clone
+    half deleted. So while a clone or such a job runs, itm catches those
+    signals (`ExitSignals`; a closing popup sends SIGHUP) and they end the
+    loop like Esc, also one that comes while the loop waits to switch: no
+    switch follows a kill. Meanwhile it reads no keys and says "Finishing
+    first…"; a failure of a job it waits for keeps the switcher open to show
+    it (UX principle 11). A clone is not waited for (it stops on the way out
+    and keeps nothing, R8.8), nor is a folder listing.
+  - Keys are read on the loop's thread, only while it waits, never by a thread
+    of their own: crossterm reads input while it polls, so a reader left
+    running after the switcher closed would take keys meant for the `herdr
+    session attach` that follows a switch, and it cannot be stopped at once
+    (joining one cost 50 ms on every exit). Keys are handled one at a time, in
+    order, so a key that opens the finder (typed on the form's project field)
+    is followed by the next key in the finder, and no key reaches a picker
+    before it is up. A paste (bracketed paste) is fed as keys, its whitespace
+    (newlines too) one space each, so a pasted URL opens the finder like
+    typing does and never presses Enter; the form's description, the one field
+    with several lines, takes it as it is.
+  - A one-line field focused with text in it has that text selected: a
+    character replaces it, Backspace or Delete clears it, Left or Home goes to
+    its start, and any other key unselects it (`screen::type_into`, drawn
+    reversed, its ghost text still shown). So a field that opens filled in
+    (the rename dialog, the edit form's title, `itm new -i "<title>"`, the add
+    dialog `add-workspace` fills in) takes a new value without being cleared
+    first. Only moving the focus selects: focus that stays where it is (a name
     taken, said after Enter on the name; a switch to a name only while the
-    name is typed) leaves what is being typed as it is, as Textual's
-    `focus()` on the focused input did. The finder's query is never selected (the
-    key that opened it must not be replaced by the next), and a snooze time
-    that could not be read puts the cursor back in it unselected, so typing
-    goes on.
+    name is typed) leaves what is being typed as it is. The finder's query is
+    never selected (the key that opened it must not be replaced by the next),
+    and a snooze time that could not be read puts the cursor back in it
+    unselected, so typing goes on.
   - The main list's keys are matched before the search box gets a key,
     except `?`, which opens the help only while the search is empty and is
     typed otherwise. F1 opens it
@@ -880,56 +848,53 @@ Visual principles (`tui/theme.rs`, `tui/draw.rs`; the decision of 2026-11-06,
     processes.
   - One loop runs the switcher and the screens the CLI opens alone
     (`App::alone`): there is no list behind them, nothing is loaded, their
-    work runs in workers like the switcher's, and the loop ends when the
-    last screen closes, returning what it closed with for the CLI to act on.
-    So `itm snooze` without a time (R4.1) runs the snooze screen alone; Esc
-    is `cancelled` (exit 1, and no delay in a popup). So do `itm new`
-    without a title or with `-i` (the New task form, R1.1), `itm edit`
-    without options (the edit form, R5.4), `itm delete`'s question (no is
-    exit 1 and says nothing, like the Python itm), `itm project remove`'s
-    clone dialog, and `itm project add-workspace`'s add dialog and folder
-    question (R10.5).
+    work runs in workers like the switcher's, and the loop ends when the last
+    screen closes, returning what it closed with for the CLI to act on. So
+    `itm snooze` without a time (R4.1) runs the snooze screen alone; Esc is
+    `cancelled` (exit 1, and no delay in a popup). So do `itm new` without a
+    title or with `-i` (the New task form, R1.1), `itm edit` without options
+    (the edit form, R5.4), `itm delete`'s question (no is exit 1 and says
+    nothing), `itm project remove`'s clone dialog, and `itm project
+    add-workspace`'s add dialog and folder question (R10.5).
   - The New task and edit form (`tui/form.rs`) has its fields in Tab order
     (title, description, projects, and for a new task the snooze and a time
     typed for "Other time…"); Enter in the title (or a time) saves, Ctrl+S
-    saves from any field, and Esc asks first when something was typed (for
-    an edit: also when the projects changed). The description is a
-    ratatui-textarea (Enter adds a line, Tab moves on). The snooze (a
-    drop-down `Select` in Textual) is a field whose choice ←/→ change;
-    typing on it picks "Other time…" and types the time there. Below the fields the form says
-    what saving does, worked out from the projects' folders as the last
-    refresh saw them (`Saved`: which folders are missing, and each saved
-    folder resolved).
+    saves from any field, and Esc asks first when something was typed (for an
+    edit: also when the projects changed). The description is a
+    ratatui-textarea (Enter adds a line, Tab moves on). The snooze is a field
+    whose choice ←/→ change; typing on it picks "Other time…" and types the
+    time there. Below the fields the form says what saving does, worked out
+    from the projects' folders as the last refresh saw them (`Saved`: which
+    folders are missing, and each saved folder resolved).
   - The project finder (`tui/finder.rs`) and the add dialog (`tui/add.rs`)
-    complete folders (`tui/completion.rs`) as the Textual switcher's
-    `FolderLister` and `FolderSuggester` did: each screen keeps the listings it asked for
-    while it is open, each folder read once in a plain thread that is never
-    joined (a scan blocked on NFS, autofs or a cold /nix/store holds up
-    neither the loop nor the exit), and filters them in memory on every
-    key. A listing comes back to every screen that asked for it, and one
-    for a screen that closed meanwhile is dropped. While a folder is read
-    the finder has no rows ("Reading the folder…"), so Enter and Tab never
-    act on rows left from earlier text; a listing that arrives late rebuilds
-    the rows from what is typed then. Symlinked folders are resolved in the
-    reading thread (`Listing.links`), so a saved folder reached through a
-    link is found, and rows are worked out from the listing alone (no
-    filesystem call while typing). Ghost text (`Folders::ghost`) is a completion that starts
-    with exactly what was typed (no casefolding), none after a trailing
-    "/"; it is worked out when drawn, from the listings the dialog has, so a
-    late listing shows it and a kind switch (only folders complete) clears
-    it. → at the end of the source, or Tab, takes it.
+    complete folders (`tui/completion.rs`): each screen keeps the listings it
+    asked for while it is open, each folder read once in a plain thread that
+    is never joined (a scan blocked on NFS, autofs or a cold /nix/store holds
+    up neither the loop nor the exit), and filters them in memory on every
+    key. A listing comes back to every screen that asked for it, and one for a
+    screen that closed meanwhile is dropped. While a folder is read the finder
+    has no rows ("Reading the folder…"), so Enter and Tab never act on rows
+    left from earlier text; a listing that arrives late rebuilds the rows from
+    what is typed then. Symlinked folders are resolved in the reading thread
+    (`Listing.links`), so a saved folder reached through a link is found, and
+    rows are worked out from the listing alone (no filesystem call while
+    typing). Ghost text (`Folders::ghost`) is a completion that starts with
+    exactly what was typed (no casefolding), none after a trailing "/"; it is
+    worked out when drawn, from the listings the dialog has, so a late listing
+    shows it and a kind switch (only folders complete) clears it. → at the end
+    of the source, or Tab, takes it.
   - Fuzzy matching is `fuzzy::fuzzy_match` (linear time), for projects and
     folders alike.
-  - The add dialog checks what was typed once typing pauses (Python's
-    0.25 s debounce): a `Job::CheckProject` in a worker says where the
-    project would go and whether it is saved already or its name taken, as
-    adding would (`Itm::check_project`, which may ask git how `insteadOf`
-    rewrites the URL); only the check of what is typed now is kept. Enter
-    adds, and adding checks again; a clone is checked before its child
-    starts, so a name taken comes back typed and puts the cursor on the
-    name (`Error::is_about_the_name`, R8.5). Its kinds are tabs: Ctrl+←/→
-    cycle them, plain ←/→ change them only in an empty source and stop at
-    the ends, never while a save or a clone runs.
+  - The add dialog checks what was typed once typing pauses (for 0.25 s): a
+    `Job::CheckProject` in a worker says where the project would go and
+    whether it is saved already or its name taken, as adding would
+    (`Itm::check_project`, which may ask git how `insteadOf` rewrites the
+    URL); only the check of what is typed now is kept. Enter adds, and adding
+    checks again; a clone is checked before its child starts, so a name taken
+    comes back typed and puts the cursor on the name
+    (`Error::is_about_the_name`, R8.5). Its kinds are tabs: Ctrl+←/→ cycle
+    them, plain ←/→ change them only in an empty source and stop at the ends,
+    never while a save or a clone runs.
   - A clone from the add dialog (`tui/clones.rs`) runs the child `itm
     project add git --name=<name> -- <url>` from a worker that reads its
     output as it comes and says the last line of each chunk (git's
@@ -966,7 +931,7 @@ Visual principles (`tui/theme.rs`, `tui/draw.rs`; the decision of 2026-11-06,
   CLI, switcher and daemon share), `store.rs`, `tasks.rs`, `snooze.rs`,
   `herdr.rs`, `switching.rs`, `daemon.rs` (`observe` asks Herdr,
   `poll_once` decides and records), `status.rs`, `projects.rs`, `notes.rs`,
-  `system.rs` (what differs between operating systems), `paths.rs`,
+  `system.rs` (what itm needs from Linux), `paths.rs`,
   `times.rs`, `error.rs`, `git.rs` (URL normalization, `insteadOf`, checkouts,
   local work, the clone, the repository a folder is in), `config.rs` (the
   settings), `workspaces.rs` (which project a workspace is in, and `itm
@@ -981,66 +946,6 @@ Visual principles (`tui/theme.rs`, `tui/draw.rs`; the decision of 2026-11-06,
   clone children). Tests sit
   next to the code; `tests/switching.rs` runs the switching protocol with
   real processes and signals.
-
-### 2026-11-06: the Rust itm replaces the Python itm (the cutover)
-- **Why.** The Go-versus-Rust standoff (an MVP of the core in each, from
-  one brief, the Python itm as the incumbent; three reviewers scoring
-  maintainability 40%, focus 30% and potential 30%) gave Rust 7.95, Go
-  7.25 and Python 6.35, and every reviewer ranked Rust first and Python
-  last. Their reasons for Rust: a typed domain (task states, `Until {Time,
-  Agent}`, `Option` for folders, which turns the optional-folder rules of
-  section 2 into compile errors), designed test seams (the `Itm` context,
-  the `Processes` trait, the daemon split into `observe` and a pure
-  `poll_once`, the switcher as a pure state machine with snapshot tests),
-  byte-for-byte compatibility with the Python itm's files (it alone
-  tracked the format change made during the standoff), and speed where
-  users feel it. Against Python: a 3,034-line core that its 244
-  `mock.patch` sites kept from being split, untyped dicts, no type checker
-  or linter, and Textual's import as a floor under the switcher's first
-  frame. Go read best and built fastest, but rewrote Python's state in the
-  old format. Their advice, followed: an incremental rewrite with the
-  Python itm as the reference until parity (2026-11-06 above), then this.
-- **Measured** (the standoff's method, `scripts/measure.sh`: a sandbox with
-  5 tasks, 3 with running headless sessions, one with a blocked fake agent;
-  `itm list` and `itm status` the median of 20 runs; the switcher's first
-  frame with the tasks the median of 10 runs of `itm ui` with
-  `ITM_EXIT_AFTER_DRAW=1` in a 120×40 tmux pane; the daemon's CPU, its own
-  and its children's from `/proc/<pid>/stat`, and peak RSS over 60 s;
-  release build, Herdr 0.9.3, on the same machine):
-
-  |                       | `itm list` | `itm status` | first draw | daemon CPU | daemon RSS |
-  |-----------------------|-----------:|-------------:|-----------:|-----------:|-----------:|
-  | Python 0.2.0          | 52.3 ms    | 60.0 ms      | ≈175 ms*   | 0.78%      | 24.5 MB    |
-  | Rust MVP (standoff)   | 1.0–1.4 ms | 1.1 ms       | 2.2–2.5 ms | 0.033%     | 4 MB       |
-  | Rust at the cutover   | 1.31 ms    | 1.61 ms      | 2.64 ms    | 0.050%     | 5.1 MB     |
-
-  \* The Python switcher has no `ITM_EXIT_AFTER_DRAW`; 175 ms is the
-  standoff's measurement of its first frame with tasks, on the user's
-  machine with real data (Python start 17 ms, Textual import about 105
-  ms). The full product costs the Rust itm little over the MVP: the
-  binary is 3.7 MB, and its daemon reads a whole `session.snapshot` of
-  each running session (the workspaces as well as the agents) and the
-  settings file on every pass.
-- **Size.** Rust: 10,380 lines of product and 7,110 of tests (281 unit
-  tests, 14 real-process tests in `tests/switching.rs`, 21 screen
-  snapshots), 14 direct dependencies (138 crates in `Cargo.lock`); a
-  release build of the crate takes about 45 s (LTO, one codegen unit),
-  more from clean. Python 0.2.0: 5,594 lines of product and 3,997 of tests
-  (280 tests), one dependency (Textual).
-- **What changed at the cutover.** The Python package, its tests and
-  `pyproject.toml` left the tree (commit 7bdbaa4 has them); the Nix
-  package, the flake's checks and CI build the crate (section 7); the
-  version went to 0.3.0, after the Python 0.2.0; `PARITY.md` lists every
-  requirement and rule with its status, where it lives and the test that
-  pins it. The cross-check still runs a pinned build of the Python itm
-  (section 6), and the smoke run passes against Herdr 0.9.3 and 0.9.5.
-- **Deliberate differences** from the Python itm are listed in
-  `PARITY.md` ("Known differences"); the ones a user sees: one command,
-  `itm` (no `inbox-task-manager`); `ITM_THEME` names mocha, latte or
-  terminal, not a Textual theme; the Settings screen edits dotted keys and inline tables;
-  errors from the system read as Rust words them; the form's snooze is a
-  field, not a drop-down; no mouse.
-- **Not done.** The oldest Rust it claims (1.89) is checked only by CI.
 
 ### 2026-11-06: Linux only
 - **Why.** The user runs itm on Linux and NixOS only. The first macOS CI
@@ -1061,13 +966,12 @@ Visual principles (`tui/theme.rs`, `tui/draw.rs`; the decision of 2026-11-06,
   are in the history before this commit.
 
 ### 2026-11-06: a theme of its own, not the terminal's named colors
-- **Why.** The cutover drew with the terminal's named ANSI colors so the
-  switcher would follow the terminal's theme. Base16 themes remap colors
-  8–15: in a Catppuccin kitty, `DarkGray` (color8) is `#45475a` on
-  `#1e1e2e`, 1.8:1, and most of the switcher's text was drawn in it (the
-  description, notes, statuses, every key label). `REVERSED` turned a
-  colored row into a block of its color. The first TUI proposal had chosen
-  Catppuccin Mocha with `ITM_THEME`; the port had dropped both.
+- **Why.** The switcher drew with the terminal's named ANSI colors so it would
+  follow the terminal's theme. Base16 themes remap colors 8–15: in a
+  Catppuccin kitty, `DarkGray` (color8) is `#45475a` on `#1e1e2e`, 1.8:1, and
+  most of the switcher's text was drawn in it (the description, notes,
+  statuses, every key label). `REVERSED` turned a colored row into a block of
+  its color.
 - **Decided.** Three themes (`[ui] theme` in `config.toml`, the Settings
   screen's Colors row, `ITM_THEME` overriding both): `mocha` (the default)
   and `latte`, Catppuccin's, with the colors that fell short moved until
@@ -1109,11 +1013,10 @@ Visual principles (`tui/theme.rs`, `tui/draw.rs`; the decision of 2026-11-06,
 - **Settings files** are rewritten with LF line endings.
 - **Alt+3…9.** Alt+1, Alt+2 and Alt+5 were sent to a Herdr popup; the others
   are assumed to arrive the same way.
-- **The Rust switcher's loop** wakes every 100 ms while a clone runs, to look
-  for signals, and redraws each time; while a worker runs it looks at the
-  results every 10 ms. Neither is measurable in the daemon's or the
-  switcher's numbers (section 4), but an idle switcher with a clone running
-  is not idle.
+- **The switcher's loop** wakes every 100 ms while a clone runs, to look for
+  signals, and redraws each time; while a worker runs it looks at the results
+  every 10 ms. Neither is measurable in the daemon's or the switcher's numbers
+  (REQUIREMENTS.md N3), but an idle switcher with a clone running is not idle.
 - **Help scroll.** The help screen learns how far it can scroll when it is
   drawn (a `Cell` set while drawing), so before its first draw ↓ may go up
   to the number of lines.
@@ -1150,8 +1053,6 @@ Visual principles (`tui/theme.rs`, `tui/draw.rs`; the decision of 2026-11-06,
   some pinned as insta snapshots in `src/tui/snapshots/` (`INSTA_UPDATE=always
   cargo test` rewrites them after an intended change; review the diff). A
   test that pins a requirement names it (`R4.1` in its name or a comment).
-  The Python itm's tests (`tests/*.py` until the cutover) were the most
-  precise spec; their cases were ported as Rust tests (`PARITY.md`).
 - Manual end-to-end checks run in a sandbox, never against real sessions:
   - separate `XDG_CONFIG_HOME` (short path: symlink it under
     `$XDG_RUNTIME_DIR`, see the socket path limit), `XDG_STATE_HOME` and
@@ -1195,25 +1096,6 @@ Visual principles (`tui/theme.rs`, `tui/draw.rs`; the decision of 2026-11-06,
   `scripts/measure.sh`, both run through
   `scripts/sandbox.sh <name>` (no `HERDR_*` variables, private XDG folders
   under `/tmp/itm-<name>`, notifications to a log).
-- `scripts/cross-check.sh` runs the Python itm (the reference: 0.2.0, the
-  Rust rewrite's base, built from that commit's flake as the script's
-  header says) and the Rust itm on shared state in a sandbox: the same commands
-  write the same `tasks.json` byte for byte (timestamps masked) and print
-  the same output and errors; each lists the other's state as the other
-  does; an edit of the other's file (the old single-project format too)
-  changes nothing it should not; a Rust edit waits for the lock. A change
-  that touches the files both read adds its commands to it, so the Rust
-  itm keeps reading and writing what 0.2.0 does (a user may still run
-  both during an upgrade). Its git projects run the Python
-  build's inner entry point (`.itm-wrapped`: the wrapper puts its own git
-  first on `PATH`) with a git whose clone makes an empty checkout of the
-  URL, so no network is needed; where each side adds its own projects,
-  their random ids are replaced by names before comparing. For Herdr
-  workspaces (R10) each side gets its own headless Herdr session with the
-  same workspaces, made in the same order (so their ids match), and its
-  own daemon runs for a few passes at a time (the first pass over a
-  session only adds). What the Rust itm printed at each step is kept in
-  `cross/steps.log`, so a step that passes can be read too.
 
 ## 7. Packaging
 
@@ -1254,4 +1136,4 @@ Visual principles (`tui/theme.rs`, `tui/draw.rs`; the decision of 2026-11-06,
   (1.89), and `nix build` and `nix flake check`, all on Linux.
 - New files need `git add` (`-N` is enough) before a flake build can see them.
 - The source fileset is `Cargo.toml`, `Cargo.lock`, `rustfmt.toml`, `src/`
-  and the `.rs` files of `tests/`.
+  and `tests/`.

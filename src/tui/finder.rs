@@ -431,9 +431,8 @@ mod tests {
         }
     }
 
-    /// R1.6, after Python's test_picker_finds_projects_fuzzily: letters in
-    /// order in any case, a name's prefix first; the add rows, "+ New
-    /// project" last; Enter adds; on a ✓ project it removes it.
+    /// R1.6: letters in order in any case, a name's prefix first; the add
+    /// rows, "+ New project" last; Enter adds; on a ✓ project it removes it.
     #[test]
     fn r1_6_projects_are_found_by_their_letters() {
         let mut found = finder(&[], "BAC");
@@ -523,9 +522,8 @@ mod tests {
         })
     }
 
-    /// R1.6, after test_picker_completes_folders_and_adds_one and
-    /// test_picker_waits_for_a_slow_folder: a typed path lists folders once
-    /// its parent was read (nothing to act on before); a saved one names
+    /// R1.6: a typed path lists folders once its parent was read (nothing
+    /// to act on before); a saved one names
     /// its project; Tab goes into a folder, which is offered itself
     /// ("Use"); Enter adds a new one through the add dialog, or picks the
     /// saved one's project.

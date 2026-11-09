@@ -1,10 +1,7 @@
 //! `tasks.json`: task and project metadata, guarded by an exclusive `flock`
-//! and written atomically (DESIGN.md section 2, "Data safety").
-//!
-//! The file is shared with the Python itm, so this module reads what Python
-//! writes (the old single `project` included), keeps every field it does not
-//! know, and writes the same bytes Python would: sorted keys, two-space
-//! indent, non-ASCII escaped.
+//! and written atomically (DESIGN.md section 2, "Data safety"). Every field
+//! itm does not know (a newer itm's, or one added by hand) is kept as it
+//! is, and keys are written sorted with a two-space indent.
 
 use std::collections::BTreeMap;
 use std::fs::{self, File};
@@ -60,12 +57,12 @@ pub struct Task {
     pub snoozed_until: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub archived_at: Option<i64>,
-    /// Fields this version does not use, kept as they are.
+    /// Fields itm does not use, kept as they are.
     #[serde(flatten)]
     pub extra: BTreeMap<String, Value>,
 }
 
-/// What a project is, read off its fields (never stored, N1).
+/// What a project is, read off its fields (never stored, R8.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, clap::ValueEnum)]
 #[serde(rename_all = "lowercase")]
 pub enum ProjectKind {
@@ -134,7 +131,8 @@ pub struct Data {
     pub extra: BTreeMap<String, Value>,
 }
 
-/// Like Python's `task_projects`: anything but a list of strings means no projects.
+/// Anything but a list reads as no projects, and a list keeps only its
+/// strings: a file edited by hand stays readable.
 fn ids_or_none<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
     Ok(match Value::deserialize(d)? {
         Value::Array(items) => items.into_iter().filter_map(|v| v.as_str().map(str::to_owned)).collect(),
@@ -164,10 +162,9 @@ impl Store {
         let _lock = self.lock()?;
         let mut data = self.read()?;
         let result = change(&mut data)?;
-        // Through a Value, whose maps sort every key, as Python's sort_keys does.
+        // Through a Value, whose maps sort every key, unknown ones included.
         let value = serde_json::to_value(&data).context(|| "cannot save tasks".into())?;
-        write_atomic(&self.path, &python_json(&value, true))
-            .context(|| format!("cannot write {}", self.path.display()))?;
+        write_atomic(&self.path, &to_json(&value, true)).context(|| format!("cannot write {}", self.path.display()))?;
         Ok(result)
     }
 
@@ -184,32 +181,13 @@ impl Store {
             }
             Err(e) => return Err(e).context(|| format!("cannot read {}", self.path.display())),
         };
-        let mut raw: Value =
+        let raw: Value =
             serde_json::from_str(&text).context(|| format!("{} is not valid JSON", self.path.display()))?;
-        upgrade(&mut raw);
         serde_json::from_value(raw).context(|| format!("{} is not a task list itm can read", self.path.display()))
     }
 }
 
-/// Older files, as the Python itm reads them (N1): tasks had one `project`
-/// before they had a list of `projects`, and projects stored their `kind`.
-fn upgrade(raw: &mut Value) {
-    if let Some(projects) = raw.get_mut("projects").and_then(Value::as_object_mut) {
-        projects.values_mut().filter_map(Value::as_object_mut).for_each(|p| drop(p.remove("kind")));
-    }
-    let Some(tasks) = raw.get_mut("tasks").and_then(Value::as_object_mut) else { return };
-    for task in tasks.values_mut().filter_map(Value::as_object_mut) {
-        if let Some(Value::String(legacy)) = task.remove("project")
-            && !task.contains_key("projects")
-            && !legacy.is_empty()
-        {
-            task.insert("projects".into(), Value::Array(vec![Value::String(legacy)]));
-        }
-    }
-}
-
-/// An exclusive `flock` on `path`, held until the file is dropped. The same
-/// lock the Python itm takes, so both wait for each other.
+/// An exclusive `flock` on `path`, held until the file is dropped.
 pub fn flocked(path: &Path) -> io::Result<File> {
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir)?;
@@ -232,48 +210,10 @@ pub fn write_atomic(path: &Path, text: &str) -> io::Result<()> {
     Ok(())
 }
 
-/// JSON as Python's `json.dumps` writes it (`ensure_ascii`), pretty with a
-/// two-space indent, or compact with Python's default separators (`, ` and
-/// `: `), with a final newline. Non-ASCII characters only occur inside
-/// strings, so escaping them after serializing is exact.
-pub fn python_json(value: &(impl Serialize + ?Sized), pretty: bool) -> String {
-    let mut bytes = vec![];
-    let written = if pretty {
-        value.serialize(&mut serde_json::Serializer::pretty(&mut bytes))
-    } else {
-        value.serialize(&mut serde_json::Serializer::with_formatter(&mut bytes, PythonSeparators))
-    };
-    written.expect("JSON values always serialize");
-    let text = String::from_utf8(bytes).expect("serde_json writes UTF-8");
-    let mut out = String::with_capacity(text.len() + 1);
-    for c in text.chars() {
-        if c.is_ascii() {
-            out.push(c);
-        } else {
-            for unit in c.encode_utf16(&mut [0; 2]) {
-                out.push_str(&format!("\\u{unit:04x}"));
-            }
-        }
-    }
-    out.push('\n');
-    out
-}
-
-/// `json.dumps`'s default separators on one line: `, ` and `: `.
-struct PythonSeparators;
-
-impl serde_json::ser::Formatter for PythonSeparators {
-    fn begin_array_value<W: ?Sized + Write>(&mut self, writer: &mut W, first: bool) -> io::Result<()> {
-        if first { Ok(()) } else { writer.write_all(b", ") }
-    }
-
-    fn begin_object_key<W: ?Sized + Write>(&mut self, writer: &mut W, first: bool) -> io::Result<()> {
-        if first { Ok(()) } else { writer.write_all(b", ") }
-    }
-
-    fn begin_object_value<W: ?Sized + Write>(&mut self, writer: &mut W) -> io::Result<()> {
-        writer.write_all(b": ")
-    }
+/// JSON with a final newline: pretty with a two-space indent, or on one line.
+pub fn to_json(value: &(impl Serialize + ?Sized), pretty: bool) -> String {
+    let text = if pretty { serde_json::to_string_pretty(value) } else { serde_json::to_string(value) };
+    text.expect("itm's values always serialize") + "\n"
 }
 
 #[cfg(test)]
@@ -357,10 +297,8 @@ mod tests {
         assert!(leftovers.is_empty(), "temp files left: {leftovers:?}");
     }
 
-    /// Written by the Python itm (`json.dumps(data, indent=2, sort_keys=True)`):
-    /// non-ASCII text, an emoji, escapes, unknown fields at every level and the
-    /// old single `project`, which Python also turns into `projects`.
-    const PYTHON_WRITTEN: &str = r#"{
+    /// Non-ASCII text, an emoji, escapes and unknown fields at every level.
+    const WRITTEN: &str = r#"{
   "deleted": {
     "task-gone": 1700000000
   },
@@ -374,7 +312,7 @@ mod tests {
   "projects": {
     "a1b2c3d4": {
       "added_at": 1700000000,
-      "kind": "dir",
+      "color": "blue",
       "last_used_at": 1700000100,
       "name": "api",
       "path": "/home/me/src/api"
@@ -388,9 +326,12 @@ mod tests {
         "a1b2c3d4"
       ],
       "last_used_at": 1700000200,
-      "project": "a1b2c3d4",
+      "pinned": true,
+      "projects": [
+        "a1b2c3d4"
+      ],
       "state": "active",
-      "title": "Caf\u00e9 cr\u00e8me \ud83d\ude80"
+      "title": "Café crème 🚀"
     }
   },
   "version": 1
@@ -398,9 +339,9 @@ mod tests {
 "#;
 
     #[test]
-    fn a_file_written_by_python_is_read_and_rewritten_as_python_would() {
+    fn a_rewrite_keeps_every_field_and_byte() {
         let (_tmp, store) = store();
-        fs::write(&store.path, PYTHON_WRITTEN).unwrap();
+        fs::write(&store.path, WRITTEN).unwrap();
         let data = store.load().unwrap();
         let task = &data.tasks["task-caf"];
         assert_eq!(task.title, "Café crème 🚀");
@@ -412,21 +353,7 @@ mod tests {
         );
 
         store.edit(|_| Ok(())).unwrap();
-        // Python's rewrite: the legacy "project" became "projects", the stored
-        // "kind" went, nothing else changed.
-        let expected = PYTHON_WRITTEN
-            .replace("      \"project\": \"a1b2c3d4\",\n", "      \"projects\": [\n        \"a1b2c3d4\"\n      ],\n")
-            .replace("      \"kind\": \"dir\",\n", "");
-        assert_eq!(fs::read_to_string(&store.path).unwrap(), expected);
-    }
-
-    #[test]
-    fn compact_json_has_pythons_separators() {
-        let value = serde_json::json!({"waiting": 1, "list": [1, 2], "empty": {}, "text": "café"});
-        assert_eq!(
-            python_json(&value, false),
-            "{\"empty\": {}, \"list\": [1, 2], \"text\": \"caf\\u00e9\", \"waiting\": 1}\n"
-        );
+        assert_eq!(fs::read_to_string(&store.path).unwrap(), WRITTEN);
     }
 
     #[test]
@@ -438,7 +365,7 @@ mod tests {
     }
 
     #[test]
-    fn the_lock_is_the_one_python_takes() {
+    fn a_second_open_of_the_lock_waits_for_the_first() {
         // flock is per open file: a second open of the lock file waits for the first.
         let (tmp, _store) = store();
         let lock = tmp.path().join(".tasks.lock");

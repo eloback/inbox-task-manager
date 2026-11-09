@@ -335,7 +335,7 @@ mod tests {
         let (_tmp, itm) = itm();
         itm.change_setting(Setting::RemoveProjectsWithoutWorkspace, false).unwrap();
         assert_eq!(read(&itm), "[herdr]\nremove_projects_without_workspace = false\n");
-        // After other content, the new table follows a blank line, as the Python itm writes it.
+        // After other content, the new table follows a blank line.
         for (text, written) in [
             ("# settings\n", "# settings\n\n[herdr]\nprojects_from_workspaces = false\n"),
             ("# settings\n\n", "# settings\n\n[herdr]\nprojects_from_workspaces = false\n"),
@@ -411,7 +411,7 @@ mod tests {
         let err = itm.change_setting(Setting::ProjectsFromWorkspaces, false).unwrap_err().to_string();
         assert!(err.starts_with("cannot read "), "{err}");
 
-        // What the Python itm refused ("edit it by hand"), the document edit follows.
+        // Quoted and dotted keys are changed where they are.
         write(&itm, "[herdr]\n\"projects_from_workspaces\" = true\n");
         itm.change_setting(Setting::ProjectsFromWorkspaces, false).unwrap();
         assert_eq!(read(&itm), "[herdr]\n\"projects_from_workspaces\" = false\n");

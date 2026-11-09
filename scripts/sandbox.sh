@@ -8,8 +8,7 @@
 # Desktop notifications go to /tmp/itm-<name>/notifications.log.
 # /tmp is shared: a root someone else made (or could write to) is refused,
 # since the command runs with its HOME, config and notify.sh.
-# ITM and ITM_PYTHON (default: the Python itm built into
-# ~/.cache/itm/python-ref, see cross-check.sh) pass through.
+# ITM (the itm to run) passes through.
 set -euo pipefail
 name=$1; shift
 root=/tmp/itm-$name
@@ -23,9 +22,6 @@ chmod 700 "$root"/runtime
 notify=$root/notify.sh
 printf '#!/bin/sh\nprintf "%%s | %%s\\n" "$1" "$2" >> %s/notifications.log\n' "$root" > "$notify"
 chmod +x "$notify"
-pass=(ITM_PYTHON="${ITM_PYTHON:-${XDG_CACHE_HOME:-$HOME/.cache}/itm/python-ref/bin/itm}")
-[ -n "${ITM:-}" ] && pass+=(ITM="$ITM")
-[ -n "${ITM_PYTHON_BARE:-}" ] && pass+=(ITM_PYTHON_BARE="$ITM_PYTHON_BARE")
 exec env -i \
   PATH="$PATH" \
   HOME="$root/home" \
@@ -38,5 +34,5 @@ exec env -i \
   XDG_RUNTIME_DIR="$root/runtime" \
   ITM_NOTIFY_COMMAND="$notify" \
   ITM_SANDBOX="$root" \
-  "${pass[@]}" \
+  ${ITM:+"ITM=$ITM"} \
   "$@"

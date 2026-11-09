@@ -350,9 +350,9 @@ mod tests {
         f(&Context { tz: &TimeZone::UTC, now: Moment { instant: Instant::now(), epoch: NOW }, paths: &paths })
     }
 
-    /// R8.3, after Python's test_projects_rename_remove_and_filter: a
-    /// project a task has cannot be removed (nothing to choose); a rename
-    /// to a name taken in any case waits; Enter shows the project's tasks.
+    /// R8.3: a project a task has cannot be removed (nothing to choose); a
+    /// rename to a name taken in any case waits; Enter shows the project's
+    /// tasks.
     #[test]
     fn r8_3_rename_remove_and_show_its_tasks() {
         let mut screen = ProjectsScreen::new(&with_projects());
@@ -396,8 +396,8 @@ mod tests {
         assert!(matches!(screen.on_key(key(KeyCode::Enter)), Outcome::CloseAnd(Action::Filter(name)) if name == "api"));
     }
 
-    /// R8.2, R8.3: the rename dialog opens with the old name selected, as
-    /// in the Python itm: typing replaces it.
+    /// R8.2, R8.3: the rename dialog opens with the old name selected:
+    /// typing replaces it.
     #[test]
     fn r8_2_a_rename_types_over_the_old_name() {
         let mut screen = ProjectsScreen::new(&with_projects());

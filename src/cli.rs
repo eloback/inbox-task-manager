@@ -13,7 +13,7 @@ use crate::itm::Itm;
 use crate::projects::{CloneChoice, CloneState, RemovalNote, project_rows, resolve_project};
 use crate::snooze::Until;
 use crate::status::Status;
-use crate::store::{Data, ProjectKind, State, python_json};
+use crate::store::{Data, ProjectKind, State, to_json};
 use crate::system::{date_reads, which};
 use crate::tasks::{self, Edit, counts, inbox_order, is_task_session};
 use crate::workspaces::Ask;
@@ -319,7 +319,7 @@ pub fn run(cli: Cli, itm: Itm) -> Result<()> {
             let data = itm.store().load()?;
             let name = tasks::resolve_task(&data, &task)?;
             if !yes {
-                // R5.3: after confirmation. A no is said by the exit status alone, as in the Python itm.
+                // R5.3: after confirmation. A no is said by the exit status alone.
                 needs_terminal()?;
                 if !tui::confirm_delete(&name, &data.tasks[&name].title, &itm)? {
                     return Err(Error::Exit(1));
@@ -371,7 +371,7 @@ pub fn run(cli: Cli, itm: Itm) -> Result<()> {
                     counts: tasks::Counts,
                     daemon: bool,
                 }
-                print!("{}", python_json(&Json { counts, daemon: status.fresh }, false));
+                print!("{}", to_json(&Json { counts, daemon: status.fresh }, false));
             } else {
                 let waiting = if status.fresh { counts.waiting.to_string() } else { "?".into() };
                 let fields = [
@@ -379,7 +379,7 @@ pub fn run(cli: Cli, itm: Itm) -> Result<()> {
                     ("active", counts.active.to_string()),
                     ("snoozed", counts.snoozed.to_string()),
                     ("archived", counts.archived.to_string()),
-                    ("daemon", if status.fresh { "True" } else { "False" }.into()),
+                    ("daemon", status.fresh.to_string()),
                 ];
                 println!("{}", format_fields(&format, &fields)?);
             }
@@ -397,7 +397,7 @@ pub fn run(cli: Cli, itm: Itm) -> Result<()> {
             }
             let rows = task_rows(&itm, &data, view, &itm.status(), &sessions, now);
             if json {
-                print!("{}", python_json(&rows, true));
+                print!("{}", to_json(&rows, true));
                 return Ok(());
             }
             for row in rows {
@@ -501,7 +501,7 @@ pub fn run(cli: Cli, itm: Itm) -> Result<()> {
             let data = itm.store().load()?;
             let rows = project_rows(&data);
             if json {
-                print!("{}", python_json(&rows, true));
+                print!("{}", to_json(&rows, true));
                 return Ok(());
             }
             for row in rows {
@@ -586,13 +586,13 @@ fn split_snooze_args(itm: &Itm, data: &Data, task: Option<&str>, words: &[String
     Ok((itm.target_or_current(data, task)?, joined(words)))
 }
 
-/// One task as `itm list --json` prints it, in the Python itm's key order.
+/// One task as `itm list --json` prints it, its keys in this order.
 #[derive(Serialize)]
 struct Row<'a> {
     session: &'a str,
     title: &'a str,
     description: Option<&'a str>,
-    /// The first project, as before tasks had several.
+    /// The first project (where the session starts): its name and id.
     project: Option<&'a str>,
     project_id: Option<&'a str>,
     projects: Vec<ProjectRef<'a>>,
@@ -654,7 +654,7 @@ fn task_rows<'a>(
         .collect()
 }
 
-/// Python's `str.format` for named fields: `{name}`, with `{{` and `}}` for braces.
+/// Named fields, `{name}`, filled in, with `{{` and `}}` for braces.
 fn format_fields(format: &str, fields: &[(&str, String)]) -> Result<String> {
     let bad = |what: &str| -> Result<String> {
         bail!("bad --format: {what}; fields: waiting, active, snoozed, archived, daemon")
@@ -729,7 +729,7 @@ mod tests {
         assert_eq!(order[2], "task-later");
         let fix = &rows[1];
         assert_eq!((fix.project, fix.project_id, fix.projects.len()), (Some("api"), Some("p1"), 2));
-        let json = python_json(&rows[1..2], true);
+        let json = to_json(&rows[1..2], true);
         let keys: Vec<&str> = json.lines().filter_map(|l| l.strip_prefix("    \"")?.split('"').next()).collect();
         assert_eq!(keys[..6], ["session", "title", "description", "project", "project_id", "projects"]);
         assert!(json.contains("\"notes\": \"") && json.ends_with("]\n"));

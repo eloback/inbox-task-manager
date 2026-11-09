@@ -202,25 +202,19 @@ pub fn normalize_git_url(url: &str) -> Result<String> {
     Ok(format!("{host}/{}", segments.join("/")))
 }
 
-/// (host, path) of a URL with a scheme, as Python's `urlsplit` reads them:
-/// the host is the network location without user and port; the path stops
-/// at a query or fragment. None for a location with IPv6 brackets (Python
-/// refuses them or finds a host no git URL here has).
+/// (host, path) of a URL with a scheme: the host is the network location
+/// without user and port; the path stops at a query or fragment.
 fn split_url(text: &str) -> Option<(String, String)> {
-    let text: String = text.chars().filter(|c| !"\t\r\n".contains(*c)).collect();
     let rest = &text[text.find("://")? + 3..];
     let (netloc, after) = rest.split_at(rest.find(['/', '?', '#']).unwrap_or(rest.len()));
     let path = after.split(['?', '#']).next().unwrap_or("");
-    if netloc.contains(['[', ']']) {
-        return None;
-    }
     let hostinfo = netloc.rsplit_once('@').map_or(netloc, |(_, host)| host);
     let host = hostinfo.split(':').next().unwrap_or("");
     Some((host.to_string(), path.to_string()))
 }
 
 /// `%XX` escapes decoded, the result read as UTF-8 (a bad sequence becomes
-/// U+FFFD), like Python's `urllib.parse.unquote`.
+/// U+FFFD).
 fn unquote(segment: &str) -> String {
     let bytes = segment.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());

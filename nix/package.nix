@@ -26,7 +26,7 @@ rustPlatform.buildRustPackage {
       ../Cargo.lock
       ../rustfmt.toml
       ../src
-      (lib.fileset.fileFilter (file: file.hasExt "rs") ../tests)
+      ../tests
     ];
   };
 

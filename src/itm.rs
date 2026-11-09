@@ -312,7 +312,7 @@ pub mod tests {
     use super::*;
     use crate::herdr::{Session, fake};
     use crate::status::{AgentState, AgentStatus, Cache, SessionStatus};
-    use crate::store::python_json;
+    use crate::store::to_json;
     use crate::switching::tests::FakeProcs;
     use serde_json::{Value, json};
     use std::fs;
@@ -342,7 +342,7 @@ pub mod tests {
         };
         let sessions = sessions.iter().map(|&(name, n)| (name.to_string(), blocked(n))).collect();
         let cache = Cache { updated_at: times::now(), sessions };
-        crate::store::write_atomic(&itm.paths.status_file().unwrap(), &python_json(&cache, false)).unwrap();
+        crate::store::write_atomic(&itm.paths.status_file().unwrap(), &to_json(&cache, false)).unwrap();
     }
 
     #[test]
@@ -757,7 +757,7 @@ pub mod tests {
             .edit(|data| {
                 let mut old = Task::new("Old title", 1);
                 old.description = Some("old text".into());
-                Ok(data.tasks.insert("task-old".into(), old)) // from before notes existed, or adopted
+                Ok(data.tasks.insert("task-old".into(), old)) // no notes yet, as an adopted session
             })
             .unwrap();
         edit(&itm, "task-old", |e| e.title = Some("New title".into())).unwrap();

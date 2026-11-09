@@ -23,19 +23,19 @@ use crate::error::{Context, Error, Result};
 use crate::herdr::{Agent, Sessions, Workspace};
 use crate::itm::Itm;
 use crate::status::{AgentState, AgentStatus, Cache, SessionStatus};
-use crate::store::{State, python_json, write_atomic};
+use crate::store::{State, to_json, write_atomic};
 use crate::system::{NotifyCommand, notify_command, output_within};
 use crate::tasks::{self, is_task_session};
 use crate::times;
 use crate::workspaces::project_roots;
 
 pub const POLL: Duration = Duration::from_secs(2);
-/// How long a desktop notification offering Open is waited for (Python's limit).
+/// How long a desktop notification offering Open is waited for.
 const NOTIFY_WAIT: Duration = Duration::from_secs(3600);
 
 /// Blocked agents already reported: wait key → when the daemon first saw
-/// the wait (`notified.json`). A key is a session, pane and state change,
-/// as the Python itm writes it, so one wait is reported once (R3.4).
+/// the wait (`notified.json`). A key is a session, pane and state change
+/// (`session|pane|seq`), so one wait is reported once (R3.4).
 pub type Notified = BTreeMap<String, i64>;
 
 /// What Herdr showed on one pass.
@@ -75,11 +75,11 @@ fn desktop_command(
 
 fn wait_key(session: &str, agent: &Agent) -> String {
     let seq = match &agent.state_change_seq {
-        None | Some(serde_json::Value::Null) => "None".to_string(),
+        None | Some(serde_json::Value::Null) => String::new(),
         Some(serde_json::Value::String(s)) => s.clone(),
         Some(other) => other.to_string(),
     };
-    format!("{session}|{}|{seq}", agent.pane_id.as_deref().unwrap_or("None"))
+    format!("{session}|{}|{seq}", agent.pane_id.as_deref().unwrap_or_default())
 }
 
 impl Itm {
@@ -143,7 +143,7 @@ impl Itm {
             cache.insert(session.clone(), SessionStatus { blocked, agents: entries });
         }
         let status_file = self.paths.status_file()?;
-        write_atomic(&status_file, &python_json(&Cache { updated_at: now, sessions: cache }, false))
+        write_atomic(&status_file, &to_json(&Cache { updated_at: now, sessions: cache }, false))
             .context(|| format!("cannot write {}", status_file.display()))?;
 
         let new_waits: Vec<(&str, &Agent)> =
@@ -220,7 +220,7 @@ impl Itm {
         for key in blocked_now.keys() {
             notified.entry(key.clone()).or_insert(now);
         }
-        write_atomic(&self.paths.notified_file(), &python_json(&*notified, false))
+        write_atomic(&self.paths.notified_file(), &to_json(&*notified, false))
             .context(|| "cannot write notified.json".into())?;
         Ok(notices)
     }
@@ -803,10 +803,10 @@ mod tests {
     }
 
     #[test]
-    fn notified_json_keys_are_the_ones_python_writes() {
+    fn wait_keys_name_the_session_pane_and_state_change() {
         let none = agent("claude", "blocked", "w1:p1", None);
-        assert_eq!(wait_key("task-a", &none), "task-a|w1:p1|None");
+        assert_eq!(wait_key("task-a", &none), "task-a|w1:p1|");
         let no_pane: Agent = serde_json::from_value(json!({"agent_status": "blocked", "state_change_seq": 3})).unwrap();
-        assert_eq!(wait_key("task-a", &no_pane), "task-a|None|3");
+        assert_eq!(wait_key("task-a", &no_pane), "task-a||3");
     }
 }

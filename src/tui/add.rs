@@ -95,8 +95,8 @@ impl AddDialog {
         dialog
     }
 
-    /// Focus `field`. Moving there selects its text, as in the Python itm;
-    /// focus already there leaves what is being typed as it is.
+    /// Focus `field`. Moving there selects its text; focus already there
+    /// leaves what is being typed as it is.
     fn focus_on(&mut self, field: Field) {
         if self.focus != field {
             self.focus = field;
@@ -405,9 +405,8 @@ mod tests {
         last
     }
 
-    /// After Python's test_kind_keys and test_the_name_only_tab: plain
-    /// arrows stop at the ends and only in an empty source; Ctrl cycles;
-    /// nothing changes the kind while a clone runs.
+    /// Plain arrows stop at the ends and only in an empty source; Ctrl
+    /// cycles; nothing changes the kind while a clone runs.
     #[test]
     fn r8_3_the_kind_keys() {
         let now = Instant::now();
@@ -425,7 +424,7 @@ mod tests {
 
         let mut named = AddDialog::new(ProjectKind::Name, "", "Client X", Field::Name);
         press(&mut named, &[key(KeyCode::Left), key(KeyCode::Right), key(KeyCode::Right)], now);
-        // Left on the selected name goes to its start (as in the Python itm), then the cursor moves.
+        // Left on the selected name goes to its start, then the cursor moves.
         assert_eq!((named.kind, named.name.cursor()), (ProjectKind::Name, 2), "the cursor moves in the name");
     }
 
@@ -450,10 +449,9 @@ mod tests {
         assert_eq!(dialog.check, None, "a check of what was typed before is dropped");
     }
 
-    /// R8.5: focus that does not move leaves the name being typed as it is
-    /// (Textual's focus on the focused input does nothing): a name taken,
-    /// said after Enter on the name, and a switch to a name only while
-    /// typing it keep it unselected. Moving to the name selects it.
+    /// R8.5: focus that does not move leaves the name being typed as it is:
+    /// a name taken, said after Enter on the name, and a switch to a name
+    /// only while typing it keep it unselected. Moving to the name selects it.
     #[test]
     fn r8_5_focus_that_stays_keeps_what_is_typed() {
         let now = Instant::now();

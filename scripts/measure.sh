@@ -6,15 +6,11 @@
 #
 #   cargo build --release
 #   scripts/sandbox.sh measure scripts/measure.sh; rm -rf /tmp/itm-measure
-#
-# Also measures the Python itm (ITM_PYTHON) on the same state for reference
-# (its switcher has no ITM_EXIT_AFTER_DRAW switch).
 set -u
 root=${ITM_SANDBOX:?run this through scripts/sandbox.sh}
 repo=$(cd "$(dirname "$0")/.." && pwd)
 itm=${ITM:-$repo/target/release/itm}
 measure="python3 $repo/scripts/measure.py"
-python_itm=${ITM_PYTHON:-}
 sessions=$XDG_CONFIG_HOME/herdr/sessions
 tmux_sock=$root/tmux.sock
 call() { printf '%s\n' "$2" | socat -t 5 - "UNIX-CONNECT:$sessions/$1/herdr.sock"; }
@@ -38,18 +34,11 @@ call task-fix-login '{"id":"s","method":"pane.send_input","params":{"pane_id":"w
 sleep 0.5
 call task-fix-login '{"id":"r","method":"pane.report_agent","params":{"pane_id":"w1:p1","source":"custom:itmtest","agent":"fakebot","state":"blocked"}}' >/dev/null
 
-echo "rust itm list:   $($measure runs 20 "$itm" list)"
-echo "rust itm status: $($measure runs 20 "$itm" status)"
-echo "rust daemon:     $($measure daemon 60 "$itm" daemon)"
+echo "itm list:   $($measure runs 20 "$itm" list)"
+echo "itm status: $($measure runs 20 "$itm" status)"
+echo "daemon:     $($measure daemon 60 "$itm" daemon)"
 tmux -S "$tmux_sock" -f /dev/null new-session -d -x 120 -y 40 \
   "ITM_EXIT_AFTER_DRAW=1 $measure tty-runs 10 $itm ui 2> $root/ui.txt"
 until [ -s "$root/ui.txt" ]; do sleep 0.2; done
-echo "rust switcher first draw (120x40 tmux): $(cat "$root/ui.txt")"
-if [ -x "$python_itm" ]; then
-  echo "python itm list:   $($measure runs 20 "$python_itm" list)"
-  echo "python itm status: $($measure runs 20 "$python_itm" status)"
-  echo "python daemon:     $($measure daemon 60 "$python_itm" daemon)"
-else
-  echo "SKIP python itm (${python_itm:-ITM_PYTHON unset} missing)"
-fi
+echo "switcher first draw (120x40 tmux): $(cat "$root/ui.txt")"
 echo "binary: $(stat -c %s "$itm") bytes"

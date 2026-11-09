@@ -674,7 +674,7 @@ fn check_project_name(name: &str) -> Result<String> {
     Ok(name.into())
 }
 
-/// Eight random hex digits, like the Python itm's `secrets.token_hex(4)`.
+/// Eight random hex digits that no project has.
 fn new_project_id(data: &Data) -> Result<String> {
     let mut urandom = File::open("/dev/urandom").context(|| "cannot read /dev/urandom".into())?;
     loop {
@@ -687,7 +687,7 @@ fn new_project_id(data: &Data) -> Result<String> {
     }
 }
 
-/// One project as `itm project list --json` prints it, in the Python itm's key order.
+/// One project as `itm project list --json` prints it, its keys in this order.
 #[derive(Serialize)]
 pub struct ProjectRow<'a> {
     pub id: &'a str,

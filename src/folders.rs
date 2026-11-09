@@ -98,7 +98,7 @@ pub fn complete(text: &str, listing: impl FnOnce(&str) -> Option<Listing>) -> Ve
 mod tests {
     use super::*;
 
-    /// After Python's CompleteFoldersTest: a home with folders, a file and a link.
+    /// A home with folders, a file and a link.
     fn home() -> (tempfile::TempDir, PathBuf) {
         let tmp = tempfile::tempdir().unwrap();
         let home = resolved(&tmp.path().join("home"));

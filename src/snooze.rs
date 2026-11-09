@@ -1,9 +1,8 @@
 //! Snooze times as people type them (R4.1): `30m`, `2h`, `1h30m`, `2d`, `45`
 //! (minutes), `14:30`, `5pm`, `today 17:00`, `tomorrow 9:00`, `friday 2pm`,
 //! `next mon`, `2026-12-01 14:30`, read by itm itself in local wall-clock
-//! time (a port of the Python `_when` and `_day_and_clock`), and any other
-//! phrase (`next week`, `+3 days`) as GNU `date -d` reads it, when there is
-//! one ([`crate::system::date_reads`]).
+//! time, and any other phrase (`next week`, `+3 days`) as GNU `date -d`
+//! reads it, when there is one ([`crate::system::date_reads`]).
 
 use std::sync::LazyLock;
 
@@ -185,7 +184,7 @@ fn day_and_clock(text: &str, now: i64, tz: &TimeZone) -> Result<Option<i64>> {
             civil::Time::new(hour, minute, 0, 0).map_err(|_| invalid_time())?
         }
     };
-    // A gap or fold (DST) resolves like Python's mktime ("compatible").
+    // A DST gap moves the time forward, a fold takes the earlier one (jiff's "compatible").
     let mut target = date.to_datetime(clock).to_zoned(tz.clone()).map_err(|_| invalid_date())?;
     if day.is_none() && target.timestamp().as_second() <= now {
         target = target.checked_add(1.day()).map_err(|_| invalid_date())?; // a calendar day: same clock across DST
@@ -206,7 +205,7 @@ mod tests {
         local.parse::<civil::DateTime>().unwrap().to_zoned(tz()).unwrap().timestamp().as_second()
     }
 
-    /// Wednesday 2026-11-04 10:00, the Python tests' base.
+    /// Wednesday 2026-11-04 10:00.
     fn base() -> i64 {
         at("2026-11-04T10:00")
     }
@@ -296,7 +295,7 @@ mod tests {
             Some(week)
         };
         assert_eq!(Until::parse("  next week ", base(), &tz(), date), Ok(Until::Time(week)));
-        assert_eq!(asked, ["next week"], "trimmed, as Python passes it");
+        assert_eq!(asked, ["next week"], "trimmed");
         // date is asked only about what itm does not read itself.
         let never = |_: &str| -> Option<i64> { panic!("date asked about a phrase itm reads") };
         assert_eq!(Until::parse("tomorrow 9:00", base(), &tz(), never), Ok(Until::Time(at("2026-11-05T09:00"))));

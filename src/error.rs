@@ -1,16 +1,15 @@
-//! itm's errors. Their messages are part of its interface (scripts and the
-//! Python itm's users read them), so each one is a sentence for the user,
-//! worded like the Python itm's. The variants are the errors a caller has
-//! to tell apart: which Herdr failure, which lookup failed, and why a
-//! project could not be added (R8.4, R8.5: the add dialog keeps you on the
-//! name field only when the name is the problem). Everything else is
-//! [`Error::Other`], written where it happens.
+//! itm's errors. Their messages are part of its interface (scripts and
+//! people read them), so each one is a sentence for the user. The variants
+//! are the errors a caller has to tell apart: which Herdr failure, which
+//! lookup failed, and why a project could not be added (R8.4, R8.5: the add
+//! dialog keeps you on the name field only when the name is the problem).
+//! Everything else is [`Error::Other`], written where it happens.
 
 use std::fmt;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Error {
-    /// A program itm runs (`herdr`, `git`) is not on `PATH` (pip installs bring neither).
+    /// A program itm runs (`herdr`, `git`) is not on `PATH`.
     Missing(&'static str),
     /// A request to a Herdr session failed.
     Herdr {
@@ -135,8 +134,8 @@ impl<T, E: fmt::Display> Context<T> for std::result::Result<T, E> {
     }
 }
 
-/// A word as a shell reads it back, quoted like Python's `shlex.quote`, for
-/// commands that messages suggest.
+/// A word as a shell reads it back, for commands that messages suggest: as
+/// it is when every character is safe, else in single quotes.
 pub fn shell_quote(word: &str) -> String {
     let safe = |c: char| c.is_ascii_alphanumeric() || "_@%+=:,./-".contains(c);
     if !word.is_empty() && word.chars().all(safe) {
@@ -150,7 +149,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn words_are_quoted_like_python_shlex() {
+    fn words_are_quoted_for_the_shell() {
         assert_eq!(shell_quote("api"), "api");
         assert_eq!(shell_quote("~/src/api"), "'~/src/api'");
         assert_eq!(shell_quote("Client X"), "'Client X'");
@@ -160,7 +159,7 @@ mod tests {
     }
 
     #[test]
-    fn messages_are_the_python_itms() {
+    fn messages_are_sentences_for_the_user() {
         let taken = Error::ProjectNameTaken { name: "api".into(), place: "~/code/api".into() };
         assert_eq!(
             taken.to_string(),

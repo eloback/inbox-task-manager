@@ -996,7 +996,7 @@ mod tests {
         assert_eq!(chosen, None);
         assert!(shown.contains("project My Thing has no folder yet"), "{shown}");
         let mut steps = vec![press(KeyCode::Enter)];
-        steps.extend(typing("My Tool")); // the name is selected, as in the Python itm: typing replaces it
+        steps.extend(typing("My Tool")); // the name is selected: typing replaces it
         steps.push(press(KeyCode::Enter));
         let (chosen, _) = run(steps);
         let Some(Action::ProjectAdded(id, _)) = chosen else { panic!("{chosen:?}") };
@@ -1159,10 +1159,9 @@ mod tests {
         assert!(shown.contains("Project added.") && shown.contains("◆ backend"), "{shown}");
     }
 
-    /// R1.6, R8.8, after Python's test_clone_runs_as_a_child_and_selects_the_project:
-    /// a git URL pasted on the form's project field opens the finder, whose
-    /// first row clones it; the add dialog opens ready on the name, and once
-    /// the clone is done the form has the project.
+    /// R1.6, R8.8: a git URL pasted on the form's project field opens the
+    /// finder, whose first row clones it; the add dialog opens ready on the
+    /// name, and once the clone is done the form has the project.
     #[test]
     fn r1_6_a_pasted_git_url_is_cloned_and_given_to_the_task() {
         let paths = Paths::under("/r".as_ref());

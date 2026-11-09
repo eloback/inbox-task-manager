@@ -215,8 +215,8 @@ impl TaskForm {
         form
     }
 
-    /// Focus `part`. Moving to a one-line field selects its text, as in the
-    /// Python itm; focus already there leaves what is being typed as it is.
+    /// Focus `part`. Moving to a one-line field selects its text; focus
+    /// already there leaves what is being typed as it is.
     fn focus_on(&mut self, part: Part) {
         if self.focus == part {
             return;
@@ -762,9 +762,9 @@ mod tests {
         }
     }
 
-    /// R5.4, R1.1: a title the form opens with is selected, as in the
-    /// Python itm: what is typed replaces it. Coming back to it with Tab
-    /// selects it again; an arrow keeps it and moves the cursor.
+    /// R5.4, R1.1: a title the form opens with is selected: what is typed
+    /// replaces it. Coming back to it with Tab selects it again; an arrow
+    /// keeps it and moves the cursor.
     #[test]
     fn typing_replaces_the_title_the_form_opens_with() {
         let mut form = edit_form(None, false, None);

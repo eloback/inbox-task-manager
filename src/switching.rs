@@ -30,15 +30,11 @@ use crate::system::{Catching, which};
 const FIND_CHILD: (u32, Duration) =
     if cfg!(test) { (3, Duration::from_millis(10)) } else { (20, Duration::from_millis(100)) };
 
-/// Whether a command line is an itm process. Part of the protocol: a
-/// marker whose process fails this is stale and deleted, so every entry
-/// point must keep one of these names.
+/// Whether a command line is an itm process, by its program (argv[0]). Part
+/// of the protocol: a marker whose process fails this is stale and deleted,
+/// so every entry point must keep one of these names.
 pub fn is_itm_process(argv: &[String]) -> bool {
-    argv.iter().any(|arg| {
-        arg.contains("inbox-task-manager")
-            || arg.contains("inbox_task_manager")
-            || arg.rsplit('/').next() == Some("itm")
-    })
+    argv.first().is_some_and(|arg| arg.contains("inbox-task-manager") || arg.rsplit('/').next() == Some("itm"))
 }
 
 fn is_attach_child(argv: &[String]) -> bool {
@@ -324,12 +320,11 @@ pub mod tests {
 
     #[test]
     fn process_names_that_count_as_itm() {
-        let cases: [(&[&str], bool); 6] = [
-            (&["/nix/store/abc-inbox-task-manager-0.2.0/bin/.inbox-task-manager-wrapped", "attach"], true),
-            (&["/usr/bin/python3", "-m", "inbox_task_manager", "attach"], true),
-            (&["/usr/bin/python3", "/home/me/.local/bin/itm", "attach"], true),
+        let cases: [(&[&str], bool); 5] = [
+            (&["/nix/store/abc-inbox-task-manager-0.3.0/bin/.itm-wrapped", "attach"], true),
+            (&["/home/me/.cargo/bin/itm", "attach"], true),
             (&["/home/me/src/itm/target/release/itm", "attach"], true),
-            (&["/usr/bin/python3", "/home/me/bin/item", "attach"], false),
+            (&["/home/me/bin/item", "attach"], false),
             (&["vim", "notes.md"], false),
         ];
         for (argv, expected) in cases {

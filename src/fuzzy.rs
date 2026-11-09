@@ -56,7 +56,6 @@ fn one_char(mut chars: impl Iterator<Item = char>) -> Option<char> {
 mod tests {
     use super::*;
 
-    /// R1.6: after Python's `test_fuzzy_match`.
     #[test]
     fn r1_6_letters_in_order_any_case_prefixes_first() {
         assert_eq!(fuzzy_match("api", "api").unwrap().1, [0, 1, 2]);

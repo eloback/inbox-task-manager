@@ -1,5 +1,4 @@
-//! Where itm keeps its files (DESIGN.md section 2, "Ownership"). The same
-//! paths as the Python itm, so either can run on the other's state.
+//! Where itm keeps its files (DESIGN.md section 2, "Ownership").
 
 use std::env;
 use std::ffi::OsString;
@@ -37,7 +36,7 @@ impl Paths {
     }
 
     /// The folders, given the home folder and how to read a variable (set
-    /// and empty counts as unset, as in the Python itm).
+    /// and empty counts as unset).
     fn from_vars(home: PathBuf, var: impl Fn(&str) -> Option<OsString>) -> Paths {
         let var = |name: &str| var(name).filter(|v| !v.is_empty()).map(PathBuf::from);
         let xdg = |name: &str, fallback: &str| var(name).unwrap_or_else(|| home.join(fallback));
@@ -124,9 +123,9 @@ pub fn expand_home(path: &Path, home: &Path) -> PathBuf {
     }
 }
 
-/// `path` absolute, its links resolved as far as it exists, like Python's
-/// `os.path.realpath`: a folder that is not there (yet, or any more) still
-/// compares with the folders that are (duplicates, R8.4).
+/// `path` absolute, its links resolved as far as it exists, the rest kept
+/// as written: a folder that is not there (yet, or any more) still compares
+/// with the folders that are (duplicates, R8.4).
 pub fn resolved(path: &Path) -> PathBuf {
     let absolute = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
     let mut out = PathBuf::new();
@@ -214,7 +213,7 @@ mod tests {
     }
 
     #[test]
-    fn the_projects_folder_reads_a_tilde_like_python() {
+    fn the_projects_folder_reads_a_leading_tilde() {
         let home = PathBuf::from("/h");
         let with = |value: &'static str| {
             let var = move |name: &str| match name {

@@ -106,16 +106,6 @@ your shell. The package puts git, GNU `date` and `notify-send` on itm's
 match the running server's version. The flake builds for x86_64-linux and
 aarch64-linux.
 
-**Upgrading from the Python itm** (0.2.0): the Rust itm reads and writes
-the same files, so tasks, projects, notes and settings carry over.
-Uninstall the Python one (`pipx uninstall inbox-task-manager`, or `uv tool
-uninstall inbox-task-manager`), install this one, and restart the daemon
-(an `itm attach` loop of the Python itm still counts as an itm client
-until you close it). The command is
-`itm` only: scripts that ran `inbox-task-manager` need `itm`. The
-switcher's colors are `[ui] theme` (below); `ITM_THEME` takes `mocha`,
-`latte` or `terminal`.
-
 ## 🛠️ Setup
 
 1. **Run the daemon.** It notifies about blocked agents and wakes snoozed
